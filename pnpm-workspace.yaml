@@ -1,0 +1,17 @@
+# TablePilot modification: exclude standalone AI/MCP and agent-facing CLI packages.
+packages:
+  - "packages/mongo-shell"
+  - "packages/plugin-sdk"
+  - "packages/plugin-cli"
+  - "packages/plugin-cli-*"
+
+overrides:
+  postcss@^8: ">=8.5.23"
+  nanoid@^3: ">=3.3.18"
+
+allowBuilds:
+  better-sqlite3: true
+  cbor-extract: false
+  esbuild: true
+  keytar: true
+  vue-demi: false

@@ -1,0 +1,11 @@
+TablePilot 0.3.0 prototype
+
+This product contains code from DBX (https://github.com/t8y2/dbx),
+release v0.6.43, commit 0db01f7f284ec6b0b090fe7369de7d05c37b25b0.
+DBX is licensed under the Apache License, Version 2.0.
+Original copyright and third-party notices are retained in the source tree.
+
+TablePilot is an independent modified desktop edition. It removes AI/MCP
+runtime integration and the upstream app updater, changes application and
+credential-store identity, and supplies its own Windows/Linux build workflow.
+It is not an official DBX release. See FORK_CHANGES.md for the modification list.
