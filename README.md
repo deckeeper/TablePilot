@@ -26,7 +26,7 @@ The installer is written to `target/release/bundle/nsis/`.
 On Ubuntu 24.04:
 
 ```sh
-sudo apt-get install build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev patchelf cmake
+sudo apt-get install build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf cmake
 corepack enable
 corepack prepare pnpm@11.25.0 --activate
 pnpm install --frozen-lockfile

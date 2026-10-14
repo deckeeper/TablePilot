@@ -6,9 +6,6 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: tablepilot-${{ github.ref }}
-  cancel-in-progress: false
 jobs:
   source:
     runs-on: ubuntu-24.04
@@ -34,7 +31,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-24.04]
+        # Use [linux-only] in a fix commit to avoid rebuilding a successful Windows package.
+        os: ${{ contains(github.event.head_commit.message, '[linux-only]') && fromJSON('["ubuntu-24.04"]') || fromJSON('["windows-latest", "ubuntu-24.04"]') }}
+    concurrency:
+      group: tablepilot-${{ matrix.os }}-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
@@ -53,9 +54,11 @@ jobs:
           version: 11.25.0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Linux prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev patchelf cmake
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf cmake
       - run: pnpm install --frozen-lockfile
       - run: node scripts/build-tablepilot.mjs
       - uses: actions/upload-artifact@v4
