@@ -1,9 +1,13 @@
 # TablePilot fork changes
 
 Based on DBX v0.6.43, commit `0db01f7f284ec6b0b090fe7369de7d05c37b25b0`.
-Modified on 14 October 2026 for the independent TablePilot desktop prototype.
+Modified on 14–16 October 2026 for the independent TablePilot desktop prototype.
 
 ## Changes
+
+- TablePilot 0.3.1 removes GitHub navigation from the toolbar, welcome screen, settings, changelog and plugin source links. GitHub Gist remains a functional sync provider.
+- Publish Windows/Linux installer assets and checksums to this repository’s Releases after successful builds.
+- Prepare daily draft DBX update proposals with protected fork files and explicit manual review; never auto-merge.
 
 - Remove AI provider execution and MCP server crates from the desktop workspace and dependency graph.
 - Remove native AI/MCP command registration, server startup, AI deep-link handling and model/agent execution.
@@ -13,7 +17,7 @@ Modified on 14 October 2026 for the independent TablePilot desktop prototype.
 - Reject AI/MCP operations at the frontend API boundary and deny plugins the `host.ai` permission.
 - Remove the upstream app updater; keep database-driver updates.
 - Use TablePilot branding, icons, app identifier, credential service, URL scheme and portable marker.
-- Replace upstream automated publishing workflows with a manual Windows/Linux installer build workflow.
+- Replace upstream publishing workflows with TablePilot-only installer builds, Releases and reviewed upstream update proposals.
 - Refresh the JS dependency lock using the available pnpm version while respecting dependency supply-chain checks.
 - Omit the upstream web server and standalone CLI/MCP distributions from this desktop-only source package.
 
@@ -24,12 +28,17 @@ Original copyright/license notices remain applicable. `README-UPSTREAM.md` descr
 The following list is also the modification notice for formats such as JSON and binary icons that cannot carry source comments.
 
 - `.github/workflows/tablepilot-build.yml`
+- `.github/workflows/tablepilot-publish-existing.yml`
+- `.github/workflows/tablepilot-upstream.yml`
+- `.tablepilot/upstream.json`
 - `Cargo.lock`
 - `Cargo.toml`
+- `FORK_CHANGES.md`
 - `NOTICE`
 - `README-TABLEPILOT.md`
 - `README-UPSTREAM.md`
 - `README.md`
+- `SOURCE_SHA256.json`
 - `VALIDATION.md`
 - `apps/desktop/index.html`
 - `apps/desktop/public/favicon.png`
@@ -53,6 +62,8 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/components/layout/StartupLoading.vue`
 - `apps/desktop/src/components/layout/WelcomeScreen.vue`
 - `apps/desktop/src/components/plugins/PluginAiAccessSection.vue`
+- `apps/desktop/src/components/plugins/PluginContributionsPanel.vue`
+- `apps/desktop/src/components/settings/ChangelogPanel.vue`
 - `apps/desktop/src/composables/useAppUpdater.ts`
 - `apps/desktop/src/composables/useComponentUpdates.ts`
 - `apps/desktop/src/composables/useMcpUpdateBadge.ts`
@@ -82,6 +93,8 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/i18n/locales/zh-CN.ts`
 - `apps/desktop/src/i18n/locales/zh-TW.ts`
 - `apps/desktop/src/lib/__tests__/tablepilot.spec.ts`
+- `apps/desktop/src/lib/app/externalLinks.spec.ts`
+- `apps/desktop/src/lib/app/externalLinks.ts`
 - `apps/desktop/src/lib/backend/api.ts`
 - `apps/desktop/src/lib/connection/connectionDeepLink.ts`
 - `apps/desktop/src/lib/database/databaseFeatureSupport.ts`
@@ -100,6 +113,10 @@ The following list is also the modification notice for formats such as JSON and 
 - `pnpm-lock.yaml`
 - `pnpm-workspace.yaml`
 - `scripts/build-tablepilot.mjs`
+- `scripts/tablepilot-publish.py`
+- `scripts/tablepilot-source-manifest.py`
+- `scripts/tablepilot-sync-upstream.py`
+- `scripts/tablepilot-sync-upstream.test.py`
 - `src-tauri/Cargo.toml`
 - `src-tauri/capabilities/default.json`
 - `src-tauri/icons/128x128.png`

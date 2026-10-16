@@ -1252,7 +1252,7 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   history: true,
   ai: false,
   theme: true,
-  github: true,
+  github: false,
   alwaysOnTop: false,
   exclusiveRightSidebarPanels: true,
 };
@@ -1873,7 +1873,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     history: items.history ?? defaults.history,
     ai: false, // TablePilot has no AI panel.
     theme: items.theme ?? defaults.theme,
-    github: items.github ?? defaults.github,
+    github: false,
     // Unlike the entries above, a newly added toolbar button stays hidden until
     // the user asks for it, so upgrading never adds another control to the
     // crowded right side of the toolbar.

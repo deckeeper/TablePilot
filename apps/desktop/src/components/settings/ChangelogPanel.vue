@@ -8,7 +8,9 @@ import { Label } from "@/components/ui/label";
 import { currentLocale } from "@/i18n";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { formatAiInlineMarkdownFragment, handleAiMarkdownLinkClick } from "@/lib/ai/aiMarkdown";
-import { changelogLangFromLocale, changelogReleaseUrl, changelogWebsiteUrl, createLatestRequestGuard, fetchChangelog, type ChangelogItem, type ChangelogLang, type ChangelogRelease } from "@/lib/app/changelog";
+import { changelogLangFromLocale, changelogWebsiteUrl, createLatestRequestGuard, fetchChangelog, type ChangelogItem, type ChangelogLang, type ChangelogRelease } from "@/lib/app/changelog";
+
+import { removeGithubAnchors } from "@/lib/app/externalLinks";
 
 const PAGE_SIZE = 5;
 
@@ -83,7 +85,7 @@ function openExternalUrl(url: string) {
 
 function formatChangelogItemHtml(item: ChangelogItem): string {
   const title = formatAiInlineMarkdownFragment(item.title);
-  return item.desc ? `${title} — ${formatAiInlineMarkdownFragment(item.desc)}` : title;
+  return removeGithubAnchors(item.desc ? `${title} — ${formatAiInlineMarkdownFragment(item.desc)}` : title);
 }
 
 function isExpanded(tag: string) {
@@ -205,11 +207,6 @@ watch(changelogLang, (lang) => {
             </div>
           </template>
           <p v-else class="text-xs italic text-muted-foreground">{{ t("settings.changelogNoDetails") }}</p>
-
-          <Button type="button" variant="ghost" size="sm" class="mt-3 h-7 px-2 text-xs" @click.stop="openExternalUrl(changelogReleaseUrl(release.tag))">
-            <ExternalLink class="mr-1 h-3 w-3" />
-            {{ t("settings.changelogOpenGitHub") }}
-          </Button>
         </div>
       </div>
 

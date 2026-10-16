@@ -1,0 +1,37 @@
+# Promote the already verified prototype artifacts, without another native build.
+name: Publish existing TablePilot 0.3.0 installers
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/tablepilot-publish-existing.yml']
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: tablepilot-release-0.3.0
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 38564008206
+          name: TablePilot-Windows
+          path: installers/windows
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 38568811551
+          name: TablePilot-Linux
+          path: installers/linux
+      - name: Verify recorded checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/tablepilot-publish.py --artifacts installers --version 0.3.0 --target adfb658b14e90cbeb275216dd8c0c520c54910e8 --existing-prototype

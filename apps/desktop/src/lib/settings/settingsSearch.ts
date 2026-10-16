@@ -76,7 +76,6 @@ export const TOOLBAR_VISIBILITY_ITEMS: readonly ToolbarVisibilityItem[] = [
   { key: "sqlFileTree", titleKey: "sqlFileTree.title" },
   { key: "history", titleKey: "history.title" },
   { key: "theme", titleKey: "toolbar.theme" },
-  { key: "github", title: "GitHub" },
   { key: "alwaysOnTop", titleKey: "toolbar.alwaysOnTop", desktopOnly: true },
   { key: "immediateSync", titleKey: "toolbar.immediateSync" },
 ];

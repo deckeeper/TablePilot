@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, defineComponent, h, nextTick, onBeforeUnmount, onMounted, ref, watch, TransitionGroup } from "vue";
+import { showExternalLink } from "@/lib/app/externalLinks";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, TransitionGroup } from "vue";
 import { ArrowUp, BadgeCheck, Check, ChevronRight, CircleAlert, Download, ExternalLink, FileUp, FolderTree, Globe, Info, LayoutGrid, Link2, List, Loader2, PackageCheck, Pencil, Pin, PinOff, Plus, RefreshCw, RotateCcw, Search, Settings2, ShieldCheck, Store, Trash2, X } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { isSensitivePluginPermission } from "@/lib/plugins/pluginPermissions";
@@ -61,22 +62,6 @@ const emit = defineEmits<{
   opened: [];
   pluginRuntimeReplaced: [pluginId: string];
 }>();
-
-// lucide no longer ships brand icons; this stroke glyph keeps the 2px outline style of
-// neighboring lucide icons instead of the heavier filled brand mark.
-const GithubIcon = defineComponent({
-  props: {
-    iconClass: { type: String, default: "size-3" },
-  },
-  render() {
-    return h("svg", { class: this.iconClass, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round" }, [
-      h("path", {
-        d: "M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4",
-      }),
-      h("path", { d: "M9 18c-4.51 2-5-2-7-2" }),
-    ]);
-  },
-});
 
 const PLUGIN_ALLOW_UNSIGNED_STORAGE_KEY = "dbx-plugin-allow-unsigned";
 const MARKETPLACE_VIEW_MODE_STORAGE_KEY = "dbx-plugin-marketplace-view-mode";
@@ -464,7 +449,7 @@ async function reloadInstalledPlugins(): Promise<void> {
 
 function openExternal(url?: string) {
   const target = url?.trim();
-  if (!target) return;
+  if (!target || !showExternalLink(target)) return;
   try {
     const parsed = new URL(target);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
@@ -1463,17 +1448,17 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="flex shrink-0 items-center gap-0.5">
                   <button
-                    v-if="listing.plugin.source"
+                    v-if="showExternalLink(listing.plugin.source)"
                     type="button"
                     class="rounded p-1 text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     :title="t('pluginPlatform.sourceRepository')"
                     :aria-label="t('pluginPlatform.sourceRepository')"
                     @click.stop="openExternal(listing.plugin.source)"
                   >
-                    <GithubIcon icon-class="size-3.5" />
+                    <ExternalLink class="size-3.5" />
                   </button>
                   <button
-                    v-if="marketplaceHomepageUrl(listing.plugin.source, listing.plugin.homepage)"
+                    v-if="showExternalLink(marketplaceHomepageUrl(listing.plugin.source, listing.plugin.homepage))"
                     type="button"
                     class="rounded p-1 text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     :title="t('pluginPlatform.pluginHomepage')"
@@ -1591,17 +1576,17 @@ onBeforeUnmount(() => {
                   <span class="shrink-0">· v{{ listing.plugin.latestVersion }}</span>
                   <span v-if="listing.latestVersionReleasedAt" class="shrink-0">· {{ formatMarketplaceReleasedDate(listing.latestVersionReleasedAt, appLocale) }}</span>
                   <button
-                    v-if="listing.plugin.source"
+                    v-if="showExternalLink(listing.plugin.source)"
                     type="button"
                     class="shrink-0 rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     :title="t('pluginPlatform.sourceRepository')"
                     :aria-label="t('pluginPlatform.sourceRepository')"
                     @click.stop="openExternal(listing.plugin.source)"
                   >
-                    <GithubIcon icon-class="size-3.5" />
+                    <ExternalLink class="size-3.5" />
                   </button>
                   <button
-                    v-if="marketplaceHomepageUrl(listing.plugin.source, listing.plugin.homepage)"
+                    v-if="showExternalLink(marketplaceHomepageUrl(listing.plugin.source, listing.plugin.homepage))"
                     type="button"
                     class="shrink-0 rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     :title="t('pluginPlatform.pluginHomepage')"
@@ -1784,17 +1769,17 @@ onBeforeUnmount(() => {
                       <div class="mt-1 flex flex-wrap items-center gap-1.5">
                         <span class="font-mono text-[10px] text-muted-foreground">{{ selectedDefinition.plugin.manifest.id }}</span>
                         <button
-                          v-if="selectedDefinition.plugin.manifest.source"
+                          v-if="showExternalLink(selectedDefinition.plugin.manifest.source)"
                           type="button"
                           class="rounded p-0.5 text-muted-foreground opacity-70 transition-opacity hover:text-foreground hover:opacity-100"
                           :title="t('pluginPlatform.sourceRepository')"
                           :aria-label="t('pluginPlatform.sourceRepository')"
                           @click="openExternal(selectedDefinition.plugin.manifest.source)"
                         >
-                          <GithubIcon />
+                          <ExternalLink class="size-3" />
                         </button>
                         <button
-                          v-if="marketplaceHomepageUrl(selectedDefinition.plugin.manifest.source, selectedDefinition.plugin.manifest.homepage)"
+                          v-if="showExternalLink(marketplaceHomepageUrl(selectedDefinition.plugin.manifest.source, selectedDefinition.plugin.manifest.homepage))"
                           type="button"
                           class="rounded p-0.5 text-muted-foreground opacity-70 transition-opacity hover:text-foreground hover:opacity-100"
                           :title="t('pluginPlatform.pluginHomepage')"
@@ -2087,9 +2072,9 @@ onBeforeUnmount(() => {
                   <Badge v-for="tag in selectedMarketplaceListing.plugin.tags" :key="tag" variant="outline" class="text-[11px]">{{ tag }}</Badge>
                 </div>
                 <div class="flex flex-wrap gap-2">
-                  <Button v-if="selectedMarketplaceListing.plugin.source" variant="outline" size="sm" class="h-8 gap-1.5 text-xs" @click.stop="openExternal(selectedMarketplaceListing.plugin.source)"><GithubIcon />{{ t("pluginPlatform.sourceRepository") }}</Button>
+                  <Button v-if="showExternalLink(selectedMarketplaceListing.plugin.source)" variant="outline" size="sm" class="h-8 gap-1.5 text-xs" @click.stop="openExternal(selectedMarketplaceListing.plugin.source)"><ExternalLink class="size-3" />{{ t("pluginPlatform.sourceRepository") }}</Button>
                   <Button
-                    v-if="marketplaceHomepageUrl(selectedMarketplaceListing.plugin.source, selectedMarketplaceListing.plugin.homepage)"
+                    v-if="showExternalLink(marketplaceHomepageUrl(selectedMarketplaceListing.plugin.source, selectedMarketplaceListing.plugin.homepage))"
                     variant="outline"
                     size="sm"
                     class="h-8 gap-1.5 text-xs"
@@ -2151,7 +2136,7 @@ onBeforeUnmount(() => {
                     <dd>{{ selectedMarketplaceListing.verified ? t("pluginPlatform.verified") : t("pluginPlatform.unverified") }}</dd>
                   </div>
                 </dl>
-                <Button v-if="selectedMarketplaceListing.repositoryHomepage" variant="outline" size="sm" class="h-8 gap-1.5 text-xs" @click.stop="openExternal(selectedMarketplaceListing.repositoryHomepage)"><Globe class="size-3.5" />{{ t("pluginPlatform.pluginDetailsRepositoryHomepage") }}</Button>
+                <Button v-if="showExternalLink(selectedMarketplaceListing.repositoryHomepage)" variant="outline" size="sm" class="h-8 gap-1.5 text-xs" @click.stop="openExternal(selectedMarketplaceListing.repositoryHomepage)"><Globe class="size-3.5" />{{ t("pluginPlatform.pluginDetailsRepositoryHomepage") }}</Button>
               </TabsContent>
             </Tabs>
           </div>

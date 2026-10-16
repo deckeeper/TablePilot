@@ -10,7 +10,7 @@ Validated in a Linux development environment on 14 October 2026.
 
 ## Limits
 
-This delivery is source code with a manual installer-build workflow, not a prebuilt installer. Windows installation, Windows compilation, end-to-end GUI operation, live database connections, SSH jump-host connections, and round-trip CSV/Excel transfers have not been tested in this environment. The full upstream test suite was not run; tests that expect upstream AI/MCP behavior do not describe this edition.
+Windows and Linux native installer builds for 0.3.0 subsequently passed in GitHub Actions (runs 38564008206, Windows job; and 38568811551, Linux). Installation, end-to-end GUI operation, live database connections, SSH jump-host connections, and round-trip CSV/Excel transfers have not been tested in this environment. The full upstream test suite was not run; tests that expect upstream AI/MCP behavior do not describe this edition.
 
 The retained drivers and database operations are upstream code, not a guarantee that every supported database server/version works without configuration. Driver packages may be downloaded at runtime. No RAM or performance benchmark has been performed.
 
@@ -29,3 +29,11 @@ node node_modules/vitest/vitest.mjs run --maxWorkers=1 \
   apps/desktop/src/lib/connection/__tests__/sshAuthMethod.spec.ts \
   apps/desktop/src/components/import/__tests__/TableImportDialogTheme.spec.ts
 ```
+
+## 0.3.1 changes — 16 October 2026
+
+- Production frontend build and full Vue/TypeScript type check passed after removing GitHub GUI navigation. The first type-check attempt exceeded the local memory limit while running alongside the build; the final standalone run passed with a 6 GB Node heap limit.
+- Two focused GUI link tests passed; changelog text is retained when GitHub anchors are removed.
+- Two upstream-proposal integration tests passed in a temporary Git repository, covering unchanged files, fork edits, protected/AI paths, additions, deletions, symlinks, and repeated proposals.
+- All three GitHub workflow files parsed successfully; Python automation scripts compiled.
+- No Rust implementation changes were made in this update (only the package version). Native installers are validated by the Windows/Linux CI builds before publication.

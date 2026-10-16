@@ -1,4 +1,4 @@
-# TablePilot 0.3.0 prototype
+# TablePilot 0.3.1 prototype
 
 An independent desktop fork of [DBX v0.6.43](https://github.com/t8y2/dbx/tree/v0.6.43), commit `0db01f7f284ec6b0b090fe7369de7d05c37b25b0`, licensed under Apache-2.0.
 
@@ -7,6 +7,18 @@ The database workbench, SQL editor, CSV/Excel import/export, field mapping, SSH 
 The AI provider runtime and MCP services are excluded from the desktop build. Their native commands and startup servers are removed. AI chat/settings/menu controls are removed, plugin `host.ai` access is denied, and the shared frontend API rejects AI/MCP calls. Some passive legacy configuration types remain to keep the shared database/settings format readable; they cannot execute models or start an MCP server.
 
 TablePilot has its own app identifier, credential-store service and portable-data marker. DBX's app updater is removed. Database driver downloads still use the upstream driver distribution service. This is not an entirely offline product, and third-party plugins retain their own declared network permissions.
+
+## Download installers
+
+Open [TablePilot Releases](https://github.com/deckeeper/TablePilot/releases), expand **Assets**, and download the Windows `.exe` or Linux `.deb`. The repository remains private: you must be signed in with repository access. Releases retain downloads beyond the 30-day Actions artifact window. The original 0.3.0 installers are also published from their verified build artifacts; the GitHub GUI link cleanup is included in 0.3.1.
+
+## Review upstream updates
+
+**Review DBX upstream updates** checks the latest stable DBX release daily at 06:23 UTC (GitHub may delay scheduled runs), or from **Actions → Run workflow**. It prepares an `upstream/dbx-v…` branch and attempts to open a draft pull request. It never merges into `main`.
+
+The proposal copies only regular files that still match the pinned DBX baseline. The fork modification/omission list, AI-related paths, dependencies, build scripts and workflows are protected. Its report lists everything requiring manual review. Filters do not guarantee compatibility or the absence of newly introduced AI calls: review the diff and test before merging. The DBX baseline is not advanced automatically. After reviewing skipped changes, update `.tablepilot/upstream.json`, run `python scripts/tablepilot-source-manifest.py` to refresh `SOURCE_SHA256.json`, bump TablePilot's version, and validate the candidate.
+
+If GitHub blocks the bot from opening pull requests, the proposal branch is still created and its compare link appears in the workflow summary. To allow future automatic draft PR creation, enable **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**. Existing proposal branches are never overwritten.
 
 ## Build an installer
 
@@ -35,7 +47,7 @@ node scripts/build-tablepilot.mjs
 
 The Debian package is written to `target/release/bundle/deb/`.
 
-Alternatively, the included **Build TablePilot installers** GitHub Actions workflow can be run manually in a repository you own. It builds installers as downloadable workflow artifacts; it does not publish releases or upload to DBX. Installers are unsigned until you configure your own signing certificate.
+The **Build TablePilot installers** GitHub Actions workflow builds Windows and Linux installers on pushes to `main` and on manual runs. Once both builds pass, it publishes the version in `package.json` as a GitHub prerelease in this repository, with checksums. Bump the version in `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and the `dbx` entry in `Cargo.lock` before publishing different installers; existing release assets are never silently replaced. A `[linux-only]` build only uploads its workflow artifact. Installers are unsigned until you configure your own signing certificate.
 
 Read `VALIDATION.md` for the checks actually completed on this prototype. Building source is not a substitute for testing an installer on Windows or testing against your database servers.
 

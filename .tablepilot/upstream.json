@@ -1,0 +1,6 @@
+{
+  "repository": "t8y2/dbx",
+  "baseline_tag": "v0.6.43",
+  "baseline_commit": "0db01f7f284ec6b0b090fe7369de7d05c37b25b0",
+  "policy": "Draft proposals only. Never auto-merge. Preserve modified/omitted fork files. Advance this baseline only after reviewing all skipped changes."
+}
