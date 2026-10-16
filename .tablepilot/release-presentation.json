@@ -1,0 +1,22 @@
+[
+  {
+    "tag": "v0.3.3",
+    "body": "TablePilot 0.3.3 desktop prototype.\n\n## Downloads\n- Windows 11 x64: `TablePilot_0.3.3_x64-setup.exe`\n- Ubuntu 24.04 / compatible Debian x64: `TablePilot_0.3.3_amd64.deb`\n- `SHA256SUMS.txt`: installer checksums.\n\nInstallers are unsigned. Native installer builds passed; installation and live database/SSH tests still need user testing.\nDownloads and release history are available from this repository.\n\nSource commit: `307860628511f6f3e2d60f50d04327d100cf00cb`.\n\nChanges: Remove Plugin Center navigation and marketplace updates while preserving Driver Manager/JDBC. Use faster prototype build settings and expanded compilation caching.\n",
+    "expected_body_sha256": "d54141473d3d0ecf15faf7b311721a008cf12ecde0b4254f61b22b2b95299828"
+  },
+  {
+    "tag": "v0.3.2",
+    "body": "TablePilot 0.3.2 desktop prototype.\n\n## Downloads\n- Windows 11 x64: `TablePilot_0.3.2_x64-setup.exe`\n- Ubuntu 24.04 / compatible Debian x64: `TablePilot_0.3.2_amd64.deb`\n- `SHA256SUMS.txt`: installer checksums.\n\nInstallers are unsigned. Native installer builds passed; installation and live database/SSH tests still need user testing.\nDownloads and release history are available from this repository.\n\nSource commit: `2dc2ceb373f26494b898a1d12ce847c913bdaeb1`.\n\nChanges: Integrate reviewed database and interface improvements, excluding AI/MCP changes.\n\nThe release tag `40fed90e1de6c5e7ad32d214272fda276488a4db` retains the application source above; only workflow definitions and their source-manifest hashes were refreshed to the current approved workflows.\n",
+    "expected_body_sha256": "6f881a2c0f473037f9e7d21cee0f1e71fd628504c388b522e64aeaa7ba99461c"
+  },
+  {
+    "tag": "v0.3.1",
+    "body": "TablePilot 0.3.1 desktop prototype.\n\n## Downloads\n- Windows 11 x64: `TablePilot_0.3.1_x64-setup.exe`\n- Ubuntu 24.04 / compatible Debian x64: `TablePilot_0.3.1_amd64.deb`\n- `SHA256SUMS.txt`: installer checksums.\n\nInstallers are unsigned. Native installer builds passed; installation and live database/SSH tests still need user testing.\nDownloads and release history are available from this repository.\n\nSource commit: `a2e656d5d780ddcbdfc957ea070263b12ec45580`.\n\nChanges: remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.\n\nThe release tag `ad6fdba622bb40ea6d82a0db0306fcd0bc4ac130` retains the application source above; only workflow definitions and their source-manifest hashes were refreshed to the current approved workflows.\n",
+    "expected_body_sha256": "0d971778a9b865d8eba4112117c6471bcd901df941558a51a11a007fc4c2b170"
+  },
+  {
+    "tag": "v0.3.0",
+    "body": "TablePilot 0.3.0 desktop prototype.\n\n## Downloads\n- Windows 11 x64: `TablePilot_0.3.0_x64-setup.exe`\n- Ubuntu 24.04 / compatible Debian x64: `TablePilot_0.3.0_amd64.deb`\n- `SHA256SUMS.txt`: installer checksums.\n\nInstallers are unsigned. Native installer builds passed; installation and live database/SSH tests still need user testing.\nDownloads and release history are available from this repository.\n\nSource commit: `adfb658b14e90cbeb275216dd8c0c520c54910e8`.\n\nWindows source: `8b0a975c5d5bc261bf170012f2d59db95bd7d031`; Linux source: `adfb658b14e90cbeb275216dd8c0c520c54910e8` (Linux packaging dependency fix). These are the existing 0.3.0 installers; GUI link removal arrives in 0.3.1.\n\nThe release tag `ee3f1ae1c07dca2aa0680d314fd3755b22dc7356` retains the application source above; only workflow definitions and their source-manifest hashes were refreshed to the current approved workflows.\n",
+    "expected_body_sha256": "44ad334afd70ffddf31f7d571d221c79f99e87409798c846ea1284c956dfe748"
+  }
+]

@@ -1,46 +1,37 @@
-# TablePilot 0.4.1
+# TablePilot
 
-An independent desktop fork of [DBX v0.6.45](https://github.com/t8y2/dbx/tree/v0.6.45), commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`, licensed under Apache-2.0.
+<!-- TablePilot modification: repository-specific documentation, 16 October 2026. -->
 
-The database workbench, SQL editor, CSV/Excel import/export, field mapping, SSH tunnelling, database drivers, themes and ordinary plugin tools are retained. Database driver processes called “agents” are database components and are retained.
+A desktop database workbench for Windows and Linux. Connect to databases, write SQL, browse and edit tables, and move data between files and tables.
 
-The AI provider runtime and MCP services are excluded from the desktop build. Their native commands and startup servers are removed. AI chat/settings/menu controls are removed, plugin `host.ai` access is denied, and the shared frontend API rejects AI/MCP calls. Some passive legacy configuration types remain to keep the shared database/settings format readable; they cannot execute models or start an MCP server.
+## Features
 
-TablePilot has its own app identifier, credential-store service and portable-data marker. DBX's app updater is removed. Database driver downloads still use the upstream driver distribution service. This is not an entirely offline product, and third-party plugins retain their own declared network permissions.
+- Database connections with Driver Manager and JDBC support.
+- SQL editor, query results, and table structure tools.
+- CSV and Excel import/export with field mapping.
+- SSH tunnelling and jump-host connection options.
+- Light and dark themes.
+- Checks for official TablePilot releases at startup and every hour.
 
-## Changes in 0.4.1
+The desktop edition excludes AI and MCP features. Plugin Center is not available; Driver Manager remains available for database connectivity. Database driver downloads may use external distribution services.
 
-Security maintenance removes three vulnerable JavaScript development dependency chains. Existing UI styles are preserved locally with their license notices, and Splitpanes uses its bundled Vue 3 types. The root workspace JavaScript audit reports zero findings; this does not certify Rust or other lockfiles. The release keeps the same application identity and is a newer update than 0.4.0.
+## Download
 
-## Changes in 0.4.0
+Get the Windows `.exe` or Linux `.deb` from [TablePilot Releases](https://github.com/deckeeper/TablePilot/releases). Each release includes installer checksums. Installers are currently unsigned.
 
-First official TablePilot release (not a GitHub prerelease). About shows the installed version; upstream community/website promotion and remaining product labels are removed from the interface. Required licenses and attribution are retained in the source and bundled `licenses` directory. Legacy storage keys, file formats and database command syntax remain compatible.
+Run the newer installer to update an existing installation. The app's update check opens the release page for a manual download; it does not install updates unattended. Only complete, stable releases are offered.
 
-TablePilot automatically checks `deckeeper/TablePilot` releases at startup and every hour, displays release notes, and offers newer complete official releases. The repository must be public; no token or sign-in is used for checks. Prereleases, drafts, invalid version tags and releases missing either installer are excluded. Updates open the release page for downloading and running the installer; unattended installation is not enabled. Driver/JDBC update sources remain separate.
+## Recent changes
 
-## Changes in 0.3.3
+- **0.4.1:** Remove three vulnerable JavaScript development dependency chains while preserving the UI styles. The root JavaScript audit reports zero findings; other dependency ecosystems are not covered by that result.
+- **0.4.0:** Official releases, refreshed About/settings branding, and update checks against this repository.
+- **0.3.3:** Remove Plugin Center navigation and marketplace updates, and improve build caching.
+- **0.3.2:** Improve grid filtering, pagination, database object editing, saved queries, and Redis previews.
 
-Plugin Center is removed from toolbar navigation, overflow menus, settings and plugin shortcut settings buttons. Legacy preferences and install links cannot reopen it. Marketplace update checks are disabled; Driver Manager, JDBC and existing database/plugin runtime support remain available.
-
-Prototype CI builds now use ThinLTO and 16 code-generation units, cache compiled workspace crates, and cache pnpm downloads. The first build with the changed profile needs a fresh compilation cache; no fixed build-time reduction is promised. Existing in-progress builds are allowed to finish.
-
-## Changes in 0.3.2
-
-Reviewed database and interface changes from DBX 0.6.45: grid filters and pagination, Oracle constraints and object rename previews, table structure editing, saved default queries, Save All Tabs, Redis value previews, SQL-file retry fixes, Thai translations, and database-driver/plugin cleanup. AI conversation changes, AI SQL execution feedback, AI provider updates and MCP discovery are excluded. TablePilot branding, hidden GitHub GUI links and its own installer/release workflows are preserved.
-
-## Download installers
-
-Open [TablePilot Releases](https://github.com/deckeeper/TablePilot/releases), expand **Assets**, and download the Windows `.exe` or Linux `.deb`. Public repository releases can be downloaded without signing in. If visibility is still private, automatic checks will report that the repository must be public. Releases retain downloads beyond the 30-day Actions artifact window. The original 0.3.0 installers are also published from their verified build artifacts; the GitHub GUI link cleanup is included in 0.3.1.
-
-## Review upstream updates
-
-**Review DBX upstream updates** checks the latest stable DBX release daily at 06:23 UTC (GitHub may delay scheduled runs), or from **Actions → Run workflow**. It prepares an `upstream/dbx-v…` branch and attempts to open a draft pull request. It never merges into `main`.
-
-The proposal copies only regular files that still match the pinned DBX baseline. The fork modification/omission list, AI-related paths, dependencies, build scripts and workflows are protected. Its report lists everything requiring manual review. Filters do not guarantee compatibility or the absence of newly introduced AI calls: review the diff and test before merging. The DBX baseline is not advanced automatically. After reviewing skipped changes, update `.tablepilot/upstream.json`, run `python scripts/tablepilot-source-manifest.py` to refresh `SOURCE_SHA256.json`, bump TablePilot's version, and validate the candidate.
-
-If GitHub blocks the bot from opening pull requests, the proposal branch is still created and its compare link appears in the workflow summary. To allow future automatic draft PR creation, enable **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**. Existing proposal branches are never overwritten.
+See [release notes](https://github.com/deckeeper/TablePilot/releases) for each version and [validation notes](VALIDATION.md) for testing scope.
 
 ## Build an installer
+
 
 Use Node.js 24, pnpm 11.25.0 and stable Rust (at least 1.88). A development machine needs more memory than the installed application; allow at least 8 GB for the frontend type checker.
 
@@ -67,8 +58,16 @@ node scripts/build-tablepilot.mjs
 
 The Debian package is written to `target/release/bundle/deb/`.
 
-The **Build TablePilot installers** GitHub Actions workflow builds Windows and Linux installers on pushes to `main` and on manual runs. Once both builds pass, the separate **Publish TablePilot installers** workflow publishes the version in `package.json` as a GitHub prerelease in this repository, with checksums. Bump the version in `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and the `dbx` entry in `Cargo.lock` before publishing different installers; existing release assets are never silently replaced. A `[linux-only]` build only uploads its workflow artifact. Installers are unsigned until you configure your own signing certificate. Release notes record the exact build source commit. If workflow definitions have since changed, the release tag retains that application source while refreshing only workflows and their manifest hashes to the approved `main` definitions, as required by GitHub’s release permissions.
+## Development and releases
 
-Read `VALIDATION.md` for the checks actually completed on this prototype. Building source is not a substitute for testing an installer on Windows or testing against your database servers.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-Original licensing is in `LICENSE`. Retain it, upstream copyright notices and third-party notices when sharing this fork. See `FORK_CHANGES.md` for modifications.
+**Build TablePilot installers** builds Windows and Linux installers. After both pass, **Publish TablePilot installers** publishes a separate version with checksums. Stable versions from 0.4.0 onward are official releases. Existing release assets are never silently replaced.
+
+Before publishing changed installers, update the frontend package version, native package version, installer configuration and application entry in the workspace lockfile together. Refresh `SOURCE_SHA256.json` using `python scripts/tablepilot-source-manifest.py`. Documentation-only commits marked `[automation-only]` skip installer compilation.
+
+**Review upstream updates for TablePilot** checks for new stable dependency-project releases and prepares proposals for manual review. It never automatically merges changes. Application customizations, AI-related code, dependencies and build configuration require review. Source provenance and the pinned baseline are recorded in the maintenance configuration and legal notices.
+
+## License
+
+Distributed under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution and third-party notices, and [FORK_CHANGES.md](FORK_CHANGES.md) for modification records. Required notices are included with the installers.

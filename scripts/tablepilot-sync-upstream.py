@@ -101,9 +101,9 @@ def main():
         raise SystemExit('Only stable semantic-version tags are supported')
     version = lambda value: tuple(map(int, value.lstrip('v').split('.')))
     if version(tag) <= version(config['baseline_tag']):
-        summary('TablePilot has no newer stable DBX release to review.')
+        summary('TablePilot has no newer stable upstream release to review.')
         return
-    branch = f'upstream/dbx-{tag}'
+    branch = f'upstream/tablepilot-{tag}'
     if git('ls-remote', '--heads', 'origin', f'refs/heads/{branch}').stdout.strip():
         summary(f'Proposal already exists: https://github.com/{repo}/compare/main...{branch}. Existing review work was preserved.')
         return
@@ -119,7 +119,7 @@ def main():
     apply_plan(plan)
     report = Path(f'.tablepilot/proposals/{tag}.md')
     report.parent.mkdir(parents=True, exist_ok=True)
-    body = f'''# Review DBX {tag} for TablePilot
+    body = f'''# Review upstream {tag} for TablePilot
 
 Upstream: https://github.com/t8y2/dbx/releases/tag/{tag}
 Compare: https://github.com/t8y2/dbx/compare/{config['baseline_commit']}...{latest}
@@ -138,10 +138,10 @@ The baseline remains `{config['baseline_tag']}`. After reviewing every skipped c
     git('add', '--', str(report))
     git('config', 'user.name', 'TablePilot Upstream Bot')
     git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
-    git('commit', '-m', f'Propose DBX {tag} updates for manual TablePilot review')
+    git('commit', '-m', f'Propose upstream {tag} updates for manual TablePilot review')
     git('push', 'origin', f'HEAD:refs/heads/{branch}')
     result = run('gh', 'pr', 'create', '--repo', repo, '--base', 'main', '--head', branch,
-                 '--draft', '--title', f'Review DBX {tag} updates', '--body-file', str(report), check=False)
+                 '--draft', '--title', f'Review upstream {tag} updates for TablePilot', '--body-file', str(report), check=False)
     if result.returncode:
         summary(f'Candidate branch created: https://github.com/{repo}/compare/main...{branch}\n\nDraft PR creation was blocked: {result.stderr.strip()}\n\nIf GitHub reports Actions PR creation is disabled, enable Settings → Actions → General → Allow GitHub Actions to create and approve pull requests, or open the PR from the compare link.')
     else:

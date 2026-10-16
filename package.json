@@ -155,6 +155,6 @@
     "node": ">=22.13.0"
   },
   "packageManager": "pnpm@11.25.0",
-  "description": "TablePilot database workbench, based on DBX, without AI or MCP",
+  "description": "TablePilot desktop database workbench for Windows and Linux",
   "tablepilotForkNotice": "Modified from t8y2/dbx v0.6.45 under Apache-2.0. See FORK_CHANGES.md."
 }

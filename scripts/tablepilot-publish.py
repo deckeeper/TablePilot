@@ -144,7 +144,7 @@ Source commit: `{args.target}`.
     else:
         changes = {
             '0.3.1': 'Remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.',
-            '0.3.2': 'Integrate reviewed DBX 0.6.45 database and interface improvements, excluding AI/MCP changes.',
+            '0.3.2': 'Integrate reviewed database and interface improvements, excluding AI/MCP changes.',
             '0.4.1': 'Security maintenance: remove vulnerable JavaScript development dependency chains while preserving existing UI styles. Update from 0.4.0 using the installer for your platform. See FORK_CHANGES.md for scope and validation limitations.',
             '0.4.0': 'First official TablePilot release. Clean up product branding and About; check this repository automatically for complete official releases and display its release history. Download updates from the release page.',
             '0.3.3': 'Remove Plugin Center navigation and marketplace updates while preserving Driver Manager/JDBC. Use faster prototype build settings and expanded compilation caching.',

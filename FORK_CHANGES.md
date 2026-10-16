@@ -3,6 +3,12 @@
 Based on reviewed non-AI changes through DBX v0.6.45, commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`.
 Modified on 14–16 October 2026 for the independent TablePilot desktop prototype.
 
+## Repository presentation (16 October 2026)
+
+- Replace landing pages and contributor guides with TablePilot-specific documentation, update issue templates and workflow display names, and remove inherited sponsorship links.
+- Preserve historical reference documents under `docs/upstream-reference/`. Keep licensing, attribution, source provenance, technical identifiers and published installer assets intact.
+- Clean historical release descriptions using a repository-scoped, body-only maintenance workflow with conflict checks. Documentation changes marked `[automation-only]` do not start new installer builds.
+
 ## TablePilot 0.4.1 security maintenance (16 October 2026)
 
 - Remove obsolete `@types/splitpanes`, which pulled in vulnerable Vue 2 (GHSA-5j4c-8p2g-v4jx). Splitpanes 4 supplies its own Vue 3 declarations.
@@ -38,7 +44,7 @@ Modified on 14–16 October 2026 for the independent TablePilot desktop prototyp
 - Refresh the JS dependency lock using the available pnpm version while respecting dependency supply-chain checks.
 - Omit the upstream web server and standalone CLI/MCP distributions from this desktop-only source package.
 
-Original copyright/license notices remain applicable. `README-UPSTREAM.md` describes the historical upstream release, including features absent from this fork. The current product documentation is `README.md` and `VALIDATION.md`.
+Original copyright/license notices remain applicable. `docs/upstream-reference/README.md` describes the historical upstream release, including features absent from this fork. The current product documentation is `README.md` and `VALIDATION.md`.
 
 ## Modified and added files
 
@@ -55,7 +61,7 @@ The following list is also the modification notice for formats such as JSON and 
 - `FORK_CHANGES.md`
 - `NOTICE`
 - `README-TABLEPILOT.md`
-- `README-UPSTREAM.md`
+- `docs/upstream-reference/README.md`
 - `README.md`
 - `SOURCE_SHA256.json`
 - `VALIDATION.md`

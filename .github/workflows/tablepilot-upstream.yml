@@ -1,4 +1,4 @@
-name: Review DBX upstream updates
+name: Review upstream updates for TablePilot
 on:
   schedule:
     - cron: '23 6 * * *'
@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   propose:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[automation-only]')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
