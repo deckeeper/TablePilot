@@ -3,7 +3,7 @@
 Based on reviewed non-AI changes through DBX v0.6.45, commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`.
 Modified on 14–16 October 2026 for the independent TablePilot desktop prototype.
 
-## Security maintenance (unreleased, 16 October 2026)
+## TablePilot 0.4.1 security maintenance (16 October 2026)
 
 - Remove obsolete `@types/splitpanes`, which pulled in vulnerable Vue 2 (GHSA-5j4c-8p2g-v4jx). Splitpanes 4 supplies its own Vue 3 declarations.
 - Remove the shadcn-vue component-generator dependency and its vulnerable `braces` chain (GHSA-vfj7-8cjw-p6xm). Preserve its 2.8.2 Tailwind stylesheet unchanged locally, with its MIT license in the stylesheet and bundled NOTICE. Existing generated components remain in the app.
