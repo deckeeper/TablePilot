@@ -279,7 +279,7 @@ describe("settings search", () => {
     expect(definitions).toHaveLength(TOOLBAR_VISIBILITY_ITEMS.length);
     expect(definitions.map((definition) => definition.id)).toEqual(TOOLBAR_VISIBILITY_ITEMS.map((item) => `appearance-toolbar-${item.key}`));
     expect(definitions).toContainEqual({ id: "appearance-toolbar-dataTransfer", category: "appearance", titleKey: "transfer.dataTransfer", targetId: "appearance" });
-    expect(definitions).toContainEqual({ id: "appearance-toolbar-ai", category: "appearance", title: "AI", targetId: "appearance" });
+    expect(definitions.map((definition) => definition.id)).not.toContain("appearance-toolbar-ai");
     expect(definitions).toContainEqual({ id: "appearance-toolbar-alwaysOnTop", category: "appearance", titleKey: "toolbar.alwaysOnTop", targetId: "appearance", visible: expect.any(Function) });
   });
 
@@ -394,4 +394,11 @@ describe("settings search", () => {
       expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual(expect.objectContaining(expectedControl));
     }
   });
+});
+
+// TablePilot's removed Plugin Center must not be re-enabled through appearance settings.
+it("keeps Driver Manager configurable without exposing a Plugin Center toggle", () => {
+  expect(TOOLBAR_VISIBILITY_ITEMS.some((item) => item.key === "pluginCenter")).toBe(false);
+  expect(TOOLBAR_VISIBILITY_ITEMS.some((item) => item.key === "driverManager")).toBe(true);
+  expect(createToolbarVisibilitySettingsSearchDefinitions().some((entry) => entry.id === "appearance-toolbar-pluginCenter")).toBe(false);
 });

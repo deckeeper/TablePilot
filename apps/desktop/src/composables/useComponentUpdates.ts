@@ -1,3 +1,4 @@
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
 // TablePilot modification: see FORK_CHANGES.md.
 import { computed, ref } from "vue";
 import * as api from "@/lib/backend/api";
@@ -82,10 +83,10 @@ export function useComponentUpdates(options: { isDesktop: boolean }) {
           drivers.value = previewDriverUpdates();
           jdbcPluginStatus.value = previewJdbcUpdate();
           mcpStatus.value = previewMcpUpdate();
-          pluginListings.value = previewPluginUpdates();
+          pluginListings.value = PLUGIN_CENTER_ENABLED ? previewPluginUpdates() : [];
           return true;
         }
-        const [agentResult, jdbcResult, mcpResult, installedPluginsResult, catalogsResult] = await Promise.allSettled([api.listInstalledAgents(), api.jdbcPluginStatus(), api.checkMcpServerStatus(), api.listPlugins(), api.fetchPluginMarketplaceCatalogs()]);
+        const [agentResult, jdbcResult, mcpResult, installedPluginsResult, catalogsResult] = await Promise.allSettled([api.listInstalledAgents(), api.jdbcPluginStatus(), api.checkMcpServerStatus(), PLUGIN_CENTER_ENABLED ? api.listPlugins() : Promise.resolve([]), PLUGIN_CENTER_ENABLED ? api.fetchPluginMarketplaceCatalogs() : Promise.resolve([])]);
         if (version !== refreshVersion) return false;
         const errors: string[] = [];
         if (agentResult.status === "fulfilled") drivers.value = agentResult.value;
@@ -103,7 +104,9 @@ export function useComponentUpdates(options: { isDesktop: boolean }) {
           mcpStatus.value = null;
           errors.push(`MCP: ${mcpResult.reason instanceof Error ? mcpResult.reason.message : String(mcpResult.reason)}`);
         }
-        if (installedPluginsResult.status === "fulfilled" && catalogsResult.status === "fulfilled") {
+        if (!PLUGIN_CENTER_ENABLED) {
+          pluginListings.value = [];
+        } else if (installedPluginsResult.status === "fulfilled" && catalogsResult.status === "fulfilled") {
           pluginListings.value = buildMarketplacePluginListings(catalogsResult.value, installedPluginsResult.value, currentLocale());
         } else {
           pluginListings.value = [];
@@ -164,6 +167,7 @@ export function useComponentUpdates(options: { isDesktop: boolean }) {
   }
 
   async function updatePlugins(result: ComponentUpdateResult) {
+    if (!PLUGIN_CENTER_ENABLED) return;
     // Listings whose recorded provenance differs from the offering repository/publisher/key need an
     // explicit confirmation, which the automatic path cannot give: keep them visible in the update
     // center (they still count) but let the user confirm them in the Plugin Center instead.

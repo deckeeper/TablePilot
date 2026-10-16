@@ -1,7 +1,7 @@
 # TablePilot modification: AI/MCP runtime dependency removed.
 [package]
 name = "dbx"
-version = "0.3.2"
+version = "0.3.3"
 description = "Open-source database management tool"
 authors = ["skyler"]
 license = "Apache-2.0"

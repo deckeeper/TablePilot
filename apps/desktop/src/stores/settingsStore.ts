@@ -1,5 +1,5 @@
 // TablePilot modification: AI/MCP initialization is disabled.
-import { AI_ENABLED } from "@/lib/tablepilot";
+import { AI_ENABLED, PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
 import { normalizeModelTemplates, type ModelTemplate } from "@/lib/model/modelTemplates";
 import { normalizePluginGraphicsEngineIds } from "@/lib/plugins/pluginGraphicsEngine";
 import { normalizePluginShortcutSettings, type PluginShortcutSettings } from "@/lib/plugins/pluginShortcuts";
@@ -1246,7 +1246,7 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   immediateSync: false,
   dataTransfer: true,
   driverManager: true,
-  pluginCenter: true,
+  pluginCenter: PLUGIN_CENTER_ENABLED,
   sqlFile: true,
   schemaDiff: true,
   dataCompare: true,
@@ -1496,7 +1496,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   autoUpdateDrivers: true,
   autoUpdateJdbc: true,
   autoUpdateMcp: false,
-  autoUpdatePlugins: true,
+  autoUpdatePlugins: PLUGIN_CENTER_ENABLED,
   sidebarHiddenTablePrefixes: [],
   sidebarCopyTableNameSeparator: "comma",
   sidebarCopyTableNameIncludeSchema: false,
@@ -1874,7 +1874,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     immediateSync: items.immediateSync ?? defaults.immediateSync,
     dataTransfer: items.dataTransfer ?? defaults.dataTransfer,
     driverManager: items.driverManager ?? defaults.driverManager,
-    pluginCenter: items.pluginCenter ?? defaults.pluginCenter,
+    pluginCenter: PLUGIN_CENTER_ENABLED && (items.pluginCenter ?? defaults.pluginCenter),
     sqlFile: items.sqlFile ?? defaults.sqlFile,
     schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
     dataCompare: items.dataCompare ?? defaults.dataCompare,
@@ -1938,7 +1938,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
   const autoUpdateDrivers = typeof settings.autoUpdateDrivers === "boolean" ? settings.autoUpdateDrivers : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers;
   const autoUpdateJdbc = typeof settings.autoUpdateJdbc === "boolean" ? settings.autoUpdateJdbc : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc;
   const autoUpdateMcp = typeof settings.autoUpdateMcp === "boolean" ? settings.autoUpdateMcp : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdateMcp;
-  const autoUpdatePlugins = typeof settings.autoUpdatePlugins === "boolean" ? settings.autoUpdatePlugins : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins;
+  const autoUpdatePlugins = PLUGIN_CENTER_ENABLED && (typeof settings.autoUpdatePlugins === "boolean" ? settings.autoUpdatePlugins : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins);
   const customThemes = (() => {
     if (Array.isArray(settings.customThemes) && settings.customThemes.length > 0) {
       return settings.customThemes.map((theme) => {
@@ -3063,7 +3063,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.autoUpdateDrivers !== undefined) editorSettings.value.autoUpdateDrivers = partial.autoUpdateDrivers;
     if (partial.autoUpdateJdbc !== undefined) editorSettings.value.autoUpdateJdbc = partial.autoUpdateJdbc;
     if (partial.autoUpdateMcp !== undefined) editorSettings.value.autoUpdateMcp = partial.autoUpdateMcp;
-    if (partial.autoUpdatePlugins !== undefined) editorSettings.value.autoUpdatePlugins = partial.autoUpdatePlugins;
+    if (partial.autoUpdatePlugins !== undefined) editorSettings.value.autoUpdatePlugins = PLUGIN_CENTER_ENABLED && partial.autoUpdatePlugins;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarCopyTableNameSeparator !== undefined) editorSettings.value.sidebarCopyTableNameSeparator = normalizeSidebarCopyTableNameSeparator(partial.sidebarCopyTableNameSeparator);
     if (partial.sidebarCopyTableNameIncludeSchema !== undefined) editorSettings.value.sidebarCopyTableNameIncludeSchema = partial.sidebarCopyTableNameIncludeSchema === true;

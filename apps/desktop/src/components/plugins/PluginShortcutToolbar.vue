@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
+
 import { computed, inject, nextTick, onScopeDispose, ref, watch } from "vue";
 import { OPEN_PLUGIN_SETTINGS } from "@/lib/plugins/pluginCenterNavigation";
 import { useI18n } from "vue-i18n";
@@ -20,7 +22,7 @@ const emit = defineEmits<{ "layout-change": [] }>();
 const { t } = useI18n();
 const settings = useSettingsStore();
 const openSettings = inject(OPEN_PLUGIN_SETTINGS, () => {});
-const showSettingsEntry = computed(() => settings.editorSettings.pluginShortcuts.showSettingsEntry);
+const showSettingsEntry = computed(() => PLUGIN_CENTER_ENABLED && settings.editorSettings.pluginShortcuts.showSettingsEntry);
 const { toast } = useToast();
 const { entries, open, isActive } = usePluginShortcuts();
 const { update, saving } = usePluginShortcutPreferences();

@@ -1,5 +1,7 @@
 <!-- TablePilot modification: AI/MCP interface entries removed. -->
 <script setup lang="ts">
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
+
 import { blockingDesktopAiRunsForUpdate } from "@/lib/ai/desktopAiRunRegistry";
 import { setupUpdatePreparation, prepareUpdateWithDraftRecovery, isUpdatePreparationActive } from "@/lib/app/updatePreparation";
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, provide } from "vue";
@@ -1309,6 +1311,7 @@ async function openImmediateSync() {
 type MainContentSurface = "query" | "settings" | "driverStore" | "pluginCenter";
 
 function activateMainContentSurface(surface: MainContentSurface) {
+  if (surface === "pluginCenter" && !PLUGIN_CENTER_ENABLED) return;
   settingsStore.settingsPageActive = surface === "settings";
   driverStoreActive.value = surface === "driverStore";
   pluginCenterActive.value = surface === "pluginCenter";
@@ -1426,6 +1429,7 @@ function closeDriverStorePage() {
 }
 
 function openPluginCenterPage(focus?: PluginCenterFocus | null) {
+  if (!PLUGIN_CENTER_ENABLED) return;
   pluginCenterFocus.value = focus ?? null;
   pluginCenterTabOpen.value = true;
   activateMainContentSurface("pluginCenter");
@@ -3112,6 +3116,7 @@ const pluginCenterInstallRequest = ref<{ id: number; url: string } | null>(null)
 let pluginInstallDeepLinkId = 0;
 
 async function openPluginInstallDeepLink(url: string) {
+  if (!PLUGIN_CENTER_ENABLED) return;
   try {
     const draft = parsePluginInstallDeepLink(url);
     if (!draft) return;
@@ -3128,7 +3133,7 @@ async function openPluginInstallDeepLink(url: string) {
 }
 
 async function openPendingPluginInstallLinks() {
-  if (!isTauriRuntime()) return;
+  if (!PLUGIN_CENTER_ENABLED || !isTauriRuntime()) return;
   try {
     const links = await api.pendingOpenPluginInstallLinks();
     for (const link of links) {
@@ -4959,7 +4964,7 @@ onUnmounted(() => {
                   @update-count-change="updateAgentDriverUpdateCount"
                 />
                 <PluginCenterPage
-                  v-if="pluginCenterTabOpen"
+                  v-if="PLUGIN_CENTER_ENABLED && pluginCenterTabOpen"
                   v-show="pluginCenterActive"
                   class="flex-1 min-h-0"
                   :focus-target="pluginCenterFocus"

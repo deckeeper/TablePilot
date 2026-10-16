@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
+
 import { computed, inject, ref, watch } from "vue";
 import { Settings2 } from "@lucide/vue";
 import { OPEN_PLUGIN_SETTINGS } from "@/lib/plugins/pluginCenterNavigation";
@@ -20,7 +22,7 @@ const props = defineProps<{ position: PluginShortcutPosition }>();
 const { t } = useI18n();
 const settings = useSettingsStore();
 const openSettings = inject(OPEN_PLUGIN_SETTINGS, () => {});
-const showSettingsEntry = computed(() => settings.editorSettings.pluginShortcuts.showSettingsEntry);
+const showSettingsEntry = computed(() => PLUGIN_CENTER_ENABLED && settings.editorSettings.pluginShortcuts.showSettingsEntry);
 const { toast } = useToast();
 const { entries, allEntries, open, isActive } = usePluginShortcuts();
 const { update, saving } = usePluginShortcutPreferences();

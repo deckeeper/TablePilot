@@ -49,3 +49,13 @@ node node_modules/vitest/vitest.mjs run --maxWorkers=1 \
 - Desktop/core/workspace dependency declarations retain the AI/MCP/updater exclusions. Native command/API and plugin host.ai blocks remain in place.
 
 Native Rust compilation was not run for this update because this session has no Rust toolchain. The earlier 0.3.0 native check does not validate these newer Rust changes. Windows/Linux installer compilation runs in GitHub Actions after merge; publication requires both builds to succeed. Live database connections, SSH jump-host operation, installer launch and end-to-end CSV/Excel round trips still require manual testing.
+
+## 0.3.3 Plugin Center removal — 16 October 2026
+
+- Full Vue/TypeScript type check and production frontend build passed (existing chunk-size/dynamic-import warnings).
+- Focused regression results: **203 tests passed across 9 files**, with 45 existing AI/MCP tests skipped. Initial failures were inherited expectations for DBX branding and an AI toolbar setting; the two affected files passed after their expectations were updated for TablePilot.
+- New tests verify that expanded/collapsed toolbars hide Plugin Center even with legacy settings, Driver Manager still opens, old plugin preferences normalize to disabled, marketplace checks/installations do not run, and driver/JDBC checks and updates still work.
+- Two release-packaging tests passed. The build workflow parsed successfully and retains non-cancelling concurrency; Python release automation compiles.
+- Windows/Linux CI builds now use ThinLTO, 16 code-generation units, workspace-crate caching and pnpm caching. The first build with this profile needs a fresh compiled cache. Build duration and runtime performance have not been benchmarked.
+
+Native installer compilation and installation remain pending GitHub Actions/manual testing for this version. No Rust implementation changes were made (only the package version). Existing native build jobs are not cancelled.

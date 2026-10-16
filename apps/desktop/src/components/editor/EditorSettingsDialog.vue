@@ -1,5 +1,7 @@
 <!-- TablePilot modification: AI/MCP interface entries removed. -->
 <script setup lang="ts">
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
+
 
 import { HISTORY_RETENTION_LIMITS, useHistoryRetentionSetting } from "@/composables/useHistoryRetentionSetting";
 import { ref, watch, shallowRef, computed, onMounted, onUnmounted, nextTick } from "vue";
@@ -9243,7 +9245,7 @@ LIMIT 100;</pre>
                     </div>
                   </div>
 
-                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
+                  <div v-if="PLUGIN_CENTER_ENABLED" class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
                     <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-plugin-center')">
                       <div class="font-medium">{{ t("settings.updatePlugins") }}</div>
                       <div class="flex items-center gap-1.5" :class="updateCheckLoading.plugins ? 'text-muted-foreground' : (props.pluginUpdateCount || 0) > 0 ? 'text-primary' : 'text-muted-foreground'">

@@ -1,5 +1,7 @@
 <!-- TablePilot modification: AI/MCP interface entries removed. -->
 <script setup lang="ts">
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
+
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
@@ -167,7 +169,7 @@ const toolbarEl = ref<HTMLElement>();
 const newConnectionLabelEl = ref<HTMLElement>();
 const toolbarCollapsed = ref(false);
 const pluginCenterGroup = ref<HTMLElement | null>(null);
-const showPluginCenterShortcuts = computed(() => settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position === "plugin-center");
+const showPluginCenterShortcuts = computed(() => PLUGIN_CENTER_ENABLED && settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position === "plugin-center");
 const shouldReserveTrafficLightInset = computed(() => shouldReserveMacTrafficLightInset(isMac, isFullscreen.value, isDesktop));
 
 function checkToolbarWidth() {
@@ -460,7 +462,7 @@ function buildToolbarMenuItems(includeVisiblePrimaryItems: boolean): ToolbarMenu
       disabled: false,
     });
   }
-  if (includeVisiblePrimaryItems || !toolbarItems.value.pluginCenter) {
+  if (PLUGIN_CENTER_ENABLED && (includeVisiblePrimaryItems || !toolbarItems.value.pluginCenter)) {
     items.push({ value: "plugin-center", label: t("toolbar.pluginCenter"), icon: PlugZap, action: () => emit("open-plugin-center"), disabled: false });
   }
   if (toolbarItems.value.sqlFile) {
@@ -595,7 +597,7 @@ const toolbarStyle = computed(() => {
         <!-- 小圆点仅提示"有可更新驱动"，具体数量交给对话框内标签页红点展示，避免工具栏长期挂红数字。 -->
         <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-block h-2 w-2 rounded-full bg-red-500" :aria-label="t('toolbar.updatableDriverCount')" :title="t('toolbar.updatableDriverCount')" />
       </Button>
-      <div v-if="toolbarItems.pluginCenter || showPluginCenterShortcuts" ref="pluginCenterGroup" class="flex shrink-0 items-center rounded-md" :class="{ 'bg-accent': showPluginCenter }">
+      <div v-if="PLUGIN_CENTER_ENABLED && (toolbarItems.pluginCenter || showPluginCenterShortcuts)" ref="pluginCenterGroup" class="flex shrink-0 items-center rounded-md" :class="{ 'bg-accent': showPluginCenter }">
         <Button v-if="toolbarItems.pluginCenter" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'rounded-r-none': showPluginCenterShortcuts }]" @click="emit('open-plugin-center')">
           <PlugZap class="h-3.5 w-3.5" />
           <span :class="toolbarTextLabelClass">{{ t("toolbar.pluginCenter") }}</span>

@@ -67,7 +67,6 @@ export type ToolbarVisibilityItem = ({ key: ToolbarVisibilityItemKey; titleKey: 
 export const TOOLBAR_VISIBILITY_ITEMS: readonly ToolbarVisibilityItem[] = [
   { key: "dataTransfer", titleKey: "transfer.dataTransfer" },
   { key: "driverManager", titleKey: "toolbar.driverManager" },
-  { key: "pluginCenter", titleKey: "toolbar.pluginCenter" },
   { key: "sqlFile", titleKey: "sqlFile.title" },
   { key: "schemaDiff", titleKey: "diff.title" },
   { key: "dataCompare", titleKey: "dataCompare.title" },
@@ -325,7 +324,6 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "updates-drivers", category: "updates", titleKey: "settings.autoUpdateDrivers", descriptionKey: "settings.autoUpdateDriversDescription", targetId: "updates" },
   { id: "updates-jdbc", category: "updates", titleKey: "settings.autoUpdateJdbc", descriptionKey: "settings.autoUpdateJdbcDescription", targetId: "updates" },
   { id: "updates-mcp", category: "updates", titleKey: "settings.autoUpdateMcp", descriptionKey: "settings.autoUpdateMcpDescription", targetId: "updates" },
-  { id: "updates-plugins", category: "updates", titleKey: "settings.autoUpdatePlugins", descriptionKey: "settings.autoUpdatePluginsDescription", targetId: "updates" },
   { id: "updates-source", category: "updates", titleKey: "settings.updateDownloadSource", descriptionKey: "settings.updateDownloadSourceDescription", targetId: "updates" },
 ];
 

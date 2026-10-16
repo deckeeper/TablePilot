@@ -132,7 +132,7 @@ describe("AppToolbar web branding (#8703, #11053)", () => {
     document.body.innerHTML = "";
   });
 
-  it("renders the DBX brand logo and title on web mode on the left by default", async () => {
+  it("renders the TablePilot brand logo and title on web mode on the left by default", async () => {
     mockIsTauriRuntime = false;
     const { host, unmount } = mount();
     await nextTick();
@@ -142,11 +142,11 @@ describe("AppToolbar web branding (#8703, #11053)", () => {
     expect(brandEl?.getAttribute("href")).toBe("https://dbxio.com");
     expect(brandEl?.getAttribute("target")).toBe("_blank");
     expect(brandEl?.getAttribute("rel")).toBe("noopener noreferrer");
-    expect(brandEl?.textContent).toContain("DBX");
+    expect(brandEl?.textContent).toContain("TablePilot");
 
     const logoImg = brandEl?.querySelector("img");
     expect(logoImg).not.toBeNull();
-    expect(logoImg?.getAttribute("alt")).toBe("DBX");
+    expect(logoImg?.getAttribute("alt")).toBe("TablePilot");
 
     // Located at the very start of toolbar (left position)
     const toolbar = host.querySelector(".app-toolbar");
@@ -155,7 +155,7 @@ describe("AppToolbar web branding (#8703, #11053)", () => {
     unmount();
   });
 
-  it("renders the DBX brand logo on the right when configured (#11053)", async () => {
+  it("renders the TablePilot brand logo on the right when configured (#11053)", async () => {
     mockIsTauriRuntime = false;
     const settingsStore = useSettingsStore();
     settingsStore.updateEditorSettings({ webLogoPosition: "right" });
@@ -165,7 +165,7 @@ describe("AppToolbar web branding (#8703, #11053)", () => {
 
     const brandEl = host.querySelector('[data-testid="web-brand-logo"]');
     expect(brandEl).not.toBeNull();
-    expect(brandEl?.textContent).toContain("DBX");
+    expect(brandEl?.textContent).toContain("TablePilot");
 
     const toolbar = host.querySelector(".app-toolbar");
     const children = Array.from(toolbar?.children ?? []);

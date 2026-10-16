@@ -1,4 +1,4 @@
-# TablePilot 0.3.2 prototype
+# TablePilot 0.3.3 prototype
 
 An independent desktop fork of [DBX v0.6.45](https://github.com/t8y2/dbx/tree/v0.6.45), commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`, licensed under Apache-2.0.
 
@@ -7,6 +7,12 @@ The database workbench, SQL editor, CSV/Excel import/export, field mapping, SSH 
 The AI provider runtime and MCP services are excluded from the desktop build. Their native commands and startup servers are removed. AI chat/settings/menu controls are removed, plugin `host.ai` access is denied, and the shared frontend API rejects AI/MCP calls. Some passive legacy configuration types remain to keep the shared database/settings format readable; they cannot execute models or start an MCP server.
 
 TablePilot has its own app identifier, credential-store service and portable-data marker. DBX's app updater is removed. Database driver downloads still use the upstream driver distribution service. This is not an entirely offline product, and third-party plugins retain their own declared network permissions.
+
+## Changes in 0.3.3
+
+Plugin Center is removed from toolbar navigation, overflow menus, settings and plugin shortcut settings buttons. Legacy preferences and install links cannot reopen it. Marketplace update checks are disabled; Driver Manager, JDBC and existing database/plugin runtime support remain available.
+
+Prototype CI builds now use ThinLTO and 16 code-generation units, cache compiled workspace crates, and cache pnpm downloads. The first build with the changed profile needs a fresh compilation cache; no fixed build-time reduction is promised. Existing in-progress builds are allowed to finish.
 
 ## Changes in 0.3.2
 

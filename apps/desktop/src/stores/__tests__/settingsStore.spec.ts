@@ -499,6 +499,15 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).updateDownloadSource).toBe("official");
   });
 
+  it("disables Plugin Center and marketplace updates in legacy settings without changing Driver Manager", () => {
+    const settings = normalizeEditorSettings({ toolbarItems: { pluginCenter: true, driverManager: true }, autoUpdatePlugins: true });
+    expect(settings.toolbarItems.pluginCenter).toBe(false);
+    expect(settings.autoUpdatePlugins).toBe(false);
+    expect(settings.toolbarItems.driverManager).toBe(true);
+    expect(settings.autoUpdateDrivers).toBe(true);
+    expect(settings.autoUpdateJdbc).toBe(true);
+  });
+
   it("migrates legacy update opt-outs without overriding explicit category settings", () => {
     expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(false);
     expect(normalizeEditorSettings({ autoDownloadUpdates: true }).autoDownloadUpdates).toBe(true);

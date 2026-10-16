@@ -5,6 +5,9 @@ Modified on 14–16 October 2026 for the independent TablePilot desktop prototyp
 
 ## Changes
 
+- TablePilot 0.3.3 removes Plugin Center toolbar/menu/settings navigation, shortcut settings entries and install-link access. Existing preferences cannot enable it. Marketplace checking/updating is disabled, while database drivers, JDBC and installed plugin runtime support are retained.
+- Future prototype installer builds use ThinLTO with 16 code-generation units, cache workspace crates and pnpm downloads, and keep non-cancelling build concurrency. Existing running jobs use their original source/configuration.
+
 - TablePilot 0.3.2 integrates reviewed non-AI DBX 0.6.45 database, grid, query, schema, locale and driver changes. AI SQL feedback, conversation storage/settings, provider updates and MCP discovery changes are excluded.
 - Keep the existing TablePilot dependency lock/toolchain and release workflows. Clipboard image reads are enabled for the existing ordinary plugin clipboard feature.
 
@@ -66,16 +69,23 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/components/layout/EditorToolbar.vue`
 - `apps/desktop/src/components/layout/QueryResultToolbarActions.vue`
 - `apps/desktop/src/components/layout/StartupLoading.vue`
+- `apps/desktop/src/components/layout/UpdateDialog.vue`
 - `apps/desktop/src/components/layout/WelcomeScreen.vue`
+- `apps/desktop/src/components/layout/__tests__/AppToolbar.tablepilotPlugins.spec.ts`
+- `apps/desktop/src/components/layout/__tests__/AppToolbar.webBranding.spec.ts`
 - `apps/desktop/src/components/plugins/PluginAiAccessSection.vue`
 - `apps/desktop/src/components/plugins/PluginContributionsPanel.vue`
+- `apps/desktop/src/components/plugins/PluginShortcutBar.vue`
+- `apps/desktop/src/components/plugins/PluginShortcutToolbar.vue`
 - `apps/desktop/src/components/settings/ChangelogPanel.vue`
+- `apps/desktop/src/composables/__tests__/useComponentUpdates.tablepilot.spec.ts`
 - `apps/desktop/src/composables/__tests__/useSqlExecution.spec.ts`
 - `apps/desktop/src/composables/useAppUpdater.ts`
 - `apps/desktop/src/composables/useComponentUpdates.ts`
 - `apps/desktop/src/composables/useMcpUpdateBadge.ts`
 - `apps/desktop/src/composables/useSqlExecution.ts`
 - `apps/desktop/src/i18n/__tests__/backendErrors.spec.ts`
+- `apps/desktop/src/i18n/__tests__/editorSelectionContextParity.spec.ts`
 - `apps/desktop/src/i18n/__tests__/featureMessages.spec.ts`
 - `apps/desktop/src/i18n/locales/az.ts`
 - `apps/desktop/src/i18n/locales/consulAz.ts`
@@ -115,6 +125,7 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/lib/editor/shortcutRegistry.ts`
 - `apps/desktop/src/lib/plugins/pluginHostBridge.ts`
 - `apps/desktop/src/lib/plugins/pluginInstallDeepLink.ts`
+- `apps/desktop/src/lib/settings/__tests__/settingsSearch.spec.ts`
 - `apps/desktop/src/lib/settings/settingsSearch.ts`
 - `apps/desktop/src/lib/tablepilot.ts`
 - `apps/desktop/src/stores/__tests__/connectionStore.savePassword.spec.ts`
@@ -164,8 +175,6 @@ The following list is also the modification notice for formats such as JSON and 
 - `src-tauri/src/lib.rs`
 - `src-tauri/tauri.conf.json`
 - `src-tauri/tauri.linux.conf.json`
-
-- `apps/desktop/src/i18n/__tests__/editorSelectionContextParity.spec.ts`
 
 ## Upstream files omitted from this desktop edition
 

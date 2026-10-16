@@ -134,7 +134,12 @@ Source commit: `{args.target}`.
     if args.existing_prototype:
         text += '\nWindows source: `8b0a975c5d5bc261bf170012f2d59db95bd7d031`; Linux source: `adfb658b14e90cbeb275216dd8c0c520c54910e8` (Linux packaging dependency fix). These are the existing 0.3.0 installers; GUI link removal arrives in 0.3.1.\n'
     else:
-        text += '\nChanges: remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.\n'
+        changes = {
+            '0.3.1': 'Remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.',
+            '0.3.2': 'Integrate reviewed DBX 0.6.45 database and interface improvements, excluding AI/MCP changes.',
+            '0.3.3': 'Remove Plugin Center navigation and marketplace updates while preserving Driver Manager/JDBC. Use faster prototype build settings and expanded compilation caching.',
+        }
+        text += '\nChanges: ' + changes.get(args.version, 'See FORK_CHANGES.md and VALIDATION.md in the tagged source for this version.') + '\n'
     if target != args.target:
         text += f'\nThe release tag `{target}` retains the application source above; only workflow definitions and their source-manifest hashes were refreshed to the current approved workflows.\n'
     notes.write_text(text)

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { PLUGIN_CENTER_ENABLED } from "@/lib/tablepilot";
+
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { AlertTriangle, CheckCircle2, ChevronDown, Loader2, RefreshCw } from "@lucide/vue";
@@ -108,7 +110,7 @@ const tabs = computed(() => {
   if (props.driverUpdates.length) available.push({ id: "drivers", label: t("settings.updateDrivers"), count: props.driverUpdates.length });
   if (props.jdbcUpdate?.update_available) available.push({ id: "jdbc", label: t("settings.updateJdbc"), count: 1 });
   if (mcpAvailable.value) available.push({ id: "mcp", label: t("settings.updateMcp"), count: 1 });
-  if (props.pluginUpdates.length) available.push({ id: "plugins", label: t("settings.updatePlugins"), count: props.pluginUpdates.length });
+  if (PLUGIN_CENTER_ENABLED && props.pluginUpdates.length) available.push({ id: "plugins", label: t("settings.updatePlugins"), count: props.pluginUpdates.length });
   return available;
 });
 const totalUpdateCount = computed(() => tabs.value.reduce((total, tab) => total + tab.count, 0));
