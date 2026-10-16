@@ -13,6 +13,7 @@ import ko from "@/i18n/locales/ko";
 import ptBR from "@/i18n/locales/pt-BR";
 import ru from "@/i18n/locales/ru";
 import tr from "@/i18n/locales/tr";
+import th from "@/i18n/locales/th";
 import zhCN from "@/i18n/locales/zh-CN";
 import zhTW from "@/i18n/locales/zh-TW";
 import { PHOENIX_DRIVER_NOT_INSTALLED_ERROR, PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR } from "@/lib/database/phoenixConnection";
@@ -27,6 +28,7 @@ const LOCALES = {
   ko,
   "pt-BR": ptBR,
   ru,
+  th,
   tr,
   "zh-CN": zhCN,
   "zh-TW": zhTW,
@@ -257,6 +259,7 @@ function lookup(messages: Record<string, unknown>, key: string): unknown {
   return key.split(".").reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], messages);
 }
 
+// TablePilot does not ship the upstream web-server crate.
 describe("backend error translation", () => {
   test.each(CASES)("$name resolves to a defined English key", ({ key }) => {
     expect(lookup(en as unknown as Record<string, unknown>, key)).toEqual(expect.any(String));
@@ -678,8 +681,6 @@ describe("backend error wording is pinned to the Rust sources", () => {
     ["crates/dbx-core/src/admin/mq/adapters/kafka.rs", "Kafka does not support unloading topics"],
     ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin update source change requires confirmation:"],
     ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin downgrade to version "],
-    ["crates/dbx-web/src/auth.rs", "Please try again in {remaining}s"],
-    ["crates/dbx-web/src/routes/agents.rs", "Close these database connections before updating drivers: "],
     ["src-tauri/src/commands/agents.rs", "Close these database connections before updating drivers: "],
     ["src-tauri/src/commands/fs_open.rs", "file does not exist: "],
   ])("%s still emits %j", (path, fragment) => {

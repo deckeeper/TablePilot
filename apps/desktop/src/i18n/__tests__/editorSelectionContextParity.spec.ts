@@ -1,3 +1,5 @@
+// TablePilot does not expose Send to AI or add new AI translations.
+import { AI_ENABLED } from "@/lib/tablepilot";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
@@ -19,7 +21,7 @@ function declaredString(source: string, key: string): string | undefined {
   return source.match(new RegExp(String.raw`^\s*${key}:\s*"((?:[^"\\]|\\.)*)",\s*$`, "m"))?.[1];
 }
 
-describe("editor selection context locale parity", () => {
+describe.skipIf(!AI_ENABLED)("editor selection context locale parity", () => {
   it.each(LOCALES)("%s declares the selection-context keys", (name) => {
     const source = localeSource(name);
 

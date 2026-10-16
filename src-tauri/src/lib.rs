@@ -716,7 +716,12 @@ pub(crate) fn request_app_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, ta
     let _ = app.emit(APP_CLOSE_REQUESTED_EVENT, target);
 }
 
-fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
+fn register_deep_link_state<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    // macOS can deliver Opened before setup, so its queue must already exist.
+    builder.manage(commands::deep_link::DeepLinkOpenState::default())
+}
+
+fn open_connection_deep_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>, links: Vec<String>) {
     if links.is_empty() {
         return;
     }
@@ -747,6 +752,7 @@ fn open_plugin_install_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
 enum LocaleFamily {
     Azerbaijani,
     English,
+    Thai,
     SimplifiedChinese,
     TraditionalChinese,
     Japanese,
@@ -776,6 +782,8 @@ fn locale_family(locale: &str) -> LocaleFamily {
         }
     } else if is_language("ja") {
         LocaleFamily::Japanese
+    } else if is_language("th") {
+        LocaleFamily::Thai
     } else if is_language("ko") {
         LocaleFamily::Korean
     } else if is_language("az") {
@@ -801,6 +809,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese => ("显示 TablePilot", "退出 TablePilot"),
         LocaleFamily::TraditionalChinese => ("顯示 TablePilot", "退出 TablePilot"),
+        LocaleFamily::Thai => ("แสดง TablePilot", "ออกจาก TablePilot"),
         LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
         LocaleFamily::Korean => ("TablePilot 표시", "TablePilot 종료"),
         LocaleFamily::Azerbaijani => ("TablePilot-i göstər", "TablePilot-dən çıx"),
@@ -820,6 +829,7 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese => "复制支持信息",
         LocaleFamily::TraditionalChinese => "複製支援資訊",
+        LocaleFamily::Thai => "คัดลอกข้อมูลสำหรับขอความช่วยเหลือ",
         LocaleFamily::Japanese => "サポート情報をコピー",
         LocaleFamily::Korean => "지원 정보 복사",
         LocaleFamily::Azerbaijani => "Dəstək məlumatlarını kopyala",
@@ -838,6 +848,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese => "关闭标签页",
         LocaleFamily::TraditionalChinese => "關閉分頁",
+        LocaleFamily::Thai => "ปิดแท็บ",
         LocaleFamily::Japanese => "タブを閉じる",
         LocaleFamily::Korean => "탭 닫기",
         LocaleFamily::Azerbaijani => "Vərəqi bağla",
@@ -855,6 +866,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
 fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese | LocaleFamily::TraditionalChinese => format!("退出 {app_name}"),
+        LocaleFamily::Thai => format!("ออกจาก {app_name}"),
         LocaleFamily::Japanese => format!("{app_name}を終了"),
         LocaleFamily::Korean => format!("{app_name} 종료"),
         LocaleFamily::Azerbaijani => format!("{app_name}-dən çıx"),
@@ -1115,6 +1127,8 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("zh-Hant-HK"), ("顯示 TablePilot", "退出 TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 TablePilot", "退出 TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
+        assert_eq!(tray_menu_labels_for_locale("th-TH"), ("แสดง TablePilot", "ออกจาก TablePilot"));
+        assert_eq!(tray_menu_labels_for_locale("th_TH"), ("แสดง TablePilot", "ออกจาก TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("TablePilot 표시", "TablePilot 종료"));
         assert_eq!(tray_menu_labels_for_locale("az-AZ"), ("TablePilot-i göstər", "TablePilot-dən çıx"));
         assert_eq!(tray_menu_labels_for_locale("es-ES"), ("Mostrar TablePilot", "Salir de TablePilot"));
@@ -1134,6 +1148,8 @@ mod tests {
         assert_eq!(app_menu_quit_label("zh-CN", "TablePilot"), "退出 TablePilot");
         assert_eq!(app_menu_quit_label("zh-TW", "TablePilot"), "退出 TablePilot");
         assert_eq!(app_menu_quit_label("ja-JP", "TablePilot"), "DBXを終了");
+        assert_eq!(app_menu_quit_label("th-TH", "TablePilot"), "ออกจาก TablePilot");
+        assert_eq!(app_menu_quit_label("th_TH", "TablePilot"), "ออกจาก TablePilot");
         assert_eq!(app_menu_quit_label("ko-KR", "TablePilot"), "TablePilot 종료");
         assert_eq!(app_menu_quit_label("tr-TR", "TablePilot"), "TablePilot Uygulamasından Çık");
         assert_eq!(app_menu_quit_label("ru-RU", "TablePilot"), "Выйти из TablePilot");
@@ -1143,6 +1159,7 @@ mod tests {
         assert_eq!(app_menu_quit_label("", "TablePilot"), "Quit TablePilot");
         assert_eq!(app_menu_copy_support_info_label("zh-CN"), "复制支持信息");
         assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
+        assert_eq!(app_menu_copy_support_info_label("th-TH"), "คัดลอกข้อมูลสำหรับขอความช่วยเหลือ");
         assert_eq!(app_menu_copy_support_info_label("ko-KR"), "지원 정보 복사");
         assert_eq!(app_menu_copy_support_info_label("tr-TR"), "Destek bilgilerini kopyala");
         assert_eq!(app_menu_copy_support_info_label("ru-RU"), "Копировать сведения о поддержке");
@@ -1152,6 +1169,7 @@ mod tests {
         assert_eq!(app_menu_close_tab_label("zh-CN"), "关闭标签页");
         assert_eq!(app_menu_close_tab_label("zh-TW"), "關閉分頁");
         assert_eq!(app_menu_close_tab_label("ja-JP"), "タブを閉じる");
+        assert_eq!(app_menu_close_tab_label("th-TH"), "ปิดแท็บ");
         assert_eq!(app_menu_close_tab_label("en-US"), "Close Tab");
     }
 
@@ -1556,7 +1574,7 @@ pub fn run() {
 
     let startup_begin = Instant::now();
 
-    let builder = tauri::Builder::default()
+    let builder = register_deep_link_state(tauri::Builder::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1813,7 +1831,6 @@ pub fn run() {
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
-            app.manage(commands::deep_link::DeepLinkOpenState::default());
             app.manage(commands::ssh_prompt::SshPromptState::new());
             commands::ssh_prompt::install_ssh_prompt_bridge(app.handle());
             commands::ssh_prompt::install_ssh_notice_bridge(app.handle());
@@ -2203,9 +2220,16 @@ pub fn run() {
             commands::query::build_duplicate_table_structure_sql,
             commands::query::build_copy_table_data_sql,
             commands::query::build_executable_object_source_statements,
+            commands::query::validate_oracle_executable_object_source,
+            commands::query::fingerprint_oracle_routine_object_source,
             commands::query::build_executable_object_source_sql,
             commands::query::build_editable_object_source,
             commands::query::build_routine_rename_object_source_statements,
+            commands::query::rewrite_oracle_routine_references,
+            commands::query::rewrite_oracle_table_references,
+            commands::query::parse_oracle_object_name,
+            commands::query::build_oracle_view_rename_source,
+            commands::query::review_oracle_view_rename_source,
             commands::query::build_view_ddl_sql,
             commands::query::build_table_structure_change_sql,
             commands::query::build_table_owner_change_sql,
@@ -2391,6 +2415,7 @@ pub fn run() {
             commands::saved_sql::save_saved_sql_folder,
             commands::saved_sql::delete_saved_sql_folder,
             commands::saved_sql::save_saved_sql_file,
+            commands::saved_sql::save_default_query_content,
             commands::saved_sql::delete_saved_sql_file,
             commands::saved_sql::saved_sql_storage_dir,
             commands::saved_sql::open_saved_sql_storage_dir,

@@ -10,6 +10,7 @@ import ko from "../locales/ko";
 import ptBR from "../locales/pt-BR";
 import ru from "../locales/ru";
 import tr from "../locales/tr";
+import th from "../locales/th";
 import zhCN from "../locales/zh-CN";
 import zhTW from "../locales/zh-TW";
 
@@ -21,9 +22,9 @@ import zhTW from "../locales/zh-TW";
 vi.mock("../locales/fallback", () => ({ withEnglishFallback: (messages: Record<string, unknown>) => messages }));
 
 type Messages = Record<string, unknown>;
-type Locale = "az" | "en" | "es" | "id" | "it" | "ja" | "ko" | "pt-BR" | "ru" | "tr" | "zh-CN" | "zh-TW";
+type Locale = "az" | "en" | "es" | "id" | "it" | "ja" | "ko" | "pt-BR" | "ru" | "th" | "tr" | "zh-CN" | "zh-TW";
 
-const declared: Record<Locale, Messages> = { az, en, es, id, it: itLocale, ja, ko, "pt-BR": ptBR, ru, tr, "zh-CN": zhCN, "zh-TW": zhTW };
+const declared: Record<Locale, Messages> = { az, en, es, id, it: itLocale, ja, ko, "pt-BR": ptBR, ru, th, tr, "zh-CN": zhCN, "zh-TW": zhTW };
 const ALL_LOCALES = Object.keys(declared) as Locale[];
 const EXCEPT_AZ_TR = ALL_LOCALES.filter((locale) => locale !== "az" && locale !== "tr");
 
@@ -42,7 +43,7 @@ const under = (namespace: string, keys: string[]) => keys.map((key) => `${namesp
 // Message sets that render in every UI language: a key missing from `en`
 // leaks the raw key path, and a key missing from a locale silently shows
 // English.
-const FEATURE_MESSAGES: FeatureMessages[] = [
+const UPSTREAM_FEATURE_MESSAGES: FeatureMessages[] = [
   { feature: "AstraFlow provider", keys: ["ai.astraflowDescription"], translated: true },
   { feature: "AI HTML preview (#6467)", keys: under("ai", ["htmlPreviewLabel", "htmlExpandPreview", "htmlExpandPreviewHint", "htmlSaveSafe", "htmlSaveFailed", "htmlCopySource", "htmlCopyRiskBody", "htmlCopyRiskAccept", "htmlCopyRiskRemember", "htmlCopyRiskToast"]) },
   { feature: "AI conversation export (#6467)", keys: under("ai", ["exportConversation", "conversationExportMarkdown", "conversationExportHtml", "conversationRoleUser", "conversationRoleAssistant", "conversationFailedMarker", "conversationExportEmpty"]) },
@@ -67,6 +68,7 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
       "pinTab",
       "reopenClosedTab",
       "resetTabGroup",
+      "saveAllTabs",
       "splitDown",
       "splitRight",
       "unpinTab",
@@ -142,6 +144,9 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
   },
   { feature: "schema diff deploy ignores foreign key checks", keys: under("diff", ["ignoreForeignKeyChecks", "ignoreForeignKeyChecksHint"]), translated: true },
 ];
+
+// TablePilot excludes AI/MCP features and their newly added translations.
+const FEATURE_MESSAGES = UPSTREAM_FEATURE_MESSAGES.filter(({ feature, keys }) => !/\bAI\b|\bMCP\b|Claude|OpenAI/.test(feature) && !keys.some((key) => /(?:^|\.)(?:ai|mcp)/.test(key)));
 
 function lookup(messages: unknown, path: string): unknown {
   return path.split(".").reduce<unknown>((node, key) => (node && typeof node === "object" ? (node as Messages)[key] : undefined), messages);

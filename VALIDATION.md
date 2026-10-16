@@ -39,3 +39,13 @@ node node_modules/vitest/vitest.mjs run --maxWorkers=1 \
 - No Rust implementation changes were made in this update (only the package version). Native installers are validated by the Windows/Linux CI builds before publication.
 
 - Two release-packaging tests passed, verifying that unchanged workflows preserve the original source commit and packaging snapshots only refresh workflow definitions and corresponding hashes.
+
+## 0.3.2 reviewed DBX 0.6.45 update — 16 October 2026
+
+- Full Vue/TypeScript type check passed, including a final run after the implementation changes.
+- Production frontend build passed (existing chunk-size/dynamic-import warnings).
+- Consolidated regression results: **5,396 tests passed across 149 executed files**; one AI-only locale suite was skipped. **69 AI/MCP tests skipped** in total. The initial 150-file run was followed by an isolated seven-file rerun after adapting inherited test expectations for TablePilot's disabled AI/updater, branding and omitted web server. One UI test timed out during CPU contention and passed in isolation without changing its timeout.
+- Coverage includes changed database/grid/schema/query/locale features, CSV/Excel import/export options, field mapping, SSH authentication, removed GitHub links and the TablePilot capability boundary.
+- Desktop/core/workspace dependency declarations retain the AI/MCP/updater exclusions. Native command/API and plugin host.ai blocks remain in place.
+
+Native Rust compilation was not run for this update because this session has no Rust toolchain. The earlier 0.3.0 native check does not validate these newer Rust changes. Windows/Linux installer compilation runs in GitHub Actions after merge; publication requires both builds to succeed. Live database connections, SSH jump-host operation, installer launch and end-to-end CSV/Excel round trips still require manual testing.
