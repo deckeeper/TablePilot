@@ -19,13 +19,7 @@ vi.mock("@/lib/backend/api", async (importOriginal) => {
       backend.saves(value);
     },
     loadHistoryRetentionLimit: async () => 5000,
-    loadMcpHistoryRetentionLimit: async () => 5000,
-    loadMcpGlobalPolicy: async () => null,
     loadDesktopSettings: async () => null,
-    loadAiConfigs: async () => [],
-    loadAiConfig: async () => null,
-    loadAiProviderConfigs: async () => ({}),
-    loadAiChatSelection: async () => null,
     webdavSyncSecretsStatus: async () => ({}),
     snippetSavedTokenStatus: async () => ({}),
     snippetSyncSettings: async () => ({}),

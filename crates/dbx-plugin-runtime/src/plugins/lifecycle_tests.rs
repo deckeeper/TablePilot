@@ -123,42 +123,11 @@ async fn rollback_drains_every_host_then_uninstall_releases_both_versions() {
     drop(result);
     assert_eq!(version(&first).await, "0.3.3");
     assert_eq!(version(&second).await, "0.3.3");
-    // A third, independent host performs the uninstall while both MCP hosts are still alive.
+    // A third, independent host performs the uninstall while both plugin hosts are still alive.
     PluginHost::new(registry(&root)).uninstall_plugin(ID).await.unwrap();
     assert!(!root.join(ID).exists());
     assert!(first.list_active().await.is_empty());
     assert!(second.list_active().await.is_empty());
-}
-
-#[tokio::test]
-async fn discovery_is_transient_and_preserves_a_live_session() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("plugins");
-    install(&root, "0.3.4");
-    let host = PluginHost::new(registry(&root));
-    let result: String = host.probe(ID, "mcp/tools", json!({}), None).await.unwrap();
-    assert_eq!(result, "0.3.4");
-    assert!(host.list_active().await.is_empty());
-    let session = host.activate(ID).await.unwrap();
-    let _: String = host.probe(ID, "mcp/tools", json!({}), None).await.unwrap();
-    assert!(Arc::ptr_eq(&session, &host.activate(ID).await.unwrap()));
-    host.stop_all().await.unwrap();
-}
-
-#[tokio::test]
-async fn cancelled_discovery_does_not_leave_a_process_or_block_uninstall() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("plugins");
-    install(&root, "0.3.4");
-    let host = PluginHost::new(registry(&root));
-    let marker = registry(&root).plugin_data_dir(ID).join("waiting");
-    let probing = host.clone();
-    let task = tokio::spawn(async move { probing.probe::<Value>(ID, "wait", json!({}), None).await });
-    wait_until(|| marker.exists()).await;
-    task.abort();
-    let _ = task.await;
-    host.uninstall_plugin(ID).await.unwrap();
-    assert!(!root.join(ID).exists());
 }
 
 #[tokio::test]

@@ -43,17 +43,12 @@ const under = (namespace: string, keys: string[]) => keys.map((key) => `${namesp
 // Message sets that render in every UI language: a key missing from `en`
 // leaks the raw key path, and a key missing from a locale silently shows
 // English.
-const FEATURE_MESSAGES: FeatureMessages[] = [
+const UPSTREAM_FEATURE_MESSAGES: FeatureMessages[] = [
   { feature: "AstraFlow provider", keys: ["ai.astraflowDescription"], translated: true },
   { feature: "AI HTML preview (#6467)", keys: under("ai", ["htmlPreviewLabel", "htmlExpandPreview", "htmlExpandPreviewHint", "htmlSaveSafe", "htmlSaveFailed", "htmlCopySource", "htmlCopyRiskBody", "htmlCopyRiskAccept", "htmlCopyRiskRemember", "htmlCopyRiskToast"]) },
   { feature: "AI conversation export (#6467)", keys: under("ai", ["exportConversation", "conversationExportMarkdown", "conversationExportHtml", "conversationRoleUser", "conversationRoleAssistant", "conversationFailedMarker", "conversationExportEmpty"]) },
   { feature: "AI conversation management", keys: under("ai", ["renameConversation", "conversationRenameFailed", "clearDatabaseSelection", "searchDatabases", "noDatabasesFound"]) },
   { feature: "AI auto routing (#9118)", keys: ["ai.actions.auto", "ai.routing.recognizing", "ai.routing.chip", "ai.routing.switchTo", "ai.defaultAutoRouting", "ai.defaultAutoRoutingDescription"] },
-  {
-    feature: "AI SQL action feedback (#11962)",
-    keys: under("ai", ["sqlActionRunning", "sqlActionSucceeded", "sqlActionSucceededIn", "sqlActionSucceededRows", "sqlActionSucceededAffected", "sqlActionFailed", "sqlActionApplied", "sqlActionAppliedIn", "sqlActionEmptySql", "sqlActionBusy", "sqlActionNoConnection", "sqlActionViewTab"]),
-    translated: true,
-  },
   { feature: "plugin AI conversation", keys: ["ai.pluginHttpModelOnly", "ai.pluginWelcome", "ai.pluginFollowUp"] },
   { feature: "quick open", keys: ["quickOpen.*", "settings.shortcutGlobalSearch"] },
   {
@@ -149,6 +144,9 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
   },
   { feature: "schema diff deploy ignores foreign key checks", keys: under("diff", ["ignoreForeignKeyChecks", "ignoreForeignKeyChecksHint"]), translated: true },
 ];
+
+// TablePilot excludes AI/MCP features and their newly added translations.
+const FEATURE_MESSAGES = UPSTREAM_FEATURE_MESSAGES.filter(({ feature, keys }) => !/\bAI\b|\bMCP\b|Claude|OpenAI/.test(feature) && !keys.some((key) => /(?:^|\.)(?:ai|mcp)/.test(key)));
 
 function lookup(messages: unknown, path: string): unknown {
   return path.split(".").reduce<unknown>((node, key) => (node && typeof node === "object" ? (node as Messages)[key] : undefined), messages);

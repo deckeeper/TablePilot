@@ -581,7 +581,7 @@ describe("connectionStore save_password opt-out", () => {
     expect(store.connectedIds.has("mysql-1")).toBe(true);
     expect(store.activeConnectionId).toBe("mysql-1");
     expect(store.getConfig("mysql-1")?.password).toBe("");
-    expect(store.connectionErrors["mysql-1"]).toContain("Connected, but DBX could not remember the password");
+    expect(store.connectionErrors["mysql-1"]).toContain("Connected, but TablePilot could not remember the password");
     expect(store.connectionErrors["mysql-1"]).toContain("disk full");
   });
 
@@ -608,7 +608,7 @@ describe("connectionStore save_password opt-out", () => {
 
     expect(store.connectedIds.has("mysql-1")).toBe(true);
     expect(store.getConfig("mysql-1")?.password).toBe("");
-    expect(store.connectionErrors["mysql-1"]).toContain("Connected, but DBX could not remember the password");
+    expect(store.connectionErrors["mysql-1"]).toContain("Connected, but TablePilot could not remember the password");
     expect(store.connectionErrors["mysql-1"]).toContain("disk full");
   });
 });

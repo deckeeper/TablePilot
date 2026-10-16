@@ -412,6 +412,8 @@ function closeSettings() {
   requestCloseSettings(false);
 }
 
+defineExpose({ requestClose: closeSettings });
+
 function cancelUnsavedSettingsClose() {
   showUnsavedSettingsCloseConfirm.value = false;
 }
@@ -7290,6 +7292,7 @@ onUnmounted(() => {
                     <SelectItem value="comment-aligned">{{ t("settings.sidebarObjectInfoModeCommentAligned") }}</SelectItem>
                     <SelectItem value="comment-right">{{ t("settings.sidebarObjectInfoModeCommentRight") }}</SelectItem>
                     <SelectItem value="size">{{ t("settings.sidebarObjectInfoModeSize") }}</SelectItem>
+                    <SelectItem value="comment-and-size">{{ t("settings.sidebarObjectInfoModeCommentAndSize") }}</SelectItem>
                     <SelectItem value="hidden">{{ t("settings.sidebarObjectInfoModeHidden") }}</SelectItem>
                   </SelectContent>
                 </Select>

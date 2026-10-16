@@ -164,48 +164,6 @@ impl PluginHost {
         Ok(session)
     }
 
-    /// Discovery must not leave one idle process per installed plugin in every MCP client.
-    /// Reuse a live session, but keep a session started only for probing short-lived.
-    pub async fn probe<T>(
-        &self,
-        plugin_id: &str,
-        method: &str,
-        params: serde_json::Value,
-        timeout: Option<Duration>,
-    ) -> Result<T, String>
-    where
-        T: DeserializeOwned,
-    {
-        let _activity = self.inner.registry.lifecycle.begin_operation(plugin_id)?;
-        if let Some(session) = self.running_session(plugin_id).await {
-            return session.invoke_with_timeout(method, params, None, timeout).await;
-        }
-        let plugin = self
-            .inner
-            .registry
-            .find_plugin(plugin_id)?
-            .ok_or_else(|| format!("Plugin '{plugin_id}' is not installed"))?;
-        if !plugin.compatibility.compatible {
-            return Err(format!("Plugin '{plugin_id}' is incompatible: {}", plugin.compatibility.errors.join("; ")));
-        }
-        let env = PluginRuntimeEnv::default().with_plugin_data_dir(&self.inner.registry.plugin_data_dir(plugin_id));
-        let session = PluginSidecarSession::start_with_runtime_lease(
-            plugin,
-            self.inner.registry.app_version().to_string(),
-            env,
-            self.inner.registry.lifecycle.runtime_lease(plugin_id)?,
-        )
-        .await?;
-        let _cleanup = super::runtime::ShutdownOnDrop::new(session.clone());
-        let result = session.invoke_with_timeout(method, params, None, timeout).await;
-        let shutdown = session.shutdown().await;
-        match (result, shutdown) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(shutdown)) => Err(format!("{error}; additionally failed to stop plugin: {shutdown}")),
-        }
-    }
-
     fn watch_session(&self, session: &Arc<PluginSidecarSession>, probe: super::lifecycle::PluginUpdateProbe) {
         let owner = Arc::downgrade(&self.inner);
         let runtime = Arc::downgrade(session);

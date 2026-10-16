@@ -224,14 +224,15 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("toggleZenMode", DEFAULT_SHORTCUT_SETTINGS.toggleZenMode, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
-  it("uses a platform-specific shortcut for toggling the AI panel", () => {
+  it("hides the AI panel shortcut while retaining legacy settings normalization", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "toggleAiPanel");
 
-    expect(definition).toMatchObject({ id: "toggleAiPanel", labelKey: "settings.shortcutToggleAiPanel", scope: "global" });
+    // TablePilot keeps legacy shortcut normalization but exposes no AI action.
+    expect(definition).toBeUndefined();
     expect(toggleAiPanelDefaultShortcut("MacIntel")).toBe("Ctrl+Mod+I");
     expect(toggleAiPanelDefaultShortcut("Win32")).toBe("Ctrl+Alt+I");
-    expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Alt+I" }, "MacIntel").toggleAiPanel).toBe("Ctrl+Mod+I");
-    expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Mod+I" }, "Win32").toggleAiPanel).toBe("Ctrl+Alt+I");
+    expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Alt+I" }, "MacIntel").toggleAiPanel).toBeUndefined();
+    expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Mod+I" }, "Win32").toggleAiPanel).toBeUndefined();
     expect(findShortcutConflict("toggleAiPanel", normalizeShortcutSettings().toggleAiPanel, normalizeShortcutSettings())).toBeNull();
   });
 

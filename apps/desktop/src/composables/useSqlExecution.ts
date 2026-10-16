@@ -35,7 +35,6 @@ import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import type { SqlExecutionTargetContext } from "@/lib/database/sqlExecutionTargetRegistry";
 import { MULTI_SOURCE_MAX_ROWS_PER_SOURCE } from "@/lib/query/multiSourceResult";
 import { translateBackendError } from "@/i18n/backend-errors";
-import type { SqlExecutionDeferredReason, SqlExecutionNotStartedReason, SqlExecutionOutcome } from "@/lib/sql/sqlExecutionOutcome";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
 
@@ -171,13 +170,6 @@ export function useSqlExecution(deps: {
   requestDangerConfirmation?: (request: SqlExecutionDangerRequest) => Promise<boolean>;
   onExecutionStarted?: (editorViewportRequestId: number) => void;
   onExecutionCancelled?: (editorViewportRequestId: number) => void;
-  /**
-   * Terminal outcome of an execution a dialog parked (#11962). Such a request
-   * leaves `tryExecute` as `{ status: "deferred" }` when the dialog opens, so this
-   * is the only place its real result arrives: accepted → the execution outcome,
-   * dismissed → `not-started`. Hosts that do not track the request ignore it.
-   */
-  onDeferredExecutionSettled?: (outcome: SqlExecutionOutcome) => void;
 }) {
   const { t } = useI18n();
   const queryStore = useQueryStore();
@@ -253,78 +245,47 @@ export function useSqlExecution(deps: {
     return { sql, sourceOffset: source.selectionFrom + leadingWhitespace, editorViewportRequestId };
   }
 
-  /**
-   * Every early return reports *why* it stopped (#11962). The editor path
-   * ignores this value, but the AI panel needs it: the target tab may not be on
-   * screen, so a silent return there leaves the user with no feedback at all.
-   */
-  function notStarted(reason: SqlExecutionNotStartedReason, tabId?: string): SqlExecutionOutcome {
-    return { status: "not-started", reason, ...(tabId ? { tabId } : {}) };
-  }
-
-  function deferred(reason: SqlExecutionDeferredReason, tabId: string): SqlExecutionOutcome {
-    return { status: "deferred", reason, tabId };
-  }
-
-  /**
-   * Report for the execution a dialog parked (#11962). `tryExecute` returned
-   * `deferred` when it opened the dialog, so the caller that needs the real
-   * outcome — the AI panel — is told here instead: once the user answers, and with
-   * whatever the resumed execution produced. Editor-initiated executions reach this
-   * too; they simply have no listener registered for them.
-   */
-  function reportDeferredExecution(outcome: SqlExecutionOutcome) {
-    deps.onDeferredExecutionSettled?.(outcome);
-  }
-
-  /** A resumed confirmation must settle its AI request even when execution throws. */
-  function reportDeferredExecutionFailure(error: unknown, tabId: string) {
-    reportDeferredExecution({ status: "started", ok: false, errorMessage: translateBackendError(t, error), tabId });
-  }
-
-  async function tryExecute(sqlOverride?: SqlExecutionOverride, options: SqlExecutionOptions = {}): Promise<SqlExecutionOutcome> {
+  async function tryExecute(sqlOverride?: SqlExecutionOverride, options: SqlExecutionOptions = {}) {
     const context = captureExecutionContext(options.tabId);
     if (!context) {
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("no-tab", options.tabId);
+      return;
     }
     const { sql, sourceOffset, editorViewportRequestId } = await resolvedExecutableSql(sqlOverride, context);
     const executionOptions = { ...options, editorViewportRequestId, tabId: context.tabId };
     if (!sql.trim()) {
       cancelEditorViewportRequest(editorViewportRequestId);
-      return notStarted("empty-sql", context.tabId);
+      return;
     }
     const tab = resolveExecutionTab(context.tabId);
     if (!tab) {
       cancelEditorViewportRequest(editorViewportRequestId);
-      return notStarted("no-tab", context.tabId);
+      return;
     }
     if (requiresDatabaseSelection(tab, context.connection, sql)) {
       deps.onMissingDatabase?.(context.tabId);
       cancelEditorViewportRequest(editorViewportRequestId);
-      return notStarted("missing-database", context.tabId);
+      return;
     }
     if (supportsSqlTemplateParameters(context.connection, sql) && prepareSqlParameterDialog(sql, sourceOffset, executionOptions)) {
-      return deferred("parameters", context.tabId);
+      return;
     }
-    return continueExecute(context, sql, sourceOffset, executionOptions);
+    await continueExecute(context, sql, sourceOffset, executionOptions);
   }
 
   function tryExecuteInNewResultTab(sqlOverride?: SqlExecutionOverride, options: SqlExecutionOptions = {}) {
     return tryExecute(sqlOverride, { ...options, openInNewResultTab: true });
   }
 
-  async function continueExecute(context: SqlExecutionContext, sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}): Promise<SqlExecutionOutcome> {
+  async function continueExecute(context: SqlExecutionContext, sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}) {
     const tab = resolveExecutionTab(context.tabId);
     if (!tab) {
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("no-tab", context.tabId);
+      return;
     }
     if (!(await ensureReadOnlyWriteAccess({ connection: context.connection, sql, source: t("production.sourceSqlEditor") }))) {
-      // The read-only unlock dialog was dismissed: the user saw UI, so the panel
-      // adds nothing (see aiSqlActionFeedback).
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("cancelled", context.tabId);
+      return;
     }
     // Redis: block dangerous commands when toggle is on (scan entire batch for highest safety level)
     if (context.connection?.db_type === "redis" && deps.blockDangerousRedisCommands?.value !== false) {
@@ -346,7 +307,7 @@ export function useSqlExecution(deps: {
       if (highestSafety === "blocked") {
         toast(t("redis.blockedCommand", { command: "Redis" }), 5000);
         cancelEditorViewportRequest(options.editorViewportRequestId);
-        return notStarted("blocked", context.tabId);
+        return;
       }
       if (highestSafety === "confirm") {
         dangerSql.value = sql;
@@ -358,9 +319,7 @@ export function useSqlExecution(deps: {
         pendingDangerTabId.value = context.tabId;
         suppressDangerConfirm.value = false;
         showDangerDialog.value = true;
-        // Parked on the Redis confirmation, not finished: `onDangerConfirm` reports
-        // the real outcome.
-        return deferred("redis-confirm", context.tabId);
+        return;
       }
     }
     const productionAssessment = assessProductionSql(sql, context.connection, tab.database);
@@ -374,10 +333,11 @@ export function useSqlExecution(deps: {
         source: t("production.sourceSqlEditor"),
       });
       if (confirmed) {
-        return doExecute(sql, sourceOffset, options);
+        await doExecute(sql, sourceOffset, options);
+      } else {
+        cancelEditorViewportRequest(options.editorViewportRequestId);
       }
-      cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("cancelled", context.tabId);
+      return;
     }
     if (isDangerousSql(sql, context.connection?.db_type) && settingsStore.editorSettings.confirmDangerousSqlExecution) {
       dangerSql.value = sql;
@@ -389,10 +349,9 @@ export function useSqlExecution(deps: {
       pendingDangerTabId.value = context.tabId;
       suppressDangerConfirm.value = false;
       showDangerDialog.value = true;
-      // Parked on the danger confirmation; `onDangerConfirm` reports the outcome.
-      return deferred("danger", context.tabId);
+    } else {
+      await doExecute(sql, sourceOffset, options);
     }
-    return doExecute(sql, sourceOffset, options);
   }
 
   function prepareSqlParameterDialog(sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}, continuation?: (sql: string, sourceOffset?: number) => Promise<void> | void): boolean {
@@ -447,31 +406,31 @@ export function useSqlExecution(deps: {
     queryStore.setActiveResultIndex(executionTabId, sqlServerDataResultIndex !== undefined && sqlServerDataResultIndex >= 0 ? sqlServerDataResultIndex : sqlServerMessageResultIndex);
   }
 
-  async function doExecute(sql?: string, sourceOffset?: number, options: SqlExecutionOptions = {}): Promise<SqlExecutionOutcome> {
+  async function doExecute(sql?: string, sourceOffset?: number, options: SqlExecutionOptions = {}) {
     if (sql === undefined) {
       const context = captureExecutionContext(options.tabId);
       if (!context) {
         cancelEditorViewportRequest(options.editorViewportRequestId);
-        return notStarted("no-tab", options.tabId);
+        return;
       }
       ({ sql, sourceOffset } = await resolvedExecutableSql(undefined, context));
     }
     const executionTabId = options.tabId ?? deps.activeTab.value?.id;
     if (!executionTabId || !sql || !sql.trim()) {
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("empty-sql", executionTabId);
+      return;
     }
     const tab = resolveExecutionTab(executionTabId);
     if (!tab) {
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("no-tab", executionTabId);
+      return;
     }
     const executionConnection = connectionStore.getConfig(tab.connectionId) ?? deps.activeConnection.value;
     const executionDatabaseType = executionConnection?.db_type;
     if (requiresDatabaseSelection(tab, executionConnection, sql)) {
       deps.onMissingDatabase?.(executionTabId);
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("missing-database", executionTabId);
+      return;
     }
     const statementCount = splitSqlStatementRanges(sql, executionDatabaseType, sqlStatementParameterOptionsForCompatibility(executionDatabaseType, executionDatabaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(tab.connectionId, tab.database) : undefined)).length;
     const redisConsoleSelected = executionDatabaseType === "redis" && tab.uiState?.redisResultViewMode === "console";
@@ -491,11 +450,8 @@ export function useSqlExecution(deps: {
       ...(options.editorViewportRequestId !== undefined ? { onExecutionStarted: () => deps.onExecutionStarted?.(options.editorViewportRequestId!) } : {}),
     });
     if (producedResult === false) {
-      // `executeCurrentSql` reports `false` while another request is already
-      // preparing a result run for this tab (queryStore's pending-preparation
-      // guard), i.e. the tab is busy — never a silent no-op.
       cancelEditorViewportRequest(options.editorViewportRequestId);
-      return notStarted("busy", executionTabId);
+      return;
     }
     const executionTabStillActive = deps.activeTab.value?.id === executionTabId;
     const sqlServerMessageResultIndex = executionDatabaseType === "sqlserver" ? tab.results?.findIndex((result) => result.server_message === true) : undefined;
@@ -546,14 +502,6 @@ export function useSqlExecution(deps: {
         await connectionStore.refreshObjectListTreeNode(tab.connectionId, tab.database, refreshTarget.schema);
       }
     }
-    return {
-      status: "started",
-      ok: success,
-      tabId: tab.id,
-      // Same text the history entry records, so the panel shows the database's
-      // own words rather than a second, drifting translation of them.
-      ...(failure ? { errorMessage: failure.error ? translateBackendError(t, failure.error, failure.rows?.[0]?.[0]) : String(failure.rows?.[0]?.[0] ?? "") } : {}),
-    };
   }
 
   async function executeTargetSql(input: TargetSqlExecutionInput): Promise<MultiDbTargetExecutionResult> {
@@ -957,20 +905,14 @@ export function useSqlExecution(deps: {
     suppressDangerConfirm.value = false;
     const tab = resolveExecutionTab(tabId);
     if (!tab) {
-      reportDeferredExecution(notStarted("no-tab", tabId));
       return;
     }
     const connection = connectionStore.getConfig(tab.connectionId);
     if (!(await ensureReadOnlyWriteAccess({ connection, sql, source: t("production.sourceSqlEditor") }))) {
       cancelEditorViewportRequest(editorViewportRequestId);
-      reportDeferredExecution(notStarted("cancelled", tab.id));
       return;
     }
-    try {
-      reportDeferredExecution(await doExecute(sql, sourceOffset, { openInNewResultTab, editorViewportRequestId, tabId: tab.id }));
-    } catch (error) {
-      reportDeferredExecutionFailure(error, tab.id);
-    }
+    await doExecute(sql, sourceOffset, { openInNewResultTab, editorViewportRequestId, tabId: tab.id });
   }
 
   async function onSqlParametersConfirm(sql: string) {
@@ -995,24 +937,14 @@ export function useSqlExecution(deps: {
     }
     const context = captureExecutionContext(tabId);
     if (!context) {
-      reportDeferredExecution(notStarted("no-tab", tabId));
       return;
     }
-    try {
-      reportDeferredExecution(await continueExecute(context, sql, sourceOffset, { openInNewResultTab, editorViewportRequestId, tabId: context.tabId }));
-    } catch (error) {
-      reportDeferredExecutionFailure(error, context.tabId);
-    }
+    await continueExecute(context, sql, sourceOffset, { openInNewResultTab, editorViewportRequestId, tabId: context.tabId });
   }
 
   watch(showSqlParameterDialog, (open) => {
     if (open) return;
     const editorViewportRequestId = pendingSqlParameterEditorViewportRequestId.value;
-    // Still set means the dialog was dismissed rather than accepted:
-    // `onSqlParametersConfirm` clears it up front, before it resumes the execution
-    // and reports that outcome itself. Without this the caller parked on the dialog
-    // would wait forever (#11962).
-    const abandonedTabId = pendingSqlParameterTabId.value;
     sqlParameterSourceSql.value = "";
     sqlParameterNames.value = [];
     sqlParameterDatabaseType.value = undefined;
@@ -1023,15 +955,11 @@ export function useSqlExecution(deps: {
     pendingSqlParameterTabId.value = undefined;
     pendingSqlParameterContinuation = undefined;
     cancelEditorViewportRequest(editorViewportRequestId);
-    if (abandonedTabId) reportDeferredExecution(notStarted("cancelled", abandonedTabId));
   });
 
   watch(showDangerDialog, (open) => {
     if (open) return;
     const editorViewportRequestId = pendingDangerEditorViewportRequestId.value;
-    // Same dismissal contract as the parameter dialog: a tab id still pending here
-    // means the user closed the dialog instead of confirming it.
-    const abandonedTabId = pendingDangerTabId.value;
     pendingDangerSql.value = "";
     pendingDangerSourceOffset.value = undefined;
     pendingDangerKind.value = "sql";
@@ -1040,7 +968,6 @@ export function useSqlExecution(deps: {
     pendingDangerTabId.value = undefined;
     suppressDangerConfirm.value = false;
     cancelEditorViewportRequest(editorViewportRequestId);
-    if (abandonedTabId) reportDeferredExecution(notStarted("cancelled", abandonedTabId));
   });
 
   return {

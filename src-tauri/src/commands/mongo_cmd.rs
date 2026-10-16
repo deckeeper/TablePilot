@@ -141,6 +141,7 @@ pub async fn mongo_find_documents(
         collation,
         None,
         None,
+        None,
         execution_id,
     )
     .await?;

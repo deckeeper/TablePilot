@@ -226,10 +226,10 @@ describe("keyboard shortcut matching", () => {
     expect(isToggleZenModeShortcut(platformModEvent, { toggleZenMode: "" })).toBe(false);
   });
 
-  it("matches the platform-specific AI panel shortcut", () => {
-    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, metaKey: true }, undefined, "MacIntel")).toBe(true);
-    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, altKey: true }, undefined, "Win32")).toBe(true);
-    expect(isToggleAiPanelShortcut({ key: "a", ctrlKey: true, shiftKey: true }, { toggleAiPanel: "Mod+Shift+A" }, "Win32")).toBe(true);
+  it("does not match excluded AI shortcuts, including saved custom bindings", () => {
+    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, metaKey: true }, undefined, "MacIntel")).toBe(false);
+    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, altKey: true }, undefined, "Win32")).toBe(false);
+    expect(isToggleAiPanelShortcut({ key: "a", ctrlKey: true, shiftKey: true }, { toggleAiPanel: "Mod+Shift+A" }, "Win32")).toBe(false);
     expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, metaKey: true }, { toggleAiPanel: "" }, "MacIntel")).toBe(false);
   });
 

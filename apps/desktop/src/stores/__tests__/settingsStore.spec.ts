@@ -1,3 +1,5 @@
+// TablePilot: upstream AI/MCP feature suites are inapplicable to this edition.
+import { AI_ENABLED, MCP_ENABLED } from "@/lib/tablepilot";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { isProxy } from "vue";
@@ -498,7 +500,7 @@ describe("normalizeEditorSettings", () => {
   });
 
   it("migrates legacy update opt-outs without overriding explicit category settings", () => {
-    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(true);
+    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(false);
     expect(normalizeEditorSettings({ autoDownloadUpdates: true }).autoDownloadUpdates).toBe(true);
     expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoDownloadUpdates).toBe(false);
     expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateDrivers).toBe(true);
@@ -912,7 +914,7 @@ describe("normalizeDesktopSettings", () => {
   });
 });
 
-describe("normalizeMcpGlobalPolicy", () => {
+describe.skipIf(!MCP_ENABLED)("normalizeMcpGlobalPolicy", () => {
   it("defaults to all connections with writes allowed", () => {
     expect(normalizeMcpGlobalPolicy(undefined)).toEqual({
       readOnly: false,
@@ -1230,7 +1232,7 @@ function makeTestConfig(overrides: Partial<AiConfigItem> & { id: string }): AiCo
   } as AiConfigItem;
 }
 
-describe("settingsStore AI API key normalization", () => {
+describe.skipIf(!AI_ENABLED)("settingsStore AI API key normalization", () => {
   beforeEach(() => {
     vi.resetModules();
     setActivePinia(createPinia());
@@ -1493,7 +1495,7 @@ describe("settingsStore AI API key normalization", () => {
   });
 });
 
-describe("settingsStore MCP policy persistence", () => {
+describe.skipIf(!MCP_ENABLED)("settingsStore MCP policy persistence", () => {
   beforeEach(() => {
     vi.resetModules();
     setActivePinia(createPinia());
@@ -1591,7 +1593,7 @@ describe("settingsStore persisted settings initialization", () => {
       fontSize: 17,
       theme: "xcode-dark",
       executeMode: "all",
-      updateNotificationsEnabled: true,
+      updateNotificationsEnabled: false,
       appLayout: "separated",
     });
     expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ fontSize: 17, theme: "xcode-dark", appLayout: "separated" }));
@@ -2351,7 +2353,7 @@ describe("settingsStore regular expression match limit persistence", () => {
 
 // --- activeModel lifecycle tests ---
 
-describe("settingsStore activeModel lifecycle", () => {
+describe.skipIf(!AI_ENABLED)("settingsStore activeModel lifecycle", () => {
   beforeEach(() => {
     vi.resetModules();
     setActivePinia(createPinia());
@@ -2656,7 +2658,7 @@ describe("settingsStore activeModel lifecycle", () => {
 
 // --- defaultAiMode lifecycle tests ---
 
-describe("settingsStore defaultAiMode lifecycle", () => {
+describe.skipIf(!AI_ENABLED)("settingsStore defaultAiMode lifecycle", () => {
   beforeEach(() => {
     vi.resetModules();
     setActivePinia(createPinia());

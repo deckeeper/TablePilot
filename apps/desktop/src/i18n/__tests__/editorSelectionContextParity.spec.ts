@@ -1,3 +1,5 @@
+// TablePilot does not expose Send to AI or add new AI translations.
+import { AI_ENABLED } from "@/lib/tablepilot";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
@@ -12,14 +14,14 @@ function localeSource(name: string): string {
   return readFileSync(new URL(`../locales/${name}.ts`, import.meta.url), "utf8");
 }
 
-// Source of truth: `supportedLocales` in ../index.ts (13 entries, `ru` included).
-const LOCALES = ["en", "zh-CN", "zh-TW", "ja", "ko", "es", "it", "pt-BR", "ru", "az", "th", "tr", "id"] as const;
+// Source of truth: `supportedLocales` in ../index.ts (12 entries, `ru` included).
+const LOCALES = ["en", "zh-CN", "zh-TW", "ja", "ko", "es", "it", "pt-BR", "ru", "az", "tr", "id"] as const;
 
 function declaredString(source: string, key: string): string | undefined {
   return source.match(new RegExp(String.raw`^\s*${key}:\s*"((?:[^"\\]|\\.)*)",\s*$`, "m"))?.[1];
 }
 
-describe("editor selection context locale parity", () => {
+describe.skipIf(!AI_ENABLED)("editor selection context locale parity", () => {
   it.each(LOCALES)("%s declares the selection-context keys", (name) => {
     const source = localeSource(name);
 

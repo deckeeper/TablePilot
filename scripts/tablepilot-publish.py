@@ -1,5 +1,6 @@
 """Publish validated TablePilot installers to this repository's GitHub Releases."""
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -8,7 +9,56 @@ import subprocess
 
 
 def gh(*args, check=True):
-    return subprocess.run(['gh', *args], check=check, text=True, capture_output=True)
+    result = subprocess.run(['gh', *args], text=True, capture_output=True)
+    if check and result.returncode:
+        raise SystemExit(result.stderr.strip() or result.stdout.strip() or 'GitHub CLI request failed')
+    return result
+
+
+def api(repo, endpoint, payload=None):
+    command = ['gh', 'api', f'repos/{repo}/{endpoint}']
+    if payload is not None:
+        command += ['--method', 'POST', '--input', '-']
+    result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
+                            text=True, capture_output=True)
+    if result.returncode:
+        raise SystemExit(result.stderr.strip())
+    return json.loads(result.stdout)
+
+
+def release_target(repo, source):
+    # GitHub Actions cannot release older workflow definitions. Retain the exact
+    # app tree but use the currently approved default-branch workflows in the tag.
+    current = api(repo, 'commits/main')['sha']
+    def workflow_tree(commit):
+        root = api(repo, f'git/trees/{commit}')
+        github = next(e for e in root['tree'] if e['path'] == '.github')
+        entries = api(repo, f"git/trees/{github['sha']}")['tree']
+        return next(e for e in entries if e['path'] == 'workflows')['sha']
+    if workflow_tree(source) == workflow_tree(current):
+        return source
+    workflows = workflow_tree(current)
+    def file_content(commit, path):
+        blob = api(repo, f'contents/{path}?ref={commit}')
+        return base64.b64decode(blob['content']).decode()
+    manifest = json.loads(file_content(source, 'SOURCE_SHA256.json'))
+    current_manifest = json.loads(file_content(current, 'SOURCE_SHA256.json'))
+    manifest = {p: h for p, h in manifest.items() if not p.startswith('.github/workflows/')}
+    manifest.update({p: h for p, h in current_manifest.items() if p.startswith('.github/workflows/')})
+    source_commit = api(repo, f'git/commits/{source}')
+    tree = api(repo, 'git/trees', {
+        'base_tree': source_commit['tree']['sha'],
+        'tree': [
+            {'path': '.github/workflows', 'mode': '040000', 'type': 'tree', 'sha': workflows},
+            {'path': 'SOURCE_SHA256.json', 'mode': '100644', 'type': 'blob',
+             'content': json.dumps(manifest, indent=2, ensure_ascii=False) + '\n'},
+        ],
+    })
+    commit = api(repo, 'git/commits', {
+        'message': f'Release packaging for {source}: retain app source, refresh approved workflows',
+        'tree': tree['sha'], 'parents': [source],
+    })
+    return commit['sha']
 
 
 def main():
@@ -67,6 +117,7 @@ def main():
             raise SystemExit(f'Release {tag} is a draft; inspect it before publishing')
         print(f'Release {tag} already contains these exact installers.')
         return
+    target = release_target(repo, args.target)
     notes = root/'release-notes.md'
     text = f'''TablePilot {args.version} desktop prototype, based on DBX with AI and MCP execution removed.
 
@@ -84,9 +135,11 @@ Source commit: `{args.target}`.
         text += '\nWindows source: `8b0a975c5d5bc261bf170012f2d59db95bd7d031`; Linux source: `adfb658b14e90cbeb275216dd8c0c520c54910e8` (Linux packaging dependency fix). These are the existing 0.3.0 installers; GUI link removal arrives in 0.3.1.\n'
     else:
         text += '\nChanges: remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.\n'
+    if target != args.target:
+        text += f'\nThe release tag `{target}` retains the application source above; only workflow definitions and their source-manifest hashes were refreshed to the current approved workflows.\n'
     notes.write_text(text)
     result = gh('release', 'create', tag, *map(str, assets), '--repo', repo,
-                '--target', args.target, '--title', f'TablePilot {args.version} prototype',
+                '--target', target, '--title', f'TablePilot {args.version} prototype',
                 '--prerelease', '--notes-file', str(notes))
     print(result.stdout)
 

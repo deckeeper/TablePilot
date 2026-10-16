@@ -1,9 +1,12 @@
 # TablePilot fork changes
 
-Based on DBX v0.6.43, commit `0db01f7f284ec6b0b090fe7369de7d05c37b25b0`.
+Based on reviewed non-AI changes through DBX v0.6.45, commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`.
 Modified on 14–16 October 2026 for the independent TablePilot desktop prototype.
 
 ## Changes
+
+- TablePilot 0.3.2 integrates reviewed non-AI DBX 0.6.45 database, grid, query, schema, locale and driver changes. AI SQL feedback, conversation storage/settings, provider updates and MCP discovery changes are excluded.
+- Keep the existing TablePilot dependency lock/toolchain and release workflows. Clipboard image reads are enabled for the existing ordinary plugin clipboard feature.
 
 - TablePilot 0.3.1 removes GitHub navigation from the toolbar, welcome screen, settings, changelog and plugin source links. GitHub Gist remains a functional sync provider.
 - Publish Windows/Linux installer assets and checksums to this repository’s Releases after successful builds.
@@ -29,7 +32,9 @@ The following list is also the modification notice for formats such as JSON and 
 
 - `.github/workflows/tablepilot-build.yml`
 - `.github/workflows/tablepilot-publish-existing.yml`
+- `.github/workflows/tablepilot-release.yml`
 - `.github/workflows/tablepilot-upstream.yml`
+- `.tablepilot/proposals/v0.6.45.md`
 - `.tablepilot/upstream.json`
 - `Cargo.lock`
 - `Cargo.toml`
@@ -52,6 +57,7 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/components/editor/EditorSettingsDialog.vue`
 - `apps/desktop/src/components/editor/QueryEditorContextMenu.vue`
 - `apps/desktop/src/components/editor/QueryHistory.vue`
+- `apps/desktop/src/components/editor/__tests__/EditorSettingsDialog.externalClose.integration.spec.ts`
 - `apps/desktop/src/components/icons/AppLogo.vue`
 - `apps/desktop/src/components/layout/AppSidebar.vue`
 - `apps/desktop/src/components/layout/AppToolbar.vue`
@@ -64,9 +70,13 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/components/plugins/PluginAiAccessSection.vue`
 - `apps/desktop/src/components/plugins/PluginContributionsPanel.vue`
 - `apps/desktop/src/components/settings/ChangelogPanel.vue`
+- `apps/desktop/src/composables/__tests__/useSqlExecution.spec.ts`
 - `apps/desktop/src/composables/useAppUpdater.ts`
 - `apps/desktop/src/composables/useComponentUpdates.ts`
 - `apps/desktop/src/composables/useMcpUpdateBadge.ts`
+- `apps/desktop/src/composables/useSqlExecution.ts`
+- `apps/desktop/src/i18n/__tests__/backendErrors.spec.ts`
+- `apps/desktop/src/i18n/__tests__/featureMessages.spec.ts`
 - `apps/desktop/src/i18n/locales/az.ts`
 - `apps/desktop/src/i18n/locales/consulAz.ts`
 - `apps/desktop/src/i18n/locales/consulEs.ts`
@@ -89,13 +99,17 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/i18n/locales/nacosAccessControl.ts`
 - `apps/desktop/src/i18n/locales/pt-BR.ts`
 - `apps/desktop/src/i18n/locales/ru.ts`
+- `apps/desktop/src/i18n/locales/th.ts`
 - `apps/desktop/src/i18n/locales/tr.ts`
 - `apps/desktop/src/i18n/locales/zh-CN.ts`
 - `apps/desktop/src/i18n/locales/zh-TW.ts`
+- `apps/desktop/src/lib/__tests__/editor/keyboardShortcuts.spec.ts`
+- `apps/desktop/src/lib/__tests__/editor/shortcutRegistry.spec.ts`
 - `apps/desktop/src/lib/__tests__/tablepilot.spec.ts`
 - `apps/desktop/src/lib/app/externalLinks.spec.ts`
 - `apps/desktop/src/lib/app/externalLinks.ts`
 - `apps/desktop/src/lib/backend/api.ts`
+- `apps/desktop/src/lib/backend/tauri.ts`
 - `apps/desktop/src/lib/connection/connectionDeepLink.ts`
 - `apps/desktop/src/lib/database/databaseFeatureSupport.ts`
 - `apps/desktop/src/lib/editor/shortcutRegistry.ts`
@@ -103,17 +117,22 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/lib/plugins/pluginInstallDeepLink.ts`
 - `apps/desktop/src/lib/settings/settingsSearch.ts`
 - `apps/desktop/src/lib/tablepilot.ts`
+- `apps/desktop/src/stores/__tests__/connectionStore.savePassword.spec.ts`
+- `apps/desktop/src/stores/__tests__/settingsStore.spec.ts`
 - `apps/desktop/src/stores/settingsStore.ts`
 - `crates/dbx-core/Cargo.toml`
 - `crates/dbx-core/src/ai/mod.rs`
 - `crates/dbx-core/src/lib.rs`
 - `crates/dbx-core/src/persistence/secret_codec.rs`
 - `crates/dbx-core/src/persistence/storage.rs`
+- `crates/dbx-plugin-runtime/src/plugins/host.rs`
+- `crates/dbx-plugin-runtime/src/plugins/lifecycle_tests.rs`
 - `package.json`
 - `pnpm-lock.yaml`
 - `pnpm-workspace.yaml`
 - `scripts/build-tablepilot.mjs`
 - `scripts/tablepilot-publish.py`
+- `scripts/tablepilot-publish.test.py`
 - `scripts/tablepilot-source-manifest.py`
 - `scripts/tablepilot-sync-upstream.py`
 - `scripts/tablepilot-sync-upstream.test.py`
@@ -145,6 +164,8 @@ The following list is also the modification notice for formats such as JSON and 
 - `src-tauri/src/lib.rs`
 - `src-tauri/tauri.conf.json`
 - `src-tauri/tauri.linux.conf.json`
+
+- `apps/desktop/src/i18n/__tests__/editorSelectionContextParity.spec.ts`
 
 ## Upstream files omitted from this desktop edition
 
@@ -335,3 +356,4 @@ The following list is also the modification notice for formats such as JSON and 
 - `src-tauri/src/commands/mcp_http_server.rs`
 - `src-tauri/src/commands/prompt_template.rs`
 - `src-tauri/src/commands/user_skills.rs`
+- `apps/desktop/src/lib/sql/sqlExecutionOutcome.ts`

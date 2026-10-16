@@ -259,6 +259,7 @@ function lookup(messages: Record<string, unknown>, key: string): unknown {
   return key.split(".").reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], messages);
 }
 
+// TablePilot does not ship the upstream web-server crate.
 describe("backend error translation", () => {
   test.each(CASES)("$name resolves to a defined English key", ({ key }) => {
     expect(lookup(en as unknown as Record<string, unknown>, key)).toEqual(expect.any(String));
@@ -680,8 +681,6 @@ describe("backend error wording is pinned to the Rust sources", () => {
     ["crates/dbx-core/src/admin/mq/adapters/kafka.rs", "Kafka does not support unloading topics"],
     ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin update source change requires confirmation:"],
     ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin downgrade to version "],
-    ["crates/dbx-web/src/auth.rs", "Please try again in {remaining}s"],
-    ["crates/dbx-web/src/routes/agents.rs", "Close these database connections before updating drivers: "],
     ["src-tauri/src/commands/agents.rs", "Close these database connections before updating drivers: "],
     ["src-tauri/src/commands/fs_open.rs", "file does not exist: "],
   ])("%s still emits %j", (path, fragment) => {
