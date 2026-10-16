@@ -8,7 +8,10 @@ import subprocess
 
 
 def gh(*args, check=True):
-    return subprocess.run(['gh', *args], check=check, text=True, capture_output=True)
+    result = subprocess.run(['gh', *args], text=True, capture_output=True)
+    if check and result.returncode:
+        raise SystemExit(result.stderr.strip() or result.stdout.strip() or 'GitHub CLI request failed')
+    return result
 
 
 def main():
