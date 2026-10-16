@@ -3,6 +3,13 @@
 Based on reviewed non-AI changes through DBX v0.6.45, commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`.
 Modified on 14–16 October 2026 for the independent TablePilot desktop prototype.
 
+## Security maintenance (unreleased, 16 October 2026)
+
+- Remove obsolete `@types/splitpanes`, which pulled in vulnerable Vue 2 (GHSA-5j4c-8p2g-v4jx). Splitpanes 4 supplies its own Vue 3 declarations.
+- Remove the shadcn-vue component-generator dependency and its vulnerable `braces` chain (GHSA-vfj7-8cjw-p6xm). Preserve its 2.8.2 Tailwind stylesheet unchanged locally, with its MIT license in the stylesheet and bundled NOTICE. Existing generated components remain in the app.
+- Remove the generator's stale optional Stylus peer from Vite and prune unreachable lockfile entries, eliminating `decode-uri-component` 0.2.2 (GHSA-vcc3-ghjq-m6fr). TablePilot has no Stylus sources. No remaining package versions were upgraded.
+- Root workspace `pnpm audit --json` reports zero vulnerabilities after these changes (previously one high, one moderate and one low). This does not cover Rust, documentation/example lockfiles or the full GitHub Dependabot alert list, which the connector cannot access.
+
 ## Changes
 
 - TablePilot 0.4.0 is the first normal release. About uses the installed version; upstream community cards, website promotion and remaining localized product branding are removed. Technical identifiers/formats remain compatible, and license/attribution files are bundled with installers.
