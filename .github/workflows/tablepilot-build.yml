@@ -59,30 +59,3 @@ jobs:
             target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 30
-  publish:
-    needs: [source, build]
-    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[linux-only]')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-      actions: read
-    concurrency:
-      group: tablepilot-publish
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.source.outputs.revision }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: TablePilot-*
-          path: installers
-      - name: Publish versioned installers
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_REVISION: ${{ needs.source.outputs.revision }}
-        run: |
-          VERSION=$(python -c 'import json; print(json.load(open("package.json"))["version"])')
-          python scripts/tablepilot-publish.py --artifacts installers --version "$VERSION" --target "$SOURCE_REVISION"

@@ -35,5 +35,7 @@ node node_modules/vitest/vitest.mjs run --maxWorkers=1 \
 - Production frontend build and full Vue/TypeScript type check passed after removing GitHub GUI navigation. The first type-check attempt exceeded the local memory limit while running alongside the build; the final standalone run passed with a 6 GB Node heap limit.
 - Two focused GUI link tests passed; changelog text is retained when GitHub anchors are removed.
 - Two upstream-proposal integration tests passed in a temporary Git repository, covering unchanged files, fork edits, protected/AI paths, additions, deletions, symlinks, and repeated proposals.
-- All three GitHub workflow files parsed successfully; Python automation scripts compiled.
+- All four GitHub workflow files parsed successfully; Python automation scripts compiled.
 - No Rust implementation changes were made in this update (only the package version). Native installers are validated by the Windows/Linux CI builds before publication.
+
+- Two release-packaging tests passed, verifying that unchanged workflows preserve the original source commit and packaging snapshots only refresh workflow definitions and corresponding hashes.

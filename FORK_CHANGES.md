@@ -29,6 +29,7 @@ The following list is also the modification notice for formats such as JSON and 
 
 - `.github/workflows/tablepilot-build.yml`
 - `.github/workflows/tablepilot-publish-existing.yml`
+- `.github/workflows/tablepilot-release.yml`
 - `.github/workflows/tablepilot-upstream.yml`
 - `.tablepilot/upstream.json`
 - `Cargo.lock`
@@ -114,6 +115,7 @@ The following list is also the modification notice for formats such as JSON and 
 - `pnpm-workspace.yaml`
 - `scripts/build-tablepilot.mjs`
 - `scripts/tablepilot-publish.py`
+- `scripts/tablepilot-publish.test.py`
 - `scripts/tablepilot-source-manifest.py`
 - `scripts/tablepilot-sync-upstream.py`
 - `scripts/tablepilot-sync-upstream.test.py`
