@@ -5,6 +5,10 @@ Modified on 14–16 October 2026 for the independent TablePilot desktop prototyp
 
 ## Changes
 
+- TablePilot 0.4.0 is the first normal release. About uses the installed version; upstream community cards, website promotion and remaining localized product branding are removed. Technical identifiers/formats remain compatible, and license/attribution files are bundled with installers.
+- Installer CI now requires a full frontend type check before native compilation and publication.
+- A dedicated native metadata client reads only public deckeeper/TablePilot releases. Startup/hourly checks and release history select complete stable releases; installation is a browser download. No access token, upstream updater or unattended installer is enabled. Release automation marks versions 0.4.0 onward as normal/latest releases.
+
 - TablePilot 0.3.3 removes Plugin Center toolbar/menu/settings navigation, shortcut settings entries and install-link access. Existing preferences cannot enable it. Marketplace checking/updating is disabled, while database drivers, JDBC and installed plugin runtime support are retained.
 - Future prototype installer builds use ThinLTO with 16 code-generation units, cache workspace crates and pnpm downloads, and keep non-cancelling build concurrency. Existing running jobs use their original source/configuration.
 
@@ -55,13 +59,17 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/public/logo-black.png`
 - `apps/desktop/public/logo.png`
 - `apps/desktop/src/App.vue`
+- `apps/desktop/src/components/auth/LoginPage.vue`
 - `apps/desktop/src/components/common/QueryErrorActions.vue`
+- `apps/desktop/src/components/connection/ConnectionDialog.vue`
 - `apps/desktop/src/components/editor/CloudSyncSelectionDialog.vue`
 - `apps/desktop/src/components/editor/EditorSettingsDialog.vue`
 - `apps/desktop/src/components/editor/QueryEditorContextMenu.vue`
 - `apps/desktop/src/components/editor/QueryHistory.vue`
 - `apps/desktop/src/components/editor/__tests__/EditorSettingsDialog.externalClose.integration.spec.ts`
+- `apps/desktop/src/components/etcd/EtcdKeyBrowser.vue`
 - `apps/desktop/src/components/icons/AppLogo.vue`
+- `apps/desktop/src/components/kv/KvKeyBrowser.vue`
 - `apps/desktop/src/components/layout/AppSidebar.vue`
 - `apps/desktop/src/components/layout/AppToolbar.vue`
 - `apps/desktop/src/components/layout/ContentArea.vue`
@@ -78,6 +86,7 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/components/plugins/PluginShortcutBar.vue`
 - `apps/desktop/src/components/plugins/PluginShortcutToolbar.vue`
 - `apps/desktop/src/components/settings/ChangelogPanel.vue`
+- `apps/desktop/src/composables/__tests__/useAppUpdater.spec.ts`
 - `apps/desktop/src/composables/__tests__/useComponentUpdates.tablepilot.spec.ts`
 - `apps/desktop/src/composables/__tests__/useSqlExecution.spec.ts`
 - `apps/desktop/src/composables/useAppUpdater.ts`
@@ -87,6 +96,7 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/i18n/__tests__/backendErrors.spec.ts`
 - `apps/desktop/src/i18n/__tests__/editorSelectionContextParity.spec.ts`
 - `apps/desktop/src/i18n/__tests__/featureMessages.spec.ts`
+- `apps/desktop/src/i18n/index.ts`
 - `apps/desktop/src/i18n/locales/az.ts`
 - `apps/desktop/src/i18n/locales/consulAz.ts`
 - `apps/desktop/src/i18n/locales/consulEs.ts`
@@ -116,9 +126,14 @@ The following list is also the modification notice for formats such as JSON and 
 - `apps/desktop/src/lib/__tests__/editor/keyboardShortcuts.spec.ts`
 - `apps/desktop/src/lib/__tests__/editor/shortcutRegistry.spec.ts`
 - `apps/desktop/src/lib/__tests__/tablepilot.spec.ts`
+- `apps/desktop/src/lib/app/changelog.ts`
 - `apps/desktop/src/lib/app/externalLinks.spec.ts`
 - `apps/desktop/src/lib/app/externalLinks.ts`
+- `apps/desktop/src/lib/app/tablepilotBranding.spec.ts`
+- `apps/desktop/src/lib/app/tablepilotBranding.ts`
 - `apps/desktop/src/lib/backend/api.ts`
+- `apps/desktop/src/lib/backend/debugLog.ts`
+- `apps/desktop/src/lib/backend/http.ts`
 - `apps/desktop/src/lib/backend/tauri.ts`
 - `apps/desktop/src/lib/connection/connectionDeepLink.ts`
 - `apps/desktop/src/lib/database/databaseFeatureSupport.ts`
@@ -170,6 +185,8 @@ The following list is also the modification notice for formats such as JSON and 
 - `src-tauri/src/commands/deep_link.rs`
 - `src-tauri/src/commands/mod.rs`
 - `src-tauri/src/commands/mongo_cmd.rs`
+- `src-tauri/src/commands/support_info.rs`
+- `src-tauri/src/commands/tablepilot_updates.rs`
 - `src-tauri/src/commands/update.rs`
 - `src-tauri/src/data_dir.rs`
 - `src-tauri/src/lib.rs`

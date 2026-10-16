@@ -5555,17 +5555,12 @@ export async function deleteHistoryEntry(id: string): Promise<void> {
 // Updates
 // ---------------------------------------------------------------------------
 
-export async function checkForUpdates(locale?: string, source?: UpdateDownloadSource): Promise<UpdateInfo> {
-  const params = new URLSearchParams();
-  if (locale) params.set("locale", locale);
-  if (source) params.set("source", source);
-  const query = params.size > 0 ? `?${params.toString()}` : "";
-  return get(`/api/update/check${query}`);
+export async function checkForUpdates(_locale?: string, _source?: UpdateDownloadSource): Promise<UpdateInfo> {
+  throw new Error("TablePilot release checks are available in the desktop app.");
 }
 
-export async function fetchChangelog(lang?: string): Promise<import("@/lib/app/changelog").ChangelogData> {
-  const query = lang ? `?lang=${encodeURIComponent(lang)}` : "";
-  return get(`/api/changelog${query}`);
+export async function fetchChangelog(_lang?: string): Promise<import("@/lib/app/changelog").ChangelogData> {
+  throw new Error("TablePilot release history is available in the desktop app.");
 }
 
 export async function checkMcpServerStatus(): Promise<import("@/lib/backend/tauri").McpServerStatus> {

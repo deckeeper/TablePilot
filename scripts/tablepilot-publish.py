@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -59,6 +60,11 @@ def release_target(repo, source):
         'tree': tree['sha'], 'parents': [source],
     })
     return commit['sha']
+
+
+def official_release(version):
+    match = re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version)
+    return bool(match and tuple(map(int, match.groups())) >= (0, 4, 0))
 
 
 def main():
@@ -119,7 +125,9 @@ def main():
         return
     target = release_target(repo, args.target)
     notes = root/'release-notes.md'
-    text = f'''TablePilot {args.version} desktop prototype, based on DBX with AI and MCP execution removed.
+    official = official_release(args.version)
+    edition = 'release' if official else 'prototype'
+    text = f'''TablePilot {args.version} desktop {edition}.
 
 ## Downloads
 - Windows 11 x64: `TablePilot_{args.version}_x64-setup.exe`
@@ -127,7 +135,7 @@ def main():
 - `SHA256SUMS.txt`: installer checksums.
 
 Installers are unsigned. Native installer builds passed; installation and live database/SSH tests still need user testing.
-This repository is private, so downloads require access to it.
+Application updates and release history are provided by deckeeper/TablePilot.
 
 Source commit: `{args.target}`.
 '''
@@ -137,6 +145,7 @@ Source commit: `{args.target}`.
         changes = {
             '0.3.1': 'Remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.',
             '0.3.2': 'Integrate reviewed DBX 0.6.45 database and interface improvements, excluding AI/MCP changes.',
+            '0.4.0': 'First official TablePilot release. Clean up product branding and About; check this repository automatically for complete official releases and display its release history. Download updates from the release page.',
             '0.3.3': 'Remove Plugin Center navigation and marketplace updates while preserving Driver Manager/JDBC. Use faster prototype build settings and expanded compilation caching.',
         }
         text += '\nChanges: ' + changes.get(args.version, 'See FORK_CHANGES.md and VALIDATION.md in the tagged source for this version.') + '\n'
@@ -144,8 +153,8 @@ Source commit: `{args.target}`.
         text += f'\nThe release tag `{target}` retains the application source above; only workflow definitions and their source-manifest hashes were refreshed to the current approved workflows.\n'
     notes.write_text(text)
     result = gh('release', 'create', tag, *map(str, assets), '--repo', repo,
-                '--target', target, '--title', f'TablePilot {args.version} prototype',
-                '--prerelease', '--notes-file', str(notes))
+                '--target', target, '--title', f'TablePilot {args.version}' + ('' if official else ' prototype'),
+                *(['--latest'] if official else ['--prerelease']), '--notes-file', str(notes))
     print(result.stdout)
 
 

@@ -548,18 +548,15 @@ const toolbarStyle = computed(() => {
 
 <template>
   <div ref="toolbarEl" class="app-toolbar h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :style="toolbarStyle" data-tauri-drag-region @dblclick="onToolbarDblClick">
-    <a
+    <div
       v-if="!isDesktop && webLogoPosition === 'left'"
-      href="https://dbxio.com"
-      target="_blank"
-      rel="noopener noreferrer"
       class="flex items-center gap-1.5 h-8 px-2 rounded-md hover:bg-muted/60 transition-colors shrink-0 select-none mr-0.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       title="TablePilot"
       data-testid="web-brand-logo"
     >
       <AppLogo class="h-5 w-5 rounded shrink-0 pointer-events-none" />
       <span class="font-bold text-xs tracking-tight text-foreground/90 translate-y-px">TablePilot</span>
-    </a>
+    </div>
     <Tooltip v-if="showSidebarExpand">
       <TooltipTrigger as-child>
         <Button variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('sidebar.expand')" @click="emit('expand-sidebar')">
@@ -767,18 +764,15 @@ const toolbarStyle = computed(() => {
     </div>
     <!-- /rightWrapper -->
 
-    <a
+    <div
       v-if="!isDesktop && webLogoPosition === 'right'"
-      href="https://dbxio.com"
-      target="_blank"
-      rel="noopener noreferrer"
       class="flex items-center gap-1.5 h-8 px-2 rounded-md hover:bg-muted/60 transition-colors shrink-0 select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       title="TablePilot"
       data-testid="web-brand-logo"
     >
       <AppLogo class="h-5 w-5 rounded shrink-0 pointer-events-none" />
       <span class="font-bold text-xs tracking-tight text-foreground/90 translate-y-px">TablePilot</span>
-    </a>
+    </div>
 
     <Tooltip>
       <TooltipTrigger as-child>

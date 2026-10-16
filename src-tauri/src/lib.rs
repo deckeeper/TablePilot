@@ -810,7 +810,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
         LocaleFamily::SimplifiedChinese => ("显示 TablePilot", "退出 TablePilot"),
         LocaleFamily::TraditionalChinese => ("顯示 TablePilot", "退出 TablePilot"),
         LocaleFamily::Thai => ("แสดง TablePilot", "ออกจาก TablePilot"),
-        LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
+        LocaleFamily::Japanese => ("TablePilotを表示", "TablePilotを終了"),
         LocaleFamily::Korean => ("TablePilot 표시", "TablePilot 종료"),
         LocaleFamily::Azerbaijani => ("TablePilot-i göstər", "TablePilot-dən çıx"),
         LocaleFamily::Spanish => ("Mostrar TablePilot", "Salir de TablePilot"),
@@ -1126,7 +1126,7 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("zh-TW"), ("顯示 TablePilot", "退出 TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("zh-Hant-HK"), ("顯示 TablePilot", "退出 TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 TablePilot", "退出 TablePilot"));
-        assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
+        assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("TablePilotを表示", "TablePilotを終了"));
         assert_eq!(tray_menu_labels_for_locale("th-TH"), ("แสดง TablePilot", "ออกจาก TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("th_TH"), ("แสดง TablePilot", "ออกจาก TablePilot"));
         assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("TablePilot 표시", "TablePilot 종료"));
@@ -1147,7 +1147,7 @@ mod tests {
     fn app_menu_labels_follow_locale() {
         assert_eq!(app_menu_quit_label("zh-CN", "TablePilot"), "退出 TablePilot");
         assert_eq!(app_menu_quit_label("zh-TW", "TablePilot"), "退出 TablePilot");
-        assert_eq!(app_menu_quit_label("ja-JP", "TablePilot"), "DBXを終了");
+        assert_eq!(app_menu_quit_label("ja-JP", "TablePilot"), "TablePilotを終了");
         assert_eq!(app_menu_quit_label("th-TH", "TablePilot"), "ออกจาก TablePilot");
         assert_eq!(app_menu_quit_label("th_TH", "TablePilot"), "ออกจาก TablePilot");
         assert_eq!(app_menu_quit_label("ko-KR", "TablePilot"), "TablePilot 종료");
@@ -2032,6 +2032,8 @@ pub fn run() {
             commands::app_settings::load_native_debug_logs,
             commands::diagnostics::get_process_memory_info,
             commands::support_info::get_app_support_info,
+            commands::tablepilot_updates::tablepilot_check_for_updates,
+            commands::tablepilot_updates::tablepilot_fetch_changelog,
             commands::cloud_sync::webdav_sync_test,
             commands::cloud_sync::migration_status,
             commands::cloud_sync::migration_start,

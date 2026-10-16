@@ -1,5 +1,5 @@
-// TablePilot modification: upstream app updates disabled.
-import { APP_UPDATES_ENABLED } from "@/lib/tablepilot";
+// TablePilot checks its own official releases; installation remains a browser download.
+import { APP_UPDATES_ENABLED, TABLEPILOT_RELEASES_URL } from "@/lib/tablepilot";
 import { computed, ref, watch, onScopeDispose } from "vue";
 import { useI18n } from "vue-i18n";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
@@ -99,25 +99,12 @@ export function tagVersion(version: string): string {
   return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
 }
 
-export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unknown, fallbackUrl: string): string {
-  const normalizedSource = normalizeUpdateDownloadSource(source);
-  if (normalizedSource === "cnb" && info?.latest_version) {
-    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
-  }
-  if (normalizedSource === "cnb") return "https://cnb.cool/dbxio.com/dbx/-/releases";
-  return info?.release_url || fallbackUrl;
+export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, _source: unknown, _fallbackUrl: string): string {
+  return info?.latest_version ? resolveReleaseTagUrl(info.latest_version, "official") : `${TABLEPILOT_RELEASES_URL}/latest`;
 }
 
-/**
- * 按版本 tag 解析“下载页”地址：CNB 源指向 CNB 的 release 页，其余指向 GitHub release 页。
- * 用于历史版本回退：只做跳转，不在应用内下载/安装旧版本。
- */
-export function resolveReleaseTagUrl(tag: string, source: unknown): string {
-  const normalizedTag = tagVersion(tag);
-  if (normalizeUpdateDownloadSource(source) === "cnb") {
-    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${encodeURIComponent(normalizedTag)}`;
-  }
-  return `https://github.com/t8y2/dbx/releases/tag/${encodeURIComponent(normalizedTag)}`;
+export function resolveReleaseTagUrl(tag: string, _source: unknown): string {
+  return `${TABLEPILOT_RELEASES_URL}/tag/${encodeURIComponent(tagVersion(tag))}`;
 }
 
 export async function resolveUpdaterProxy(): Promise<string | undefined> {
@@ -151,7 +138,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
   const autoUpdateEnabled = computed(() => settingsStore.editorSettings.autoUpdateApp !== false);
   const hasUpdateAvailable = computed(() => (updateDownloaded.value || updateReady.value || updateInfo.value?.update_available === true) && !isUpdateIgnored(updateInfo.value, settingsStore.editorSettings.ignoredUpdateVersion));
-  const latestReleaseUrl = "https://github.com/t8y2/dbx/releases/latest";
+  const latestReleaseUrl = `${TABLEPILOT_RELEASES_URL}/latest`;
   let generation = 0;
   let activeDownload: Promise<void> | undefined;
   let automaticDownload = false;
@@ -444,25 +431,6 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   async function initialize() {
     if (!APP_UPDATES_ENABLED || initialized || disposed) return;
     initialized = true;
-    if (isTauriRuntime()) {
-      phase.value = "checking";
-      try {
-        const cache = await api.getDownloadedUpdate();
-        if (disposed) return;
-        if (cache) {
-          const ignored = isUpdateIgnored({ latest_version: cache.version } as api.UpdateInfo, settingsStore.editorSettings.ignoredUpdateVersion);
-          if (ignored) await api.discardDownloadedUpdate(cache.cache_id);
-          else {
-            setDownloaded(cache);
-            updateInfo.value!.current_version = await api.getAppVersion();
-          }
-        }
-      } catch (error) {
-        fail(error);
-      } finally {
-        if (phase.value === "checking") phase.value = "idle";
-      }
-    }
     if (disposed) return;
     hourlyTimer = setInterval(() => {
       if (!retryTimer) {

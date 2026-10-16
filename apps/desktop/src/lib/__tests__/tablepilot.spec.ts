@@ -15,11 +15,11 @@ describe("TablePilot capability boundary", () => {
     expect(backend.installMcpServer).not.toHaveBeenCalled();
   });
   it("permits database, import/export, driver and SSH operations", () => {
-    for (const operation of ["testSshTunnel", "connectDb", "listTables", "previewImportFile", "importTableData", "exportTable", "installAgent", "getSystemProxyUrl"]) {
+    for (const operation of ["testSshTunnel", "connectDb", "listTables", "previewImportFile", "importTableData", "exportTable", "installAgent", "getSystemProxyUrl", "checkForUpdates", "fetchChangelog"]) {
       expect(isExcludedOperation(operation)).toBe(false);
     }
   });
   it("blocks replacement by the upstream application updater", () => {
-    for (const operation of ["checkForUpdates", "downloadUpdate", "installDownloadedUpdate"]) expect(isExcludedOperation(operation)).toBe(true);
+    for (const operation of ["downloadUpdate", "installDownloadedUpdate"]) expect(isExcludedOperation(operation)).toBe(true);
   });
 });

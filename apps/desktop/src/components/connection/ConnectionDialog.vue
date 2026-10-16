@@ -7602,7 +7602,7 @@ function openExternalUrl(url: string) {
                             <FolderOpen class="h-3.5 w-3.5" />
                             {{ t("toolbar.driverManager") }}
                           </Button>
-                          <Button type="button" variant="outline" size="sm" @click="openExternalUrl(activeJdbcProductProfile?.docsUrl || 'https://dbxio.com')">
+                          <Button v-if="activeJdbcProductProfile?.docsUrl" type="button" variant="outline" size="sm" @click="openExternalUrl(activeJdbcProductProfile.docsUrl)">
                             <ExternalLink class="h-3.5 w-3.5" />
                             {{ activeJdbcProductProfile ? t(activeJdbcProductProfile.docsLabelKey) : t("connection.jdbcDocs") }}
                           </Button>
@@ -9558,10 +9558,6 @@ function openExternalUrl(url: string) {
                             <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
                               <FolderOpen class="h-3.5 w-3.5" />
                               {{ t("toolbar.driverManager") }}
-                            </Button>
-                            <Button v-if="form.db_type !== 'dameng'" type="button" variant="outline" size="sm" @click="openExternalUrl('https://dbxio.com')">
-                              <ExternalLink class="h-3.5 w-3.5" />
-                              {{ t("connection.jdbcDocs") }}
                             </Button>
                           </div>
                         </div>

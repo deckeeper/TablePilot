@@ -166,7 +166,7 @@ watch(changelogLang, (lang) => {
     </div>
 
     <div v-else-if="error && !releases.length" class="mt-4 space-y-3">
-      <p class="text-sm text-destructive">{{ t("settings.changelogLoadFailed") }}</p>
+      <p class="text-sm text-destructive">{{ t("settings.changelogLoadFailed") }} {{ error }}</p>
       <div class="flex flex-wrap gap-2">
         <Button type="button" variant="outline" size="sm" @click="load(true)">{{ t("settings.changelogRetry") }}</Button>
         <Button type="button" variant="outline" size="sm" @click="openExternalUrl(changelogWebsiteUrl(changelogLang))">

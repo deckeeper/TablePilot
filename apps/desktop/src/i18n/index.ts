@@ -1,3 +1,4 @@
+import { tablepilotMessages } from "@/lib/app/tablepilotBranding";
 import { createI18n } from "vue-i18n";
 import en from "./locales/en";
 import { safeLocalStorageGet } from "@/lib/backend/safeStorage";
@@ -88,7 +89,7 @@ const i18n = createI18n({
   locale: initialLocale,
   fallbackLocale: defaultLocale,
   messages: {
-    en,
+    en: tablepilotMessages(en),
   },
 });
 const i18nGlobal = i18n.global as unknown as I18nGlobal;
@@ -98,7 +99,7 @@ export async function loadLocaleMessages(locale: Locale) {
   const loader = localeLoaders[locale as Exclude<Locale, "en">];
   if (!loader) return;
   const messages = await loader();
-  i18nGlobal.setLocaleMessage(locale, messages.default);
+  i18nGlobal.setLocaleMessage(locale, tablepilotMessages(messages.default));
   loadedLocales.add(locale);
 }
 

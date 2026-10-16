@@ -1,3 +1,4 @@
+import { TABLEPILOT_RELEASES_URL } from "@/lib/tablepilot";
 export type ChangelogItem = {
   title: string;
   desc: string;
@@ -37,12 +38,12 @@ export function changelogLangFromLocale(locale: string): ChangelogLang {
   return locale === "zh-CN" || locale === "zh-TW" ? "cn" : "en";
 }
 
-export function changelogWebsiteUrl(lang: ChangelogLang): string {
-  return `https://dbxio.com/${lang}/changelog`;
+export function changelogWebsiteUrl(_lang: ChangelogLang): string {
+  return TABLEPILOT_RELEASES_URL;
 }
 
 export function changelogReleaseUrl(tag: string): string {
-  return `https://github.com/t8y2/dbx/releases/tag/${encodeURIComponent(tag)}`;
+  return `${TABLEPILOT_RELEASES_URL}/tag/${encodeURIComponent(tag)}`;
 }
 
 export async function fetchChangelog(lang: ChangelogLang, options: { force?: boolean } = {}): Promise<ChangelogData> {

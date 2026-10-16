@@ -1,4 +1,4 @@
-# TablePilot 0.3.3 prototype
+# TablePilot 0.4.0
 
 An independent desktop fork of [DBX v0.6.45](https://github.com/t8y2/dbx/tree/v0.6.45), commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`, licensed under Apache-2.0.
 
@@ -7,6 +7,12 @@ The database workbench, SQL editor, CSV/Excel import/export, field mapping, SSH 
 The AI provider runtime and MCP services are excluded from the desktop build. Their native commands and startup servers are removed. AI chat/settings/menu controls are removed, plugin `host.ai` access is denied, and the shared frontend API rejects AI/MCP calls. Some passive legacy configuration types remain to keep the shared database/settings format readable; they cannot execute models or start an MCP server.
 
 TablePilot has its own app identifier, credential-store service and portable-data marker. DBX's app updater is removed. Database driver downloads still use the upstream driver distribution service. This is not an entirely offline product, and third-party plugins retain their own declared network permissions.
+
+## Changes in 0.4.0
+
+First official TablePilot release (not a GitHub prerelease). About shows the installed version; upstream community/website promotion and remaining product labels are removed from the interface. Required licenses and attribution are retained in the source and bundled `licenses` directory. Legacy storage keys, file formats and database command syntax remain compatible.
+
+TablePilot automatically checks `deckeeper/TablePilot` releases at startup and every hour, displays release notes, and offers newer complete official releases. The repository must be public; no token or sign-in is used for checks. Prereleases, drafts, invalid version tags and releases missing either installer are excluded. Updates open the release page for downloading and running the installer; unattended installation is not enabled. Driver/JDBC update sources remain separate.
 
 ## Changes in 0.3.3
 
@@ -20,7 +26,7 @@ Reviewed database and interface changes from DBX 0.6.45: grid filters and pagina
 
 ## Download installers
 
-Open [TablePilot Releases](https://github.com/deckeeper/TablePilot/releases), expand **Assets**, and download the Windows `.exe` or Linux `.deb`. The repository remains private: you must be signed in with repository access. Releases retain downloads beyond the 30-day Actions artifact window. The original 0.3.0 installers are also published from their verified build artifacts; the GitHub GUI link cleanup is included in 0.3.1.
+Open [TablePilot Releases](https://github.com/deckeeper/TablePilot/releases), expand **Assets**, and download the Windows `.exe` or Linux `.deb`. Public repository releases can be downloaded without signing in. If visibility is still private, automatic checks will report that the repository must be public. Releases retain downloads beyond the 30-day Actions artifact window. The original 0.3.0 installers are also published from their verified build artifacts; the GitHub GUI link cleanup is included in 0.3.1.
 
 ## Review upstream updates
 

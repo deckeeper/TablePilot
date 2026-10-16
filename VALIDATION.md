@@ -59,3 +59,13 @@ Native Rust compilation was not run for this update because this session has no 
 - Windows/Linux CI builds now use ThinLTO, 16 code-generation units, workspace-crate caching and pnpm caching. The first build with this profile needs a fresh compiled cache. Build duration and runtime performance have not been benchmarked.
 
 Native installer compilation and installation remain pending GitHub Actions/manual testing for this version. No Rust implementation changes were made (only the package version). Existing native build jobs are not cancelled.
+
+## 0.4.0 official release — 16 October 2026
+
+- Production frontend build passed (existing chunk-size/dynamic-import warnings).
+- Focused regression results: **58 tests passed across 10 files** after an isolated two-file rerun. Coverage includes startup/hourly checks, failure reporting, manual release downloads, ignored versions, stale response handling, repository links, About branding/version, localization, driver updates and settings behavior. Two initial failures were an old upstream URL expectation and a test hook accidentally returning a mock as a cleanup callback; both were corrected.
+- Four release-packaging tests passed, including actual mocked publication commands for normal/latest 0.4.0 and prerelease 0.3.3. Python compilation and packaging configuration checks passed.
+- Local full Vue/TypeScript checks reported cleanup errors while source edits were in progress (unused link helpers, a settings search field and a temporarily removed debug-copy helper). These were corrected; the final source has not completed a standalone full type check locally. The installer CI runs the full frontend/type-check build before native compilation.
+- Release checks use a dedicated native client with a fixed public TablePilot GitHub API endpoint and a 30-second timeout. It filters drafts/prereleases, nonstandard tags and incomplete installer releases, then compares semantic versions. No token is used; executable download/install commands remain blocked.
+- Native unit coverage was added for release filtering but cannot run locally because the Rust toolchain is unavailable. Windows/Linux compilation remains a CI gate. Live update checks and installer upgrades require manual testing of the built application.
+- Required LICENSE/NOTICE resources are included in the installer configuration. The application identifier and installer mode are preserved for upgrades.

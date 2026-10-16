@@ -4995,7 +4995,7 @@ onUnmounted(() => {
                   :plugin-update-count="componentUpdates.pluginUpdateCount.value"
                   class="flex-1 min-h-0"
                   @update:open="(open: boolean) => (open ? activateSettingsPage() : finishCloseSettingsPage())"
-                  @check-updates="checkAllUpdates"
+                  @check-updates="handleToolbarUpdateClick"
                   @update-all="updateAllAvailable"
                   @open-update-center="handleToolbarUpdateClick"
                   @open-driver-store="openDriverStoreFromUpdate"

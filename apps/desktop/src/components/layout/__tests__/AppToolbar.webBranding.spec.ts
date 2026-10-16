@@ -139,9 +139,10 @@ describe("AppToolbar web branding (#8703, #11053)", () => {
 
     const brandEl = host.querySelector('[data-testid="web-brand-logo"]');
     expect(brandEl).not.toBeNull();
-    expect(brandEl?.getAttribute("href")).toBe("https://dbxio.com");
-    expect(brandEl?.getAttribute("target")).toBe("_blank");
-    expect(brandEl?.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(brandEl?.tagName).toBe("DIV");
+    expect(brandEl?.getAttribute("href")).toBeNull();
+    expect(brandEl?.getAttribute("target")).toBeNull();
+    expect(brandEl?.getAttribute("rel")).toBeNull();
     expect(brandEl?.textContent).toContain("TablePilot");
 
     const logoImg = brandEl?.querySelector("img");
@@ -195,7 +196,7 @@ describe("AppToolbar web branding (#8703, #11053)", () => {
     unmount();
   });
 
-  it("does not render the web DBX brand logo in desktop mode regardless of setting", async () => {
+  it("does not render the web TablePilot brand logo in desktop mode regardless of setting", async () => {
     mockIsTauriRuntime = true;
     const settingsStore = useSettingsStore();
     settingsStore.updateEditorSettings({ webLogoPosition: "right" });

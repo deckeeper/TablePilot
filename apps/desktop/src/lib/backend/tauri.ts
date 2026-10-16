@@ -3384,12 +3384,12 @@ export async function uninstallNpmMcpServer(): Promise<string> {
   return invoke("uninstall_npm_mcp_server");
 }
 
-export async function checkForUpdates(locale?: string, source?: UpdateDownloadSource): Promise<UpdateInfo> {
-  return invoke("check_for_updates", { locale, source });
+export async function checkForUpdates(_locale?: string, _source?: UpdateDownloadSource): Promise<UpdateInfo> {
+  return invoke("tablepilot_check_for_updates");
 }
 
-export async function fetchChangelog(lang?: string): Promise<import("@/lib/app/changelog").ChangelogData> {
-  return invoke("fetch_changelog", { lang });
+export async function fetchChangelog(_lang?: string): Promise<import("@/lib/app/changelog").ChangelogData> {
+  return invoke("tablepilot_fetch_changelog");
 }
 
 export async function getSystemProxyUrl(): Promise<string | null> {

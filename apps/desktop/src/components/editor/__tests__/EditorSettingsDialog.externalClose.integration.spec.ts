@@ -48,7 +48,7 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-async function mountPage() {
+async function mountPage(initialTab = "editor") {
   const pinia = createPinia();
   setActivePinia(pinia);
   const store = useSettingsStore();
@@ -67,7 +67,8 @@ async function mountPage() {
               ref: page,
               variant: "page",
               open: true,
-              initialTab: "editor",
+              initialTab,
+              appVersion: "0.4.0",
               "onUpdate:open": (value: boolean) => {
                 open.value = value;
               },
@@ -135,4 +136,11 @@ describe("settings page external close request", () => {
     await settle();
     expect(open.value).toBe(false);
   });
+});
+
+it("shows the installed TablePilot version without upstream branding or community links", async () => {
+  await mountPage("about");
+  expect(host.textContent).toContain("TablePilot 0.4.0");
+  expect(host.textContent).not.toMatch(/DBX|0\.3\.0|QQ Group|WeChat|Feishu|Discord|dbxio/);
+  expect(host.querySelector('a[href*="dbxio"], a[href*="discord.gg"]')).toBeNull();
 });

@@ -6,7 +6,6 @@ import { useI18n } from "vue-i18n";
 import { AlertTriangle, CheckCircle2, ChevronDown, Loader2, RefreshCw } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { getAppVersion, type UpdateInfo } from "@/lib/backend/api";
 import type { AgentDriverInfo, McpServerStatus, UpdateDownloadSource } from "@/lib/backend/tauri";
 import type { JdbcPluginStatus } from "@/types/database";
@@ -349,7 +348,7 @@ watch(
                 {{ t("updates.portableAutomaticUpdate") }}
               </p>
               <p v-if="isDesktop && updateInfo?.update_available && updateInfo.manual_update_only" class="text-xs text-muted-foreground">
-                {{ t("updates.windows7ManualUpdate") }}
+                Download the installer from the TablePilot release page, close the app, then run the installer to update.
               </p>
               <div v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop) && activeTaskCount > 0" role="alert" class="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
                 <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
@@ -465,18 +464,7 @@ watch(
         </div>
 
         <DialogFooter v-if="selectedTab === 'app'" data-update-footer class="mx-0 mb-0 min-w-0 rounded-none border-t px-[22px] pb-2.5 pt-2.5 sm:items-center sm:justify-end">
-          <div v-if="!updateReady && !isInstallingUpdate && !updateDownloaded && (updateInfo?.update_available || updateCheckFailed)" class="flex items-center gap-1.5 self-start sm:mr-auto sm:self-center">
-            <span class="text-xs text-muted-foreground">{{ t("updates.source") }}</span>
-            <Select :model-value="updateDownloadSource" :disabled="checkingUpdates || isIgnoringUpdate" @update:model-value="(value) => value && emit('change-download-source', value as UpdateDownloadSource)">
-              <SelectTrigger class="h-8 w-[150px] text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="official">{{ t("updates.sourceOfficial") }}</SelectItem>
-                <SelectItem value="cnb">{{ t("updates.sourceCnb") }}</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          <span class="mr-auto text-xs text-muted-foreground">TablePilot official releases</span>
           <template v-if="updateInfo?.update_available">
             <div class="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
               <Button v-if="canIgnoreVersion" variant="ghost" class="shrink-0" :disabled="isIgnoringUpdate" @click="emit('ignore-version')">
