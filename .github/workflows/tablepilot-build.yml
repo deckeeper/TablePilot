@@ -1,4 +1,4 @@
-# TablePilot installer builds; no upstream release or updater publishing.
+# TablePilot installer builds and releases to this repository only.
 name: Build TablePilot installers
 on:
   push:
@@ -8,22 +8,12 @@ permissions:
   contents: read
 jobs:
   source:
+    if: ${{ !contains(github.event.head_commit.message, '[automation-only]') }}
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     outputs:
       revision: ${{ steps.revision.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
-      - name: Import verified TablePilot source (first run only)
-        if: hashFiles('.tablepilot-bootstrap/import.py') != ''
-        run: |
-          python .tablepilot-bootstrap/import.py
-          git config user.name "TablePilot Build"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Import TablePilot 0.3.0 source with AI and MCP removed"
-          git push origin HEAD:main
       - id: revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   build:

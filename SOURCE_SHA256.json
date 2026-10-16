@@ -98,7 +98,6 @@
   ".github/ui-preview/record.mjs": "1152e61ed4e54bf4e9837c57794d255d91c99534160cb53919d15a64c9bff024",
   ".github/ui-preview/run.sh": "fba52d5a4856d6d87e94a89f319cc69bdff6bd1db50271d688f6847e7bef902f",
   ".github/ui-preview/seed.mjs": "d0ff256df31e7bd332472ead87e4f1522f0542383ac7ff4f3f0505196007c364",
-  ".github/workflows/tablepilot-build.yml": "c331e8f561554a601f44812dafe3b01dace12863097f0df14cbcdd558ede3597",
   ".gitignore": "eb473c4bcbf7eaea85e4b2dee02aefa0e578ba2cff29ed7a98430c6fdd85ba32",
   ".husky/pre-commit": "4dc1535b05a992d34c3696a675b24de35980b99ac3d222d90a07949c736c19aa",
   ".nvmrc": "6d07ac247e81cd42c2c20abf8dfe504413d6b2422e4aba9b2c975a776f155921",
@@ -6652,5 +6651,9 @@
   "vendor/wry/src/wkwebview/proxy.rs": "f7ee208069b3d4d045540c46b842c71f0fa2bba905b20463e67679471f58ad20",
   "vendor/wry/src/wkwebview/synthetic_mouse_events.rs": "6c0f6c12b15b673b947a3c3823c91528742e0244521567a168095f3524bf86ee",
   "vendor/wry/src/wkwebview/util.rs": "c7be7b4421d3d4ba06a61d39f4efc3ada0eb3e2d691078aa842c3ae76f95e755",
-  "vitest.config.ts": "3731336446259ffb46706f8b84a3e845941db68afa8803d08ce8e14fbe1f4d9e"
+  "vitest.config.ts": "3731336446259ffb46706f8b84a3e845941db68afa8803d08ce8e14fbe1f4d9e",
+  ".github/workflows/tablepilot-build.yml": "c4956eae6317c8d8874666444d16bfd6e9c40fc381d5a2f12daa73a485ebace1",
+  ".github/workflows/tablepilot-publish-existing.yml": "9f55289e63177316ce91601cd216af4503d75706861b2daf3f8fcd0e394af278",
+  ".github/workflows/tablepilot-release.yml": "cc06b0be7f60560311607e91a3c9efc4629ebcebba52cea3cfc24afd57ca435b",
+  ".github/workflows/tablepilot-upstream.yml": "619ec9b2c46d9130a5528cad1d7e3b2ba492fefe1632f81c95b2dbc0027a9d47"
 }

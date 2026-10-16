@@ -1,0 +1,71 @@
+# Publish completed main-branch builds using the current trusted release script.
+name: Publish TablePilot installers
+on:
+  workflow_run:
+    workflows: ['Build TablePilot installers']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Completed main-branch installer build run ID'
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: tablepilot-publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify completed build provenance
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          python - <<'PY'
+          import base64, json, os, re, subprocess
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_id = os.environ['BUILD_RUN_ID']
+          assert re.fullmatch(r'\d+', run_id), 'Invalid run ID'
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
+          run = api(f'actions/runs/{run_id}')
+          assert run['head_repository']['full_name'] == repo and run['head_branch'] == 'main'
+          assert run['path'] == '.github/workflows/tablepilot-build.yml' and run['status'] == 'completed'
+          jobs = api(f'actions/runs/{run_id}/jobs?per_page=100')['jobs']
+          required = {'build (windows-latest)', 'build (ubuntu-24.04)'}
+          successful = {j['name'] for j in jobs if j['conclusion'] == 'success'}
+          if not required.issubset(successful):
+              print('Both native builds have not succeeded; no release will be published.')
+              raise SystemExit(0)
+          source = run['head_sha']
+          package = api(f'contents/package.json?ref={source}')
+          version = json.loads(base64.b64decode(package['content']))['version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'ready=true\nrun_id={run_id}\nsource={source}\nversion={version}\n')
+          PY
+      - uses: actions/download-artifact@v4
+        if: steps.build.outputs.ready == 'true'
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.build.outputs.run_id }}
+          pattern: TablePilot-*
+          path: installers
+      - name: Publish verified installers
+        if: steps.build.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.build.outputs.version }}
+          SOURCE_REVISION: ${{ steps.build.outputs.source }}
+        run: python scripts/tablepilot-publish.py --artifacts installers --version "$RELEASE_VERSION" --target "$SOURCE_REVISION"

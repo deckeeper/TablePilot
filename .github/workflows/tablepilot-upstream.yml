@@ -1,0 +1,30 @@
+name: Review DBX upstream updates
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tablepilot-upstream.yml'
+      - '.tablepilot/upstream.json'
+      - 'scripts/tablepilot-sync-upstream.py'
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: tablepilot-upstream-proposal
+  cancel-in-progress: false
+jobs:
+  propose:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Prepare draft update without merging or executing upstream code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/tablepilot-sync-upstream.py
