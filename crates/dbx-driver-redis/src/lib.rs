@@ -940,6 +940,7 @@ pub async fn discover_sentinel_master(
 
 pub async fn connect_cluster(config: &ConnectionConfig) -> Result<RedisClusterPool, String> {
     let seed_nodes = redis_cluster_seed_nodes(config)?;
+    let timeout = Duration::from_secs(config.effective_connect_timeout_secs());
     let mut last_error = None;
     for auth in redis_auth_candidates(&config.username, &config.password) {
         let cluster_nodes: Vec<ConnectionInfo> = seed_nodes
@@ -956,10 +957,13 @@ pub async fn connect_cluster(config: &ConnectionConfig) -> Result<RedisClusterPo
                 )
             })
             .collect::<Result<_, _>>()?;
-        let client = ClusterClient::new(cluster_nodes).map_err(|e| format!("Redis cluster connection failed: {e}"))?;
-        let mut con = match tokio::time::timeout(connection_timeout(), client.get_async_connection())
+        let client = ClusterClient::builder(cluster_nodes)
+            .connection_timeout(timeout)
+            .build()
+            .map_err(|e| format!("Redis cluster connection failed: {e}"))?;
+        let mut con = match tokio::time::timeout(timeout, client.get_async_connection())
             .await
-            .map_err(|_| format!("Redis cluster connection timed out ({}s)", CONNECTION_TIMEOUT_SECS))?
+            .map_err(|_| format!("Redis cluster connection timed out ({}s)", timeout.as_secs()))?
             .map_err(|e| format!("Redis cluster connection failed: {e}"))
         {
             Ok(con) => con,
@@ -974,17 +978,13 @@ pub async fn connect_cluster(config: &ConnectionConfig) -> Result<RedisClusterPo
             Err(err) => return Err(err),
         };
 
-        let cluster_ping = match tokio::time::timeout(
-            connection_timeout(),
-            redis::cmd("PING").query_async::<String>(&mut con),
-        )
-        .await
+        let cluster_ping = match tokio::time::timeout(timeout, redis::cmd("PING").query_async::<String>(&mut con)).await
         {
             Ok(Ok(_)) => Ok(()),
             // Reachable and authenticated, only the PING privilege is missing (issue #9394).
             Ok(Err(error)) if is_redis_command_denied_error(&error.to_string()) => Ok(()),
             Ok(Err(error)) => Err(format!("Redis cluster ping failed: {error}")),
-            Err(_) => Err(format!("Redis cluster ping timed out ({}s)", CONNECTION_TIMEOUT_SECS)),
+            Err(_) => Err(format!("Redis cluster ping timed out ({}s)", timeout.as_secs())),
         };
         match cluster_ping {
             Ok(_) => {
@@ -1472,10 +1472,44 @@ pub async fn list_databases<C>(con: &mut C) -> Result<Vec<RedisDatabaseInfo>, St
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let configured_count =
-        redis::cmd("CONFIG").arg("GET").arg("databases").query_async(con).await.ok().and_then(parse_database_count);
+    list_databases_with_timeout(con, connection_timeout()).await
+}
 
-    let keyspace_db_infos = list_keyspace_databases(con).await.unwrap_or_default();
+/// Lists the logical databases of a standalone Redis connection.
+///
+/// Both metadata probes are bounded. A server (or a proxy in front of it) that accepts the
+/// connection and answers `PING` but never replies to `CONFIG GET databases` / `INFO keyspace`
+/// used to keep the caller waiting forever: the connection dialog's database picker stayed in
+/// its loading state with the rest of the dialog disabled (#12426). A probe that never answers
+/// now reports a timeout — the call stops there instead of issuing another command, because a
+/// multiplexed connection cannot answer later requests while a reply is still outstanding.
+pub async fn list_databases_with_timeout<C>(con: &mut C, timeout: Duration) -> Result<Vec<RedisDatabaseInfo>, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let configured_count =
+        match tokio::time::timeout(timeout, redis::cmd("CONFIG").arg("GET").arg("databases").query_async(con)).await {
+            Ok(Ok(value)) => parse_database_count(value),
+            // Renamed or denied CONFIG keeps the DBX default, as before.
+            Ok(Err(_)) => None,
+            Err(_) => {
+                return Err(format!(
+                    "Redis database list timed out ({}s): the server did not answer CONFIG GET databases",
+                    timeout.as_secs()
+                ))
+            }
+        };
+
+    let keyspace_db_infos = match tokio::time::timeout(timeout, list_keyspace_databases(con)).await {
+        Ok(Ok(infos)) => infos,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            return Err(format!(
+                "Redis database list timed out ({}s): the server did not answer INFO keyspace",
+                timeout.as_secs()
+            ))
+        }
+    };
     let database_count = configured_count.unwrap_or(DEFAULT_REDIS_DATABASES);
     let max_db = keyspace_db_infos.iter().map(|db| db.db).max().map(|db| db + 1).unwrap_or(0);
     let visible_count = database_count.max(max_db).max(1);
@@ -6470,6 +6504,281 @@ mod tests {
         assert!(error.contains("connection timed out"));
     }
 
+    #[derive(Clone, Copy)]
+    enum ClusterDelayStage {
+        Setup,
+        Slots,
+        Ping,
+    }
+
+    // Unlike the sequential Sentinel/standalone mocks, cluster discovery opens
+    // multiple sockets. Keep their tasks owned so aborting the server closes all
+    // sockets, including a deliberately delayed response after client timeout.
+    async fn cluster_timeout_mock(
+        stage: ClusterDelayStage,
+        delay: Duration,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let slots_seen = Arc::new(AtomicUsize::new(0));
+        let pings_after_slots = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        let slots_seen = slots_seen.clone();
+                        let pings_after_slots = pings_after_slots.clone();
+                        connections.spawn(async move {
+                            let (reader, mut writer) = stream.into_split();
+                            let mut reader = BufReader::new(reader);
+                            let mut first = true;
+                            let mut ping_count = 0;
+                            loop {
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                    break;
+                                }
+                                let count: usize = line.trim().strip_prefix('*').unwrap().parse().unwrap();
+                                let mut args = Vec::new();
+                                for _ in 0..count {
+                                    line.clear();
+                                    reader.read_line(&mut line).await.unwrap();
+                                    let len: usize = line.trim().strip_prefix('$').unwrap().parse().unwrap();
+                                    let mut arg = vec![0; len + 2];
+                                    reader.read_exact(&mut arg).await.unwrap();
+                                    arg.truncate(len);
+                                    args.push(arg);
+                                }
+                                let is_slots = args[0] == b"CLUSTER" && args[1] == b"SLOTS";
+                                if args[0] == b"PING" {
+                                    ping_count += 1;
+                                }
+                                let should_delay = match stage {
+                                    ClusterDelayStage::Setup => first,
+                                    ClusterDelayStage::Slots => is_slots && slots_seen.load(Ordering::SeqCst) == 0,
+                                    // With this one-node topology redis-rs sends PING
+                                    // on connect, then checks the reused socket after
+                                    // CLUSTER SLOTS. The third PING is the DBX probe.
+                                    ClusterDelayStage::Ping => args[0] == b"PING"
+                                        && ping_count > 2
+                                        && slots_seen.load(Ordering::SeqCst) > 0
+                                        && pings_after_slots.fetch_add(1, Ordering::SeqCst) == 0,
+                                };
+                                first = false;
+                                if should_delay {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                let response = if is_slots {
+                                    slots_seen.fetch_add(1, Ordering::SeqCst);
+                                    format!("*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:{}\r\n", address.port())
+                                } else if args[0] == b"PING" {
+                                    "+PONG\r\n".to_string()
+                                } else {
+                                    "+OK\r\n".to_string()
+                                };
+                                if writer.write_all(response.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    finished = connections.join_next(), if !connections.is_empty() => {
+                        finished.unwrap().unwrap();
+                    }
+                }
+            }
+        });
+        (address, server)
+    }
+
+    async fn cluster_connect_with_delay(
+        stage: ClusterDelayStage,
+        delay: Duration,
+        timeout_secs: u64,
+    ) -> Result<(), String> {
+        let (address, server) = cluster_timeout_mock(stage, delay).await;
+        let mut config = redis_test_connection_config();
+        config.host = address.ip().to_string();
+        config.port = address.port();
+        config.password = "test-only".to_string();
+        config.connect_timeout_secs = timeout_secs;
+        let result = tokio::time::timeout(Duration::from_secs(20), super::connect_cluster(&config)).await;
+        server.abort();
+        let _ = server.await;
+        result.expect("cluster regression exceeded its test deadline").map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn cluster_connect_honors_configured_handshake_timeout() {
+        cluster_connect_with_delay(ClusterDelayStage::Setup, Duration::from_millis(1500), 30).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_connect_honors_configured_initialization_timeout() {
+        cluster_connect_with_delay(ClusterDelayStage::Slots, Duration::from_millis(5500), 30).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_connect_honors_configured_ping_timeout() {
+        cluster_connect_with_delay(ClusterDelayStage::Ping, Duration::from_millis(5500), 30).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_connect_rejects_initialization_over_configured_timeout() {
+        let error =
+            cluster_connect_with_delay(ClusterDelayStage::Slots, Duration::from_millis(1500), 1).await.unwrap_err();
+        assert_eq!(error, "Redis cluster connection timed out (1s)");
+    }
+
+    #[tokio::test]
+    async fn cluster_connect_uses_effective_timeout_for_unset_and_oversized_values() {
+        for timeout in [0, u64::MAX] {
+            cluster_connect_with_delay(ClusterDelayStage::Setup, Duration::from_millis(1500), timeout).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_connect_rejects_ping_over_configured_timeout() {
+        let error =
+            cluster_connect_with_delay(ClusterDelayStage::Ping, Duration::from_millis(1500), 1).await.unwrap_err();
+        assert_eq!(error, "Redis cluster ping timed out (1s)");
+    }
+
+    #[derive(Clone, Copy)]
+    enum MetadataReply {
+        Answer,
+        Deny,
+        /// Accept the command and keep the socket open without ever answering it.
+        Silent,
+    }
+
+    /// Minimal RESP server for the standalone database-list probes: it answers the
+    /// connection handshake and `PING`, and follows the script for the two metadata
+    /// commands.
+    async fn database_list_mock(
+        config: MetadataReply,
+        info: MetadataReply,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let count: usize = line.trim().strip_prefix('*').unwrap().parse().unwrap();
+                    let mut args = Vec::new();
+                    for _ in 0..count {
+                        line.clear();
+                        reader.read_line(&mut line).await.unwrap();
+                        let len: usize = line.trim().strip_prefix('$').unwrap().parse().unwrap();
+                        let mut arg = vec![0; len + 2];
+                        reader.read_exact(&mut arg).await.unwrap();
+                        arg.truncate(len);
+                        args.push(arg);
+                    }
+                    let command = args[0].to_ascii_uppercase();
+                    match command.as_slice() {
+                        b"PING" => writer.write_all(b"+PONG\r\n").await.unwrap(),
+                        b"CONFIG" => match config {
+                            MetadataReply::Answer => {
+                                writer.write_all(b"*2\r\n$9\r\ndatabases\r\n$1\r\n4\r\n").await.unwrap();
+                            }
+                            MetadataReply::Deny => {
+                                writer
+                                    .write_all(b"-NOPERM this user has no permissions to run the 'config' command\r\n")
+                                    .await
+                                    .unwrap();
+                            }
+                            MetadataReply::Silent => {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                break;
+                            }
+                        },
+                        b"INFO" => match info {
+                            MetadataReply::Answer => {
+                                let keyspace = b"# Keyspace\r\ndb2:keys=5,expires=0,avg_ttl=0\r\n";
+                                writer.write_all(format!("${}\r\n", keyspace.len()).as_bytes()).await.unwrap();
+                                writer.write_all(keyspace).await.unwrap();
+                                writer.write_all(b"\r\n").await.unwrap();
+                            }
+                            MetadataReply::Deny => {
+                                writer
+                                    .write_all(b"-NOPERM this user has no permissions to run the 'info' command\r\n")
+                                    .await
+                                    .unwrap();
+                            }
+                            MetadataReply::Silent => {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                break;
+                            }
+                        },
+                        _ => writer.write_all(b"+OK\r\n").await.unwrap(),
+                    }
+                }
+            }
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn database_list_uses_the_configured_count_with_keyspace_counts() {
+        let (address, server) = database_list_mock(MetadataReply::Answer, MetadataReply::Answer).await;
+        let mut con = super::connect(&format!("redis://{address}"), Duration::from_secs(3)).await.unwrap();
+
+        let databases = super::list_databases_with_timeout(&mut con, Duration::from_millis(200)).await.unwrap();
+
+        assert_eq!(databases.len(), 4);
+        assert_eq!(databases[2].keys, Some(5));
+        assert_eq!(databases[0].keys, None);
+        server.abort();
+    }
+
+    // 既有的降级路径：CONFIG 被改名/拒绝时用 DBX 默认值，键数量仍来自 INFO keyspace。
+    #[tokio::test]
+    async fn database_list_degrades_when_the_config_probe_is_denied() {
+        let (address, server) = database_list_mock(MetadataReply::Deny, MetadataReply::Answer).await;
+        let mut con = super::connect(&format!("redis://{address}"), Duration::from_secs(3)).await.unwrap();
+
+        let databases = super::list_databases_with_timeout(&mut con, Duration::from_millis(200)).await.unwrap();
+
+        assert_eq!(databases.len(), 16);
+        assert_eq!(databases[2].keys, Some(5));
+        server.abort();
+    }
+
+    // #12426：服务端/代理不回答 CONFIG 时返回超时错误，而不是让选择器一直等待。
+    #[tokio::test]
+    async fn database_list_reports_a_timeout_when_the_config_probe_stays_silent() {
+        let (address, server) = database_list_mock(MetadataReply::Silent, MetadataReply::Answer).await;
+        let mut con = super::connect(&format!("redis://{address}"), Duration::from_secs(3)).await.unwrap();
+
+        let error = super::list_databases_with_timeout(&mut con, Duration::from_millis(200)).await.unwrap_err();
+
+        assert!(error.contains("CONFIG GET databases"), "{error}");
+        server.abort();
+    }
+
+    // #12426：INFO keyspace 一直不回答时返回超时错误，而不是无限等待。
+    #[tokio::test]
+    async fn database_list_reports_a_timeout_when_the_keyspace_probe_stays_silent() {
+        let (address, server) = database_list_mock(MetadataReply::Answer, MetadataReply::Silent).await;
+        let mut con = super::connect(&format!("redis://{address}"), Duration::from_secs(3)).await.unwrap();
+
+        let error = super::list_databases_with_timeout(&mut con, Duration::from_millis(200)).await.unwrap_err();
+
+        assert!(error.contains("INFO keyspace"), "{error}");
+        server.abort();
+    }
+
     struct SentinelMockReply {
         command: &'static str,
         response: Vec<u8>,
@@ -10371,6 +10680,8 @@ mod tests {
             connect_timeout_secs: dbx_types::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_types::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: dbx_types::models::connection::default_idle_timeout_secs(),
+            manual_transaction_timeout_secs: dbx_types::models::connection::default_manual_transaction_timeout_secs(),
+            idle_disconnect_secs: dbx_types::models::connection::default_idle_disconnect_secs(),
             keepalive_interval_secs: dbx_types::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
