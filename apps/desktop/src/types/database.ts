@@ -174,6 +174,16 @@ export interface ConnectionConfig {
   query_timeout_secs?: number;
   query_timeout_inherit?: boolean;
   idle_timeout_secs?: number;
+  /** Seconds a manual transaction may sit idle before DBX rolls it back. */
+  manual_transaction_timeout_secs?: number;
+  /**
+   * 空闲自动断开阈值（秒）：后端在连接池层面实现，连接在此秒数内无任何查询活动时自动关闭其
+   * 连接池；前端据此把连接标记为未连接并保留已打开的页签与结果，供用户下次操作时自动重连。
+   *
+   * 0（默认）表示不启用。与 `idle_timeout_secs` 语义不同：后者只回收连接池内的空闲物理连接，
+   * 不会关闭整个连接池；本字段关闭的是整个连接池。所有方言均适用（与方言无关）。
+   */
+  idle_disconnect_secs?: number;
   keepalive_interval_secs?: number;
   ssl?: boolean;
   ca_cert_path?: string;
@@ -274,6 +284,15 @@ export type ConnectionLivenessFailureKind = "probe_failed" | "timed_out";
  * sidebar green indefinitely.
  */
 export type ConnectionLivenessMessage = { kind: "lost"; connectionId: string; failureKind: ConnectionLivenessFailureKind } | { kind: "resync" };
+
+/**
+ * 后端「空闲自动断开」事件（`dbx:connection-idle-closed`）的载荷：某个连接的连接池因空闲
+ * 超过 `idle_disconnect_secs` 被后端自动关闭。前端收到后把该连接标记为未连接并保留页签。
+ *
+ * `closedAtMs` 是后端关闭时的墙钟时间（Unix 毫秒）：事件通道可能有缓冲，若本连接在事件
+ * 到达之前已经重新建立，说明这次断开描述的是上一个会话，前端必须忽略，否则会关掉新会话。
+ */
+export type ConnectionIdleClosedEvent = { connectionId: string; closedAtMs?: number };
 
 export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
 
@@ -1493,6 +1512,8 @@ export interface QueryResult {
   large_value_refs?: string[];
   session_id?: string | null;
   has_more?: boolean;
+  /** Frontend-only SQL page lookahead, independent of the driver's cursor has_more. */
+  page_has_more?: boolean;
   /** For Elasticsearch REST search results parsed into a _source table,
    *  this carries the raw HTTP response body so the UI can toggle between
    *  the tabular view and the original JSON. */
@@ -1629,6 +1650,7 @@ export interface QueryResultRun {
   querySourceColumns?: QueryTab["querySourceColumns"];
   queryWriteTargets?: QueryTab["queryWriteTargets"];
   resultColumnComments?: QueryTab["resultColumnComments"];
+  resultColumnTypeLabels?: QueryTab["resultColumnTypeLabels"];
   queryDisplaySourceColumns?: QueryTab["queryDisplaySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
@@ -2012,7 +2034,7 @@ export interface TableStructureEditorViewport {
   scrollLeft: number;
 }
 
-export type ObjectBrowserViewMode = "list" | "grid";
+export type ObjectBrowserViewMode = "list" | "grid" | "compact";
 
 export type ObjectBrowserFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "triggers" | "events" | "sequences" | "packages" | "types";
 
@@ -2054,6 +2076,8 @@ export interface TabUiState {
   /** Redis query results default to grid; a per-tab override selects command-line output. */
   redisResultViewMode?: RedisResultViewMode;
   resultPaneOpen?: boolean;
+  /** Tracks whether the active output view was auto-switched to "messages" by live server output during execution. */
+  autoSwitchedToMessagesDuringExecution?: boolean;
   /** Small JSON-compatible snapshots owned by special-page components. */
   page?: Record<string, TabPageUiState>;
 }
@@ -2285,6 +2309,7 @@ export interface QueryTab {
     commandId?: string;
     pluginId: string;
     contributionId: string;
+    defaultTitle?: string;
     context?: Record<string, unknown>;
   };
   pluginFilesystem?: {
@@ -2462,6 +2487,14 @@ export interface QueryTab {
    * (e.g. multi-table JOIN), so joined results still show column comments.
    */
   resultColumnComments?: Array<string | undefined>;
+  /**
+   * Display-only column type labels for multi-source (or otherwise enriched)
+   * query results, indexed by result-column ordinal. Built from resolved base
+   * column metadata so headers can show declared length/precision (e.g.
+   * `varchar(50)`) even when ResultSet `column_types` only carry bare type
+   * names. `undefined` entries fall back to ResultSet / single-table metadata.
+   */
+  resultColumnTypeLabels?: Array<string | undefined>;
   /**
    * Display-only result-column to source mapping for multi-source results,
    * indexed by result-column ordinal. Each entry carries the source identity

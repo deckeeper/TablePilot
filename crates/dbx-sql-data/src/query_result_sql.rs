@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
+use dbx_sql_core::sql_risk::{prove_read_only_for_database, ReadProof};
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
@@ -59,6 +60,10 @@ pub struct QueryPaginationExecutionPlanOptions {
 #[serde(rename_all = "camelCase")]
 pub struct QueryPaginationExecutionPlan {
     pub sql_to_execute: String,
+    /// Optional native MySQL page with one extra row. Only offered for queries
+    /// accepted by the strict read-only proof; callers must trim the probe row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_probe_sql: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_sql: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +166,7 @@ pub fn build_query_pagination_execution_plan(
     };
     let mut plan = QueryPaginationExecutionPlan {
         sql_to_execute: options.sql.clone(),
+        page_probe_sql: None,
         page_sql: None,
         page_limit: None,
         page_offset: None,
@@ -214,14 +220,20 @@ pub fn build_query_pagination_execution_plan(
     }
 
     let can_use_first_page_cursor = options.use_agent_cursor && options.pagination.offset == 0;
-    // DB2, HighGo, OceanBase Oracle, and Xugu can spend substantially more time
+    // DB2, GoldenDB, HighGo, OceanBase Oracle, and Xugu can spend substantially more time
     // executing an unbounded query before the Agent exposes its first cursor
     // page. Prefer a bounded SQL query whenever it can be rewritten safely.
     // Independent pages of an unordered query do not have a stable row order;
     // callers should add ORDER BY when that matters.
     // Kingbase keeps the cursor for unordered queries to preserve its behavior.
     let prefer_server_pagination = match options.database_type {
-        Some(DatabaseType::Db2 | DatabaseType::Highgo | DatabaseType::OceanbaseOracle | DatabaseType::Xugu) => true,
+        Some(
+            DatabaseType::Db2
+            | DatabaseType::Goldendb
+            | DatabaseType::Highgo
+            | DatabaseType::OceanbaseOracle
+            | DatabaseType::Xugu,
+        ) => true,
         Some(DatabaseType::Kingbase) => kingbase_server_pagination_is_stable(&options.query_base_sql),
         _ => false,
     };
@@ -252,6 +264,34 @@ pub fn build_query_pagination_execution_plan(
         plan.page_sql = page_sql;
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
+        // A SELECT can mutate session state or invoke a user function. Do not
+        // evaluate an extra row unless both the original and rewritten query
+        // satisfy the same strict proof used for manual-transaction reads.
+        if options.database_type == Some(DatabaseType::Mysql)
+            && !options.use_agent_cursor
+            && options.pagination.limit > 0
+            && prove_read_only_for_database(&options.sql, DatabaseType::Mysql) == ReadProof::ProvenReadOnly
+            && (options.sql == options.query_base_sql
+                || prove_read_only_for_database(&options.query_base_sql, DatabaseType::Mysql)
+                    == ReadProof::ProvenReadOnly)
+        {
+            if let Some(probe_limit) =
+                options.pagination.limit.checked_add(1).filter(|limit| *limit <= i32::MAX as usize)
+            {
+                let probe = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                    original_sql: options.sql.clone(),
+                    database_type: options.database_type,
+                    limit: probe_limit,
+                    offset: options.pagination.offset,
+                });
+                if probe.ok {
+                    plan.page_probe_sql = probe.sql.map(|sql| match execution_hint {
+                        Some(hint) => inject_execution_hint(&sql, hint),
+                        None => sql,
+                    });
+                }
+            }
+        }
         if options.pagination.offset > 0
             && pagination_strategy(options.database_type, PaginationContext::UserQuery)
                 == TablePaginationStrategy::Rownum
@@ -399,7 +439,7 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
             .map(|sql| ok(format!("{execution_hint}{sql}")))
             .unwrap_or_else(|| err("unsupported"));
     }
-    if options.database_type == Some(DatabaseType::Mysql) {
+    if matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
         return mysql_count_sql(&statement)
             .map(|sql| ok(format!("{execution_hint}{sql}")))
             .unwrap_or_else(|| err("unsupported"));
@@ -471,7 +511,7 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     }
     let normalized_base_len = base_sql.trim_end_matches(';').trim().len();
     if statement.len() != normalized_base_len {
-        if options.database_type != Some(DatabaseType::Mysql) {
+        if !matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
             return err("multi");
         }
         statement = restore_leading_execution_hint(base_sql, &statement, options.database_type);
@@ -479,11 +519,12 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
             return err("multi");
         }
     }
-    let (execution_hint, statement) = if options.database_type == Some(DatabaseType::Mysql) {
-        split_leading_execution_hint(&statement, options.database_type)
-    } else {
-        ("", statement.as_str())
-    };
+    let (execution_hint, statement) =
+        if matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
+            split_leading_execution_hint(&statement, options.database_type)
+        } else {
+            ("", statement.as_str())
+        };
     if statement.trim_start().to_ascii_uppercase().starts_with("WITH") {
         return err("with");
     }
@@ -512,14 +553,14 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
         .collect::<Vec<_>>();
     let derived_table_rejects_duplicate_labels = match options.database_type {
         Some(DatabaseType::Oracle) => has_duplicate_labels(|left, right| left == right),
-        Some(DatabaseType::Mysql) => has_duplicate_labels(str::eq_ignore_ascii_case),
+        Some(DatabaseType::Mysql | DatabaseType::Goldendb) => has_duplicate_labels(str::eq_ignore_ascii_case),
         _ => false,
     };
     if derived_table_rejects_duplicate_labels
         || (options.database_type == Some(DatabaseType::OceanbaseOracle)
             && !rownum_wrapper_projection_is_safe(statement))
     {
-        let parsed = if options.database_type == Some(DatabaseType::Mysql) {
+        let parsed = if matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
             Parser::parse_sql(&MySqlDialect {}, statement)
         } else {
             Parser::parse_sql(&GenericDialect {}, statement)
@@ -573,7 +614,7 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     // Caché/IRIS rejects derived-table column alias lists (`t(col, col)`)
     // outright (SQLCODE -25), regardless of delimited-identifier support.
     let use_derived_column_aliases = !uses_hive_subquery_syntax
-        && options.database_type != Some(DatabaseType::Mysql)
+        && !matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb))
         && options.database_type != Some(DatabaseType::ClickHouse)
         // Doris accepts the derived-table alias but not its column-name list.
         && options.database_type != Some(DatabaseType::Doris)
@@ -697,8 +738,8 @@ fn unsupported_pagination_type(database_type: Option<DatabaseType>) -> bool {
 }
 
 fn find_query_result_statement_at_cursor(sql: &str, cursor_pos: usize, database_type: Option<DatabaseType>) -> String {
-    if database_type == Some(DatabaseType::Mysql) {
-        find_statement_at_cursor_for_database(sql, cursor_pos, DatabaseType::Mysql)
+    if matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
+        find_statement_at_cursor_for_database(sql, cursor_pos, database_type.unwrap())
     } else {
         find_statement_at_cursor(sql, cursor_pos)
     }
@@ -2119,6 +2160,11 @@ fn rownum_wrapper_projection_is_safe(statement: &str) -> bool {
     let [Statement::Query(query)] = statements.as_slice() else {
         return false;
     };
+    // Oracle-compatible servers reject `seq.NEXTVAL` / `seq.CURRVAL` inside a
+    // derived table with ORA-02287, so the ROWNUM wrapper cannot be used.
+    if references_sequence_pseudocolumn(&statements[0]) {
+        return false;
+    }
     fn safe_projection(body: &SetExpr) -> bool {
         match body {
             SetExpr::Query(query) => safe_projection(&query.body),
@@ -2160,6 +2206,23 @@ fn rownum_wrapper_projection_is_safe(statement: &str) -> bool {
         }
     }
     safe_projection(&query.body)
+}
+
+fn references_sequence_pseudocolumn(statement: &Statement) -> bool {
+    visit_expressions(statement, |expr| match expr {
+        Expr::CompoundIdentifier(parts)
+            if parts.len() > 1
+                && parts.last().is_some_and(|name| match name.quote_style {
+                    // A quoted name is a pseudocolumn only when written in its stored uppercase form.
+                    Some(_) => matches!(name.value.as_str(), "NEXTVAL" | "CURRVAL"),
+                    None => name.value.eq_ignore_ascii_case("NEXTVAL") || name.value.eq_ignore_ascii_case("CURRVAL"),
+                }) =>
+        {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 fn add_rownum_limit(statement: &str, limit: usize, offset: usize) -> String {
@@ -2204,8 +2267,8 @@ fn add_standard_limit(
         // MySQL rejects a derived table whose columns share a name (error 1060),
         // which `SELECT t.id, t.*` produces. Page through the user's own LIMIT
         // instead of wrapping it.
-        let rewrite_limit_in_place =
-            database_type == Some(DatabaseType::Mysql) && !mysql_projection_has_unique_names(statement);
+        let rewrite_limit_in_place = matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb))
+            && !mysql_projection_has_unique_names(statement);
         if !order_sql.is_empty() {
             if rewrite_limit_in_place {
                 return rewrite_mysql_top_level_limit(statement, limit, offset, &order_sql);
@@ -2891,6 +2954,48 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // #12271: OceanBase Oracle, like Oracle, raises ORA-02287 when a sequence
+    // pseudocolumn sits inside the ROWNUM pagination derived table.
+    #[test]
+    fn oceanbase_sequence_pseudocolumns_keep_the_original_statement() {
+        for sql in [
+            "SELECT to_char(sysdate,'yyyymmdd')||seq_yaz001.nextval FROM DUAL",
+            "SELECT seq_yaz001.NEXTVAL AS id FROM DUAL",
+            "SELECT app.seq_yaz001.currval AS id FROM DUAL",
+            "SELECT \"SEQ_YAZ001\".\"NEXTVAL\" AS id FROM DUAL",
+            "SELECT NVL(seq_yaz001.nextval, 0) AS id FROM DUAL",
+        ] {
+            for limit in [1, 100] {
+                let plan = oceanbase_plan(sql, limit, 0, true);
+                assert_eq!(plan.sql_to_execute, sql);
+                assert!(plan.use_agent_result_session, "{sql}");
+                assert!(plan.page_sql.is_none());
+                assert_eq!(plan.page_limit, Some(limit));
+
+                let plan = oceanbase_plan(sql, limit, 0, false);
+                assert_eq!(plan.sql_to_execute, sql);
+                assert!(plan.page_sql.is_none());
+                assert!(plan.pagination_error.is_none());
+            }
+            let paginated = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: sql.into(),
+                database_type: Some(DatabaseType::OceanbaseOracle),
+                limit: 100,
+                offset: 100,
+            });
+            assert!(!paginated.ok, "{sql}");
+        }
+    }
+
+    #[test]
+    fn oceanbase_columns_named_like_pseudocolumns_keep_bounded_sql() {
+        for sql in ["SELECT t.\"nextval\" AS v FROM t", "SELECT nextval AS v FROM t"] {
+            let plan = oceanbase_plan(sql, 100, 0, true);
+            assert!(!plan.use_agent_result_session, "{sql}");
+            assert!(plan.sql_to_execute.contains("ROWNUM <= 100"), "{sql}");
         }
     }
 
@@ -5914,6 +6019,74 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn goldendb_prefers_server_pagination_over_agent_cursor() {
+        let first_page = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+            execution_hint: None,
+        });
+
+        assert_eq!(first_page.sql_to_execute, "SELECT * FROM events LIMIT 100;");
+        assert_eq!(first_page.page_sql, Some(first_page.sql_to_execute.clone()));
+        assert_eq!(first_page.page_limit, Some(100));
+        assert_eq!(first_page.page_offset, Some(0));
+        assert!(!first_page.use_agent_result_session);
+
+        let second_page = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+            pagination: QueryPagination { limit: 100, offset: 100, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+            execution_hint: None,
+        });
+
+        assert_eq!(second_page.sql_to_execute, "SELECT * FROM events LIMIT 100 OFFSET 100;");
+        assert_eq!(second_page.page_sql, Some(second_page.sql_to_execute.clone()));
+        assert_eq!(second_page.page_limit, Some(100));
+        assert_eq!(second_page.page_offset, Some(100));
+        assert!(!second_page.use_agent_result_session);
+    }
+
+    #[test]
+    fn goldendb_keeps_agent_fallback_for_unrewritable_query() {
+        let sql = "SELECT * FROM events; SELECT 1";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+            execution_hint: None,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn goldendb_count_query_handles_duplicate_column_names() {
+        let sql = "SELECT t.id, t.* FROM events t";
+        let count = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+        });
+
+        assert!(count.ok);
+        assert_eq!(
+            count.sql.as_deref(),
+            Some("SELECT COUNT(*) AS dbx_total_rows FROM (SELECT 1 AS dbx_count_value FROM events t) `dbx_count`;")
+        );
+    }
+
+    #[test]
     fn xugu_top_clause_keeps_first_page_agent_cursor() {
         for sql in [
             "SELECT TOP 10 * FROM events",
@@ -7021,6 +7194,55 @@ WHERE u.id = picked.id;
 
         assert!(!result.ok);
         assert_eq!(result.reason.as_deref(), Some("unsupported"));
+    }
+
+    #[test]
+    fn goldendb_sort_with_duplicate_labels_does_not_wrap_the_query() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "/*+ MAX_EXECUTION_TIME(1000) */ SELECT t.id, t.* FROM dbx_eval_t t ORDER BY t.id;"
+                .to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+            result_columns: vec!["id".to_string(), "id".to_string(), "name".to_string(), "qty".to_string()],
+            column_index: 2,
+            column: "name".to_string(),
+            direction: QuerySortDirection::Desc,
+            tie_breaker_column_indexes: Vec::new(),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "/*+ MAX_EXECUTION_TIME(1000) */ SELECT t.id, t.* FROM dbx_eval_t t ORDER BY 3 DESC;"
+        );
+    }
+
+    #[test]
+    fn goldendb_sort_treats_labels_differing_only_in_case_as_duplicates() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT a.ID, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+            result_columns: vec!["ID".to_string(), "id".to_string()],
+            column_index: 1,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Asc,
+            tie_breaker_column_indexes: Vec::new(),
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT a.ID, b.id FROM a JOIN b ON b.a_id = a.id ORDER BY 2 ASC;");
+    }
+
+    #[test]
+    fn goldendb_sort_without_duplicate_labels_wraps_in_derived_table_without_column_aliases() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT id, name FROM users".to_string(),
+            database_type: Some(DatabaseType::Goldendb),
+            result_columns: vec!["id".to_string(), "name".to_string()],
+            column_index: 1,
+            column: "name".to_string(),
+            direction: QuerySortDirection::Asc,
+            tie_breaker_column_indexes: Vec::new(),
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id, name FROM users) t ORDER BY `name` ASC;");
     }
 
     #[test]
