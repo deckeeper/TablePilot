@@ -212,10 +212,10 @@ async function flushAsyncUpdates() {
   }
 }
 
-async function mountSourceDialog(connectionId = "connection-1") {
+async function mountSourceDialog(connectionId = "connection-1", prefillTables?: string[]) {
   const container = document.createElement("div");
   document.body.append(container);
-  const app = createApp(defineComponent({ setup: () => () => h(TableImportDialog, { open: true, prefillConnectionId: connectionId, prefillDatabase: "main" }) }));
+  const app = createApp(defineComponent({ setup: () => () => h(TableImportDialog, { open: true, prefillConnectionId: connectionId, prefillDatabase: "main", prefillTables }) }));
   mountedApps.push(app);
   app.use(i18n);
   app.mount(container);
@@ -276,6 +276,10 @@ async function startImport() {
 beforeEach(() => {
   i18n.global.locale.value = "en";
   mocks.listTables.mockReset().mockResolvedValue([]);
+  mocks.getColumns.mockReset().mockResolvedValue([
+    { name: "id", data_type: "INTEGER", nullable: false },
+    { name: "name", data_type: "TEXT", nullable: true },
+  ]);
   mocks.previewTableImportFile.mockReset().mockImplementation((_source, options) => Promise.resolve(workbookPreview(options.parseOptions.sheetName || "First")));
   mocks.importTableFile.mockReset().mockImplementation(async (request, onProgress) => {
     const rowsImported = request.preparedSource!.totalRows;
@@ -685,4 +689,191 @@ describe("TableImportDialog batch selection", () => {
     await startImport();
     expect(mocks.importTableFile.mock.calls.at(-1)?.[0].parseOptions.emptyStringAsNull).toBe(true);
   });
+});
+
+async function mountExistingBatch(names = ["customers", "orders"], files = names.map((name) => new File(["id,name"], `${name}.csv`))) {
+  mocks.previewTableImportFile.mockImplementation((source) => Promise.resolve({ ...delimitedPreview(), fileName: source.name, filePath: `/tmp/${source.name}`, sourceRef: source.name }));
+  await mountSourceDialog("connection-1", names);
+  await selectFiles(files);
+}
+
+async function changeSelect(selector: string, value: string) {
+  const select = document.body.querySelector<HTMLSelectElement>(selector)!;
+  expect(select, selector).toBeTruthy();
+  select.value = value;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  await flushAsyncUpdates();
+}
+
+describe("TableImportDialog import into selected existing tables", () => {
+  it("matches CSV filenames, reviews every destination and imports existing tables without data types", async () => {
+    await mountExistingBatch();
+    expect(document.body.querySelector<HTMLInputElement>('input[type="file"]')!.multiple).toBe(true);
+    expect(taskCheckbox("customers").checked).toBe(true);
+    expect(taskCheckbox("orders").checked).toBe(true);
+    await click("Next");
+    await click("Next");
+    expect(document.body.querySelector('[data-testid="batch-import-review"]')!.textContent).toContain("customers.csv");
+    expect(document.body.querySelector('[data-testid="batch-import-review"]')!.textContent).toContain("orders.csv");
+    await click("Start Import");
+    expect(mocks.importTableFile.mock.calls.map(([request]) => request.table)).toEqual(["customers", "orders"]);
+    for (const [request] of mocks.importTableFile.mock.calls) {
+      expect(request).toMatchObject({ createTable: false, mode: "append", connectionId: "connection-1", database: "main" });
+      expect(request.mappings).toEqual([
+        { sourceColumn: "id", targetColumn: "id" },
+        { sourceColumn: "name", targetColumn: "name" },
+      ]);
+    }
+  });
+
+  it("keeps each table's field mapping when switching tasks and when reloading previews", async () => {
+    await mountExistingBatch();
+    await click("Next");
+    await changeSelect('select[aria-label="Map column name"]', "__skip__");
+    await click("orders");
+    expect(document.body.querySelector<HTMLSelectElement>('select[aria-label="Map column name"]')!.value).toBe("name");
+    await click("customers");
+    expect(document.body.querySelector<HTMLSelectElement>('select[aria-label="Map column name"]')!.value).toBe("__skip__");
+    await click("Back");
+    await click("Reload Preview");
+    await startImport();
+    expect(mocks.importTableFile.mock.calls[0]![0].mappings).toEqual([{ sourceColumn: "id", targetColumn: "id" }]);
+    expect(mocks.importTableFile.mock.calls[1]![0].mappings).toHaveLength(2);
+  });
+
+  it("requires unmatched files to be assigned to one of the selected tables", async () => {
+    await mountExistingBatch(["customers", "orders"], [new File(["data"], "unknown.csv"), new File(["data"], "orders.csv")]);
+    expect(button("Next").disabled).toBe(true);
+    const target = document.body.querySelector<HTMLSelectElement>('[data-testid="target-table-select"]')!;
+    expect([...target.options].map((option) => option.value)).toEqual(["", "customers", "orders"]);
+    await changeSelect('[data-testid="target-table-select"]', "customers");
+    await startImport();
+    expect(mocks.importTableFile.mock.calls.map(([request]) => request.table)).toEqual(["customers", "orders"]);
+  });
+
+  it("blocks duplicate destination assignments and allows an unmatched item to be excluded", async () => {
+    await mountExistingBatch();
+    await changeSelect('[data-testid="target-table-select"]', "orders");
+    expect(button("Next").disabled).toBe(true);
+    await changeSelect('[data-testid="target-table-select"]', "");
+    await selectTask("customers.csv", false);
+    await startImport();
+    expect(mocks.importTableFile.mock.calls.map(([request]) => request.table)).toEqual(["orders"]);
+  });
+
+  it("matches worksheet names in a workbook and keeps worksheet identity at execution", async () => {
+    await mountSourceDialog("connection-1", ["First", "Second", "Third"]);
+    await selectFiles([new File(["workbook"], "rows.xlsx")]);
+    await selectTask("Second", false);
+    await startImport();
+    expect(mocks.importTableFile.mock.calls.map(([request]) => [request.table, request.parseOptions?.sheetName, request.createTable])).toEqual([
+      ["First", null, false],
+      ["Third", "Third", false],
+    ]);
+  });
+
+  it("supports a single file for one selected table and leaves the other selected tables untouched", async () => {
+    await mountExistingBatch(["customers", "orders"], [new File(["data"], "orders.csv")]);
+    await startImport();
+    expect(mocks.importTableFile.mock.calls.map(([request]) => request.table)).toEqual(["orders"]);
+  });
+
+  it("lets users order parent tables first and applies truncate only to selected targets", async () => {
+    await mountExistingBatch(["orders", "customers", "unused"]);
+    await selectTask("unused", false);
+    await click("Next");
+    await click("Next");
+    document.body.querySelector<HTMLButtonElement>('button[aria-label="Move customers up"]')!.click();
+    document.body.querySelector<HTMLElement>('[data-select-option="truncate"]')!.click();
+    await flushAsyncUpdates();
+    await click("Start Import");
+    expect(mocks.importTableFile.mock.calls.map(([request]) => [request.table, request.mode])).toEqual([
+      ["customers", "truncate"],
+      ["orders", "truncate"],
+    ]);
+  });
+
+  it("stops after an error and does not attempt remaining tables", async () => {
+    await mountExistingBatch();
+    mocks.importTableFile.mockRejectedValueOnce(new Error("Foreign key constraint"));
+    await startImport();
+    expect(mocks.importTableFile).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Foreign key constraint");
+    expect(document.body.textContent).not.toContain("Import complete");
+  });
+
+  it("does not start the next table when cancellation races with a successful current import", async () => {
+    await mountExistingBatch();
+    let finish!: (summary: TableImportSummary) => void;
+    mocks.importTableFile.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await startImport();
+    expect(mocks.importTableFile).toHaveBeenCalledTimes(1);
+    const cancel = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent?.trim() === "Cancel" && !item.disabled)!;
+    expect(cancel).toBeTruthy();
+    cancel.click();
+    await flushAsyncUpdates();
+    finish({ importId: mocks.importTableFile.mock.calls[0]![0].importId, rowsImported: 2, totalRows: 2, elapsedMs: 1 });
+    await flushAsyncUpdates();
+    expect(mocks.importTableFile).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Import cancelled");
+  });
+
+  it("does not start a batch while any selected destination's metadata is unavailable", async () => {
+    mocks.getColumns.mockImplementation((_connection, _database, _schema, table) => (table === "orders" ? Promise.reject(new Error("metadata unavailable")) : Promise.resolve([{ name: "id", data_type: "INTEGER", nullable: false }])));
+    await mountExistingBatch();
+    await click("Next");
+    expect(button("Next").disabled).toBe(true);
+    await selectTask("orders", false);
+    expect(button("Next").disabled).toBe(false);
+    await click("Next");
+    await click("Start Import");
+    expect(mocks.importTableFile.mock.calls.map(([request]) => request.table)).toEqual(["customers"]);
+  });
+});
+
+it("keeps different target schemas and custom mappings isolated across tasks", async () => {
+  mocks.getColumns.mockImplementation((_connection, _database, _schema, table) =>
+    Promise.resolve(
+      table === "orders"
+        ? [
+            { name: "order_id", data_type: "INTEGER", nullable: false },
+            { name: "description", data_type: "TEXT", nullable: true },
+          ]
+        : [
+            { name: "id", data_type: "INTEGER", nullable: false },
+            { name: "name", data_type: "TEXT", nullable: true },
+          ],
+    ),
+  );
+  await mountExistingBatch();
+  await click("Next");
+  await click("orders");
+  await changeSelect('select[aria-label="Map column id"]', "order_id");
+  await changeSelect('select[aria-label="Map column name"]', "description");
+  await click("customers");
+  expect(document.body.querySelector<HTMLSelectElement>('select[aria-label="Map column id"]')!.value).toBe("id");
+  await click("orders");
+  expect(document.body.querySelector<HTMLSelectElement>('select[aria-label="Map column id"]')!.value).toBe("order_id");
+  await click("Next");
+  await click("Start Import");
+  expect(mocks.importTableFile.mock.calls[1]![0].mappings).toEqual([
+    { sourceColumn: "id", targetColumn: "order_id" },
+    { sourceColumn: "name", targetColumn: "description" },
+  ]);
+});
+
+it("blocks execution after a failed batch re-preview until it succeeds", async () => {
+  await mountExistingBatch();
+  mocks.previewTableImportFile.mockRejectedValueOnce(new Error("Unreadable file"));
+  await click("Reload Preview");
+  expect(button("Next").disabled).toBe(true);
+  expect(mocks.importTableFile).not.toHaveBeenCalled();
+  await click("Load Preview");
+  await startImport();
+  expect(mocks.importTableFile).toHaveBeenCalledTimes(2);
 });

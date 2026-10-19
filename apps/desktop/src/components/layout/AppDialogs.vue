@@ -299,6 +299,7 @@ watch(
     :prefill-database="dialogs.tableImportPrefillDatabase.value"
     :prefill-schema="dialogs.tableImportPrefillSchema.value"
     :prefill-table="dialogs.tableImportPrefillTable.value"
+    :prefill-tables="dialogs.tableImportPrefillTables.value"
   />
   <MongoImportDialog v-model:open="dialogs.showMongoImportDialog.value" :connection-id="dialogs.mongoImportPrefillConnectionId.value" :database="dialogs.mongoImportPrefillDatabase.value" :collection="dialogs.mongoImportPrefillCollection.value" />
   <MongoDatabaseDumpDialog

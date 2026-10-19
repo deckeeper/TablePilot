@@ -143,6 +143,7 @@ Source commit: `{args.target}`.
         text += '\nWindows source: `8b0a975c5d5bc261bf170012f2d59db95bd7d031`; Linux source: `adfb658b14e90cbeb275216dd8c0c520c54910e8` (Linux packaging dependency fix). These are the existing 0.3.0 installers; GUI link removal arrives in 0.3.1.\n'
     else:
         changes = {
+            '0.4.2': 'Import multiple files or Excel worksheets into selected existing tables in one batch. Review separate field mappings and destinations, reorder imports, and run once. Multi-table export remains available through sidebar selection. See README.md for instructions and VALIDATION.md for testing scope.',
             '0.3.1': 'Remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.',
             '0.3.2': 'Integrate reviewed database and interface improvements, excluding AI/MCP changes.',
             '0.4.1': 'Security maintenance: remove vulnerable JavaScript development dependency chains while preserving existing UI styles. Update from 0.4.0 using the installer for your platform. See FORK_CHANGES.md for scope and validation limitations.',

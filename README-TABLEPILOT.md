@@ -8,7 +8,7 @@ A desktop database workbench for Windows and Linux. Connect to databases, write 
 
 - Database connections with Driver Manager and JDBC support.
 - SQL editor, query results, and table structure tools.
-- CSV and Excel import/export with field mapping.
+- CSV and Excel import/export with field mapping and multi-table selection.
 - SSH tunnelling and jump-host connection options.
 - Light and dark themes.
 - Checks for official TablePilot releases at startup and every hour.
@@ -23,12 +23,25 @@ Run the newer installer to update an existing installation. The app's update che
 
 ## Recent changes
 
+- **0.4.2:** Import several files or Excel worksheets into selected existing tables in one batch, with individual field mappings, destination review, and adjustable import order.
+
 - **0.4.1:** Remove three vulnerable JavaScript development dependency chains while preserving the UI styles. The root JavaScript audit reports zero findings; other dependency ecosystems are not covered by that result.
 - **0.4.0:** Official releases, refreshed About/settings branding, and update checks against this repository.
 - **0.3.3:** Remove Plugin Center navigation and marketplace updates, and improve build caching.
 - **0.3.2:** Improve grid filtering, pagination, database object editing, saved queries, and Redis previews.
 
 See [release notes](https://github.com/deckeeper/TablePilot/releases) for each version and [validation notes](VALIDATION.md) for testing scope.
+
+## Import and export several tables
+
+In the sidebar, Ctrl-click individual tables or Shift-click a range, then right-click a selected table.
+
+- **Export Data (N):** choose CSV, JSON, SQL INSERT or XLSX, then choose one output folder. Each selected table gets its own file. SQL database export also supports selecting multiple tables.
+- **Import into N selected tables (0.4.2+):** select several files, or one Excel workbook with several worksheets. The wizard matches filenames or worksheet names to the selected tables in the active database/schema. Unmatched items need an explicit destination.
+
+Click each import item to review its destination and column mapping. Uncheck items to skip them. On Review, check the complete file-to-table list and use Up/Down to put parent tables before dependent child tables. Click **Start Import** once for the selected batch. Files without a matching table are never assigned by position.
+
+Append is the default; choosing Truncate applies to every selected destination. Parsing options apply across the batch. Duplicate targets are blocked, and metadata must load before a table can be imported. A failure or cancellation stops remaining items; rows already written are kept. This is not a transaction across all tables. Update-existing-row conflict handling remains available for single-table imports.
 
 ## Build an installer
 

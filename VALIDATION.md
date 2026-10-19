@@ -69,3 +69,11 @@ Native installer compilation and installation remain pending GitHub Actions/manu
 - Release checks use a dedicated native client with a fixed public TablePilot GitHub API endpoint and a 30-second timeout. It filters drafts/prereleases, nonstandard tags and incomplete installer releases, then compares semantic versions. No token is used; executable download/install commands remain blocked.
 - Native unit coverage was added for release filtering but cannot run locally because the Rust toolchain is unavailable. Windows/Linux compilation remains a CI gate. Live update checks and installer upgrades require manual testing of the built application.
 - Required LICENSE/NOTICE resources are included in the installer configuration. The application identifier and installer mode are preserved for upgrades.
+
+## 0.4.2 batch import into selected tables — 19 October 2026
+
+- Full Vue/TypeScript type check and production frontend build passed on the final implementation. Vite retains existing chunk-size/dynamic-import warnings.
+- **113 tests passed across 7 focused files.** Existing single-table import, create-table batches, multi-table export, theme classes and sidebar/dialog routing remain covered. New tests exercise CSV filename and Excel worksheet matching, explicit destinations for unmatched files, duplicate-target rejection, separate mappings for different destination columns, excluded items, import order, truncate selection, metadata failures, preview failures, and cancellation/error queue boundaries.
+- Four release-packaging tests passed. Frontend/native/installer version declarations are synchronized at 0.4.2.
+- Import component tests use mocked database/file APIs. No live database writes or end-to-end CSV/Excel round trips were performed. Native installer builds run in Windows/Linux GitHub Actions; publication requires both to succeed. Installation and live-database testing remain pending for this version.
+- A batch is sequential, not a cross-table transaction. Completed writes remain after failure/cancellation. Targets are limited to the active database/schema, duplicate target assignments are blocked, parsing options are shared, and update-existing-row conflict handling remains single-table only. Users can order parent tables before child tables on the Review page.

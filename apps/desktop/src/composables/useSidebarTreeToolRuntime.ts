@@ -150,11 +150,13 @@ export function useSidebarTreeToolRuntime(options: SidebarTreeToolRuntimeOptions
   function openTableImport() {
     const node = activeNode.value;
     if (!node.connectionId || !node.database) return;
+    const tables = node.type === "table" ? selectedSameSchemaStructureTargets().filter((target) => target.type === "table") : [];
     connectionStore.tableImportSource = {
       connectionId: node.connectionId,
       database: node.database,
       schema: node.schema,
-      tableName: node.type === "table" ? node.label : undefined,
+      tableName: tables.length > 1 ? undefined : node.type === "table" ? node.label : undefined,
+      ...(tables.length > 1 ? { tableNames: tables.map((table) => table.label) } : {}),
     };
   }
 

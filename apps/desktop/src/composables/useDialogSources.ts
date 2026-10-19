@@ -88,6 +88,7 @@ const tableImportPrefillConnectionId = ref("");
 const tableImportPrefillDatabase = ref("");
 const tableImportPrefillSchema = ref("");
 const tableImportPrefillTable = ref("");
+const tableImportPrefillTables = ref<string[]>([]);
 const mongoImportPrefillConnectionId = ref("");
 const mongoImportPrefillDatabase = ref("");
 const mongoImportPrefillCollection = ref("");
@@ -302,6 +303,7 @@ export function useDialogSources() {
           tableImportPrefillDatabase.value = v.database;
           tableImportPrefillSchema.value = v.schema ?? "";
           tableImportPrefillTable.value = v.tableName ?? "";
+          tableImportPrefillTables.value = v.tableNames ?? [];
           showTableImportDialog.value = true;
           connectionStore.tableImportSource = null;
         }
@@ -681,6 +683,7 @@ export function useDialogSources() {
     tableImportPrefillDatabase,
     tableImportPrefillSchema,
     tableImportPrefillTable,
+    tableImportPrefillTables,
     mongoImportPrefillConnectionId,
     mongoImportPrefillDatabase,
     mongoImportPrefillCollection,

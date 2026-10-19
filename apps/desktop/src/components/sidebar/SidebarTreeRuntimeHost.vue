@@ -238,7 +238,7 @@ import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
 import { runBatchTableDrop } from "@/lib/table/batchTableDrop";
 import { buildSidebarDdlTemplateSql, formatSidebarDdlTemplateForDisplay } from "@/lib/sidebar/sidebarDdlTemplate";
 import { resolveSidebarDdlTargets } from "@/lib/sidebar/sidebarDdlTargets";
-import { sidebarTableDataExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
+import { sidebarSameSchemaStructureTargets, sidebarTableDataExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
 import { createColumnDrafts } from "@/lib/table/tableStructureEditorState";
 import type { BuildSingleColumnAlterSqlOptions } from "@/lib/table/tableStructureEditorSql";
 import { formatSidebarTableCopyText, type FormatSidebarTableNamesOptions } from "@/lib/sidebar/sidebarTableNameCopy";
@@ -6406,6 +6406,11 @@ const shortcutRefresh = "F5";
 
 const shortcutDelete = "Delete";
 
+function tableImportMenuLabel(): string {
+  const count = sidebarSameSchemaStructureTargets(activeNode.value, connectionStore.treeNodes, acceptedSelectionIds ?? connectionStore.selectedTreeNodeIds).filter((node) => node.type === "table").length;
+  return count > 1 ? t("tableImport.batchAction", { count }) : t("contextMenu.importData");
+}
+
 function selectedDataExportTargetCount(): number {
   return sidebarTableDataExportTargets(activeNode.value, connectionStore.treeNodes, acceptedSelectionIds ?? connectionStore.selectedTreeNodeIds).length;
 }
@@ -6875,7 +6880,7 @@ function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.push({ sidebarActionId: "contextMenu.createTable", label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
     if (canOpenTableImport.value) {
-      items.push({ sidebarActionId: "contextMenu.importData", label: t("contextMenu.importData"), action: openTableImport, icon: Download });
+      items.push({ sidebarActionId: "contextMenu.importData", label: tableImportMenuLabel(), action: openTableImport, icon: Download });
     }
     if (canCreateSchema.value) {
       items.push({ sidebarActionId: "contextMenu.createSchema", label: t("contextMenu.createSchema"), action: openCreateSchemaDialog, icon: Plus });
@@ -7356,7 +7361,7 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.push({ sidebarActionId: "diagram.open", label: t("diagram.open"), action: openDiagram, icon: Network });
     }
     if (canOpenTableImport.value) {
-      items.push({ sidebarActionId: "contextMenu.importData", label: t("contextMenu.importData"), action: openTableImport, icon: Download });
+      items.push({ sidebarActionId: "contextMenu.importData", label: tableImportMenuLabel(), action: openTableImport, icon: Download });
     }
     if (isTableNotView.value) {
       items.push({ sidebarActionId: "dataCompare.title", label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
@@ -7645,7 +7650,7 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
       if (canOpenTableImport.value) {
-        items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: Upload });
+        items.push({ label: tableImportMenuLabel(), action: openTableImport, icon: Upload });
       }
       if (canPasteTreeClipboardToCurrentNode() || canTransferTreeClipboardToCurrentNode()) {
         items.push({ label: t("contextMenu.pasteTable"), action: openPasteTableDialog, icon: Clipboard });

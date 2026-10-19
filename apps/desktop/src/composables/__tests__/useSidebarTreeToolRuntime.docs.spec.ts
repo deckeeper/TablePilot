@@ -8,6 +8,7 @@ function setup(node: Partial<TreeNode>, options: { treeNodes?: TreeNode[]; selec
   const activeNode = shallowRef({ id: "n-1", label: "node", children: [], ...node } as TreeNode);
   const connectionStore = {
     docsSource: null as unknown,
+    tableImportSource: null as unknown,
     dataDictionarySource: null as unknown,
     diagramSource: null as unknown,
     databaseExportSource: null as unknown,
@@ -222,5 +223,24 @@ describe("useSidebarTreeToolRuntime openSchemaDiffForRoutine", () => {
       selectedRoutines: ["add(integer)"],
       preferredResultTab: "routines",
     });
+  });
+});
+
+describe("useSidebarTreeToolRuntime selected table import", () => {
+  const users: TreeNode = { id: "users", label: "users", type: "table", connectionId: "c1", database: "db", schema: "public" };
+  const orders: TreeNode = { ...users, id: "orders", label: "orders" };
+  const otherSchema: TreeNode = { ...users, id: "archive", schema: "archive" };
+  const view: TreeNode = { ...users, id: "view", label: "active_users", type: "view" };
+
+  it("uses the accepted selection and only tables in the active schema", () => {
+    const { connectionStore, runtime } = setup(users, { treeNodes: [users, orders, otherSchema, view], selectedTreeNodeIds: [users.id], acceptedSelectionIds: [users.id, orders.id, otherSchema.id, view.id] });
+    runtime.openTableImport();
+    expect(connectionStore.tableImportSource).toEqual({ connectionId: "c1", database: "db", schema: "public", tableNames: ["users", "orders"] });
+  });
+
+  it("retains single-table import when right-clicking outside the selection", () => {
+    const { connectionStore, runtime } = setup(users, { treeNodes: [users, orders], selectedTreeNodeIds: [orders.id] });
+    runtime.openTableImport();
+    expect(connectionStore.tableImportSource).toEqual({ connectionId: "c1", database: "db", schema: "public", tableName: "users" });
   });
 });

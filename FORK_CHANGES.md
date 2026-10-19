@@ -1,7 +1,16 @@
 # TablePilot fork changes
 
 Based on reviewed non-AI changes through DBX v0.6.45, commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`.
-Modified on 14–16 October 2026 for the independent TablePilot desktop prototype.
+Modified on 14–19 October 2026 for the independent TablePilot desktop prototype.
+
+## TablePilot 0.4.2 batch table import (19 October 2026)
+
+- Pass accepted sidebar table selections through the dialog source into the import wizard; restrict a selected-table batch to tables in the active database/schema.
+- Extend the existing multi-file/worksheet queue to existing tables. Match names without guessing by position, keep metadata and mappings per task, block unmatched/duplicate destinations, and show every selected source/destination at review.
+- Let users reorder selected imports for foreign-key dependencies. Use append by default; optional truncate applies only to selected tasks. Stop remaining tasks on cancellation or error and retain already-written rows. Keep single-table update-existing-row conflict handling.
+- Reparse all batch previews when shared parsing options change, preserve custom mappings, and block execution after preview or metadata failures.
+- Document the existing multi-table CSV/JSON/SQL/XLSX export workflow and add a counted multi-table import menu action.
+- Increment frontend/native/installer versions together. Native implementation and database-driver dependencies are unchanged.
 
 ## Repository presentation (16 October 2026)
 
