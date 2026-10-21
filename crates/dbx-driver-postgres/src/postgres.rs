@@ -2997,7 +2997,9 @@ where
                         // LISTEN/NOTIFY messages are not surfaced anywhere.
                         Some(Ok(_)) => {}
                         Some(Err(err)) => {
-                            log::warn!("[postgres] connection driver error: {err}");
+                            // `tokio_postgres::Error`'s `Display` omits the underlying
+                            // I/O error, which is the only clue to why the socket died.
+                            log::warn!("[postgres] connection driver error: {}", error_with_sources_to_string(&err));
                             break;
                         }
                         None => break,
@@ -5113,15 +5115,14 @@ fn postgres_columns_for_relations_query_tiers() -> [&'static str; 3] {
 // 4880): same column list and detection logic (identity/serial inference,
 // numeric precision/scale, enum values), batched by oid instead of a single
 // (schema, table) pair. Kept as a separate literal rather than sharing a
-// fragment — `pg_class` needs the `c` alias here for the oid filter, which
-// pushes `information_schema.columns` to `ic` instead of the single-relation
-// version's `c`, and every column's position in the SELECT list is relied on
+// fragment — `pg_class` needs the `c` alias here for the oid filter,
+// and every column's position in the SELECT list is relied on
 // positionally by `column_info_from_row_offset`. A change to one almost
 // certainly needs the same change in the other.
 fn postgres_columns_for_relations_sql() -> &'static str {
     "SELECT c.oid::bigint AS relid, a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(ic.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              CASE WHEN a.attgenerated <> '' THEN NULL ELSE pg_get_expr(ad.adbin, ad.adrelid) END AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -5157,7 +5158,6 @@ fn postgres_columns_for_relations_sql() -> &'static str {
                               FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]') END AS enum_values \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
@@ -5183,8 +5183,6 @@ fn postgres_columns_for_relations_sql() -> &'static str {
                LIMIT 1 \
              ) dep ON TRUE \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
-             LEFT JOIN information_schema.columns ic \
-               ON ic.table_schema = n.nspname AND ic.table_name = c.relname AND ic.column_name = a.attname \
              WHERE c.oid = ANY($1::bigint[]) \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY c.oid, a.attnum"
@@ -5195,7 +5193,7 @@ fn postgres_columns_for_relations_sql() -> &'static str {
 fn postgres_columns_for_relations_compat_sql() -> &'static str {
     "SELECT c.oid::bigint AS relid, a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(ic.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -5220,7 +5218,6 @@ fn postgres_columns_for_relations_compat_sql() -> &'static str {
              NULL::text AS enum_values \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN pg_catalog.pg_class serial_seq ON serial_seq.oid = ( \
@@ -5243,8 +5240,6 @@ fn postgres_columns_for_relations_compat_sql() -> &'static str {
                ORDER BY sequence_dep.objid \
                LIMIT 1 \
              ) AND serial_seq.relkind = 'S' \
-             LEFT JOIN information_schema.columns ic \
-               ON ic.table_schema = n.nspname AND ic.table_name = c.relname AND ic.column_name = a.attname \
              WHERE c.oid = ANY($1::bigint[]) \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY c.oid, a.attnum"
@@ -5414,6 +5409,7 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
              LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
              WHERE t.oid = ANY($1::bigint[]) \
+             AND k.attnum >= 0 \
              GROUP BY t.oid, i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY t.oid, i.relname"
 }
@@ -5429,6 +5425,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS columns, \
              ARRAY( \
@@ -5442,6 +5439,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum > 0 \
                LEFT JOIN pg_opclass oc \
                  ON oc.oid = (string_to_array(ix.indclass::text, ' '))[pos.n]::oid \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
@@ -5458,6 +5456,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
@@ -8045,7 +8044,7 @@ pub async fn list_schema_infos_with_system(pool: &Pool, show_system_schemas: boo
 // note there about why these aren't merged into a shared fragment.
 const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(c.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              CASE WHEN a.attgenerated <> '' THEN NULL ELSE pg_get_expr(ad.adbin, ad.adrelid) END AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -8081,8 +8080,6 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
                               FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]') END AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
-             JOIN pg_class relation_class ON relation_class.oid = a.attrelid \
-             JOIN pg_namespace relation_namespace ON relation_namespace.oid = relation_class.relnamespace \
              LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN LATERAL ( \
@@ -8107,9 +8104,7 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
                LIMIT 1 \
              ) dep ON TRUE \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
-             LEFT JOIN information_schema.columns c \
-               ON c.table_schema = relation_namespace.nspname AND c.table_name = relation_class.relname AND c.column_name = a.attname \
-             WHERE a.attrelid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -8117,7 +8112,7 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
 // 3148) — see the note on `POSTGRES_COLUMNS_SQL` above.
 const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(c.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -8142,8 +8137,6 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
              NULL::text AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
-             JOIN pg_class relation_class ON relation_class.oid = a.attrelid \
-             JOIN pg_namespace relation_namespace ON relation_namespace.oid = relation_class.relnamespace \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN pg_catalog.pg_class serial_seq ON serial_seq.oid = ( \
                SELECT sequence_dep.objid \
@@ -8165,9 +8158,7 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
                ORDER BY sequence_dep.objid \
                LIMIT 1 \
              ) AND serial_seq.relkind = 'S' \
-             LEFT JOIN information_schema.columns c \
-               ON c.table_schema = relation_namespace.nspname AND c.table_name = relation_class.relname AND c.column_name = a.attname \
-             WHERE a.attrelid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -8195,7 +8186,7 @@ const POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL: &str = "SELECT c.column_name, \
              CAST(c.character_maximum_length AS int) AS character_maximum_length, \
              NULL::text AS enum_values \
              FROM information_schema.columns c \
-             WHERE c.table_schema = (CASE WHEN coalesce(length($1), 0) = 0 THEN current_schema() ELSE $1 END) \
+             WHERE c.table_schema = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN current_schema() ELSE $1 END) \
              AND c.table_name = $2 \
              ORDER BY c.ordinal_position";
 
@@ -9677,6 +9668,13 @@ pub async fn execute_query_on_client_unnamed(
 // relation: a FOREIGN KEY stores the referenced table's unique index in
 // `conindid`, so matching on `conindid` alone marked that standalone index as
 // constraint-backed and dropped it from generated DDL (#10484).
+//
+// `AND k.attnum >= 0` skips system attributes (negative `indkey` entries such as
+// `tableoid`) that openGauss / GaussDB can carry in `pg_index.indkey`: because the
+// `pg_attribute` join is restricted to `attnum > 0`, `pg_get_indexdef` would
+// otherwise render the raw system-column name as a key part and the UI would show
+// a bogus `tableoid` column. Only non-negative attnums (0 = expression, positive =
+// user column) are real, displayable index key parts.
 const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              array_agg(COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
              array_agg(CASE WHEN oc.opcdefault THEN NULL ELSE quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname) END ORDER BY k.n) AS column_opclasses, \
@@ -9699,12 +9697,18 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
              LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
              LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
-             WHERE t.oid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             AND k.attnum >= 0 \
              GROUP BY i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY i.relname";
 
 // Compat-tier sibling of `postgres_indexes_for_relations_compat_sql` (~line
 // 3312) — see the note on `POSTGRES_INDEXES_SQL` above.
+//
+// The opclass subquery has to join `pg_opclass` before its WHERE: a JOIN after
+// WHERE is a syntax error, and this tier is the only one GaussDB / openGauss
+// ever run (`list_indexes_compat_first`), so the misordered join broke every
+// index listing there with `syntax error at or near "LEFT"` (#12650, #12675).
 const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              ARRAY( \
                SELECT COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, pos.n, false)) \
@@ -9713,6 +9717,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS columns, \
              ARRAY( \
@@ -9726,6 +9731,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum > 0 \
                LEFT JOIN pg_opclass oc \
                  ON oc.oid = (string_to_array(ix.indclass::text, ' '))[pos.n]::oid \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
@@ -9742,6 +9748,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
@@ -9751,7 +9758,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
-             WHERE t.oid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              ORDER BY i.relname";
 
 const POSTGRES_OWNERS_SQL: &str =
@@ -14382,8 +14389,10 @@ mod tests {
         assert!(POSTGRES_COLUMNS_SQL.contains("pg_sequence"));
         assert!(POSTGRES_COLUMNS_SQL.contains("generated by default as identity"));
         assert!(POSTGRES_COLUMNS_SQL.contains("generated always as identity"));
-        assert!(POSTGRES_COLUMNS_SQL.contains("COALESCE(c.is_nullable = 'YES', NOT a.attnotnull)"));
-        assert!(POSTGRES_COLUMNS_SQL.contains("LEFT JOIN information_schema.columns"));
+        assert!(
+            POSTGRES_COLUMNS_SQL.contains("NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable")
+        );
+        assert!(!POSTGRES_COLUMNS_SQL.contains("information_schema.columns"));
         assert!(POSTGRES_COLUMNS_SQL.contains("pg_enum"));
         assert!(POSTGRES_COLUMNS_SQL.contains("AS enum_values"));
     }
@@ -14391,18 +14400,18 @@ mod tests {
     #[test]
     fn postgres_single_relation_metadata_can_resolve_through_search_path() {
         // GaussDB A mode folds `''` to NULL, so `$1 = ''` is never true there and the
-        // unqualified branch was skipped (issue #12198). `coalesce(length($1), 0) = 0`
+        // unqualified branch was skipped (issue #12198). `coalesce(length($1::text), 0) = 0`
         // matches both NULL and the empty string on every PostgreSQL-compatible kernel.
         for sql in [POSTGRES_COLUMNS_SQL, POSTGRES_COLUMNS_COMPAT_SQL] {
-            assert!(sql.contains("CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2)"), "{sql}");
-            assert!(sql.contains("c.table_schema = relation_namespace.nspname"));
+            assert!(sql.contains("CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2)"), "{sql}");
+            assert!(!sql.contains("information_schema.columns"));
         }
         for sql in [POSTGRES_INDEXES_SQL, POSTGRES_INDEXES_COMPAT_SQL] {
-            assert!(sql.contains("t.oid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2)"), "{sql}");
+            assert!(sql.contains("t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2)"), "{sql}");
         }
         assert!(
             POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL
-                .contains("CASE WHEN coalesce(length($1), 0) = 0 THEN current_schema() ELSE $1 END"),
+                .contains("CASE WHEN coalesce(length($1::text), 0) = 0 THEN current_schema() ELSE $1 END"),
             "{POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL}"
         );
     }
@@ -14486,10 +14495,12 @@ mod tests {
         assert_eq!(column_tiers.len(), 3);
         assert!(column_tiers.iter().all(|sql| sql.contains("c.oid = ANY($1::bigint[])")));
         assert!(column_tiers[0].contains("a.attgenerated"));
+        assert!(!column_tiers[0].contains("information_schema.columns"));
         assert!(!column_tiers[1].contains("a.attgenerated"));
         assert!(!column_tiers[1].contains("pg_sequence"));
         assert!(column_tiers[1].contains("sequence_dep.deptype = 'a'"));
         assert!(!column_tiers[1].contains("LEFT JOIN LATERAL"));
+        assert!(!column_tiers[1].contains("information_schema.columns"));
         assert!(column_tiers[2].contains("information_schema.columns"));
         assert!(!column_tiers[2].contains("pg_attribute"));
 
@@ -14543,10 +14554,27 @@ mod tests {
         assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("pg_sequence"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("AS column_extra"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("col_description"));
-        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("COALESCE(c.is_nullable = 'YES', NOT a.attnotnull)"));
-        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("LEFT JOIN information_schema.columns"));
+        assert!(POSTGRES_COLUMNS_COMPAT_SQL
+            .contains("NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable"));
+        assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("information_schema.columns"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("NULL::text AS enum_values"));
         assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("pg_enum"));
+    }
+
+    #[test]
+    fn postgres_columns_queries_avoid_information_schema_columns_join() {
+        // Issue #12393: information_schema.columns join took 34-42s in GaussDB/openGauss/PG.
+        // Direct catalog query using pg_type domain nullability drops it to <1s.
+        for sql in [
+            POSTGRES_COLUMNS_SQL,
+            POSTGRES_COLUMNS_COMPAT_SQL,
+            postgres_columns_for_relations_sql(),
+            postgres_columns_for_relations_compat_sql(),
+        ] {
+            assert!(sql.contains("NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable"), "{sql}");
+            assert!(!sql.contains("information_schema.columns"), "{sql}");
+            assert!(!sql.contains("relation_namespace"), "{sql}");
+        }
     }
 
     #[test]
@@ -15441,6 +15469,39 @@ mod tests {
     }
 
     #[test]
+    fn postgres_index_metadata_skips_system_columns() {
+        // openGauss / GaussDB can carry system attributes (negative `indkey` entries such as
+        // `tableoid`) inside `pg_index.indkey`. The `pg_attribute` join only matches `attnum > 0`,
+        // so without an explicit attnum guard `pg_get_indexdef` renders the raw system-column
+        // name and the object browser shows a bogus `tableoid` key part.
+        for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
+            assert!(sql.contains("AND k.attnum >= 0"), "expected system-column guard in {sql}");
+        }
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            assert!(
+                sql.contains("WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0"),
+                "expected system-column guard in {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_index_metadata_sql_has_valid_join_order() {
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            assert!(
+                !sql.contains("WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 LEFT JOIN"),
+                "WHERE clause must not precede LEFT JOIN in {sql}"
+            );
+            let opclass_pos = sql.find("LEFT JOIN pg_opclass oc").expect("must contain opclass join");
+            let col_opclasses_end = sql.find(") AS column_opclasses").expect("must contain column_opclasses");
+            let where_pos = sql[opclass_pos..col_opclasses_end]
+                .find("WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0")
+                .expect("must contain where guard after opclass join");
+            assert!(where_pos > 0, "WHERE guard must appear after LEFT JOIN pg_opclass oc in column_opclasses");
+        }
+    }
+
+    #[test]
     fn postgres_index_metadata_tracks_per_key_ordering_without_include_columns() {
         for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
             assert!(sql.contains("ix.indoption[(k.n - 1)::int]"));
@@ -15449,6 +15510,50 @@ mod tests {
         for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
             assert!(sql.contains("string_to_array(ix.indoption::text, ' ')") && sql.contains("AS key_options"));
         }
+    }
+
+    #[test]
+    fn compat_index_queries_keep_the_opclass_join_before_the_where_clause() {
+        // Both compat queries used to build the opclass subquery as
+        // `FROM generate_series(...) LEFT JOIN pg_attribute ... WHERE <key filter> LEFT JOIN pg_opclass ...`.
+        // A JOIN after WHERE is a syntax error, and GaussDB / openGauss never run the modern tier
+        // (`list_indexes_compat_first`), so every index listing — and every schema comparison that
+        // loads one — died with `syntax error at or near "LEFT"` on the opclass join (#12650, #12675).
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(compact.matches("LEFT JOIN pg_opclass oc").count(), 1, "expected one opclass join in {sql}");
+            assert!(!compact.contains(">= 0 LEFT JOIN"), "a JOIN after the key filter's WHERE is invalid: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn compat_index_query_parses_and_reports_index_columns() {
+        // The compat tier is the only tier GaussDB and openGauss ever run, so it has to be valid
+        // SQL against a real server and not merely a plausible-looking string (#12650, #12675).
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let timeout = crate::db::connection_timeout();
+        let client = checkout_postgres_client(&pool, None, timeout).await.expect("checkout client");
+        let table = format!("dbx_compat_index_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS public.{table}; \
+                 CREATE TABLE public.{table} (id int PRIMARY KEY, email text, tag text); \
+                 CREATE INDEX {table}_email_tag ON public.{table} (email, tag)"
+            ))
+            .await
+            .expect("create index fixtures");
+        let indexes = list_indexes_compat_first(&pool, "public", &table).await.expect("compat index listing");
+        client.batch_execute(&format!("DROP TABLE IF EXISTS public.{table}")).await.expect("drop index fixtures");
+        let primary_name = format!("{table}_pkey");
+        let primary = indexes.iter().find(|index| index.name == primary_name).expect("primary key index");
+        assert_eq!(primary.columns, vec!["id".to_string()]);
+        assert!(primary.is_primary && primary.is_unique);
+        let composite_name = format!("{table}_email_tag");
+        let composite = indexes.iter().find(|index| index.name == composite_name).expect("composite index");
+        assert_eq!(composite.columns, vec!["email".to_string(), "tag".to_string()]);
+        assert!(!composite.is_primary && !composite.is_unique);
     }
 
     #[test]
