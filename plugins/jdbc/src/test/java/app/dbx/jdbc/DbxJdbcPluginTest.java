@@ -6,12 +6,14 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Clob;
 import java.sql.DatabaseMetaData;
@@ -1353,6 +1355,66 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void duckDbConnectTimeoutDoesNotInjectUnsupportedProperties() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("applyConnectTimeout", JsonNode.class, Properties.class);
+        method.setAccessible(true);
+        int previousTimeout = DriverManager.getLoginTimeout();
+        try {
+            for (String url : List.of("jdbc:duckdb:", "jdbc:duckdb:/tmp/example.duckdb", "JDBC:DUCKDB:")) {
+                JsonNode connection = MAPPER.createObjectNode()
+                    .put("connection_string", url)
+                    .put("connect_timeout_secs", 45);
+                Properties properties = new Properties();
+                properties.setProperty("duckdb_read_only", "true");
+                method.invoke(null, connection, properties);
+                assertEquals("true", properties.getProperty("duckdb_read_only"));
+                assertFalse(properties.containsKey("loginTimeout"), url);
+                assertFalse(properties.containsKey("connectTimeout"), url);
+                assertEquals(45, DriverManager.getLoginTimeout());
+            }
+        } finally {
+            DriverManager.setLoginTimeout(previousTimeout);
+        }
+    }
+
+    @Test
+    void duckDbInMemoryConnectionExecutesQueries() throws Exception {
+        JsonNode response = request("executeQuery", """
+            {
+              "connection": {
+                "connection_string": "jdbc:duckdb:",
+                "connect_timeout_secs": 45
+              },
+              "sql": "SELECT 42 AS answer"
+            }
+            """);
+        assertFalse(response.has("error"), response.toString());
+        assertEquals(42, response.path("result").path("rows").path(0).path(0).asInt());
+    }
+
+    @Test
+    void duckDbFileConnectionPersistsDataAcrossReconnects(@TempDir Path directory) throws Exception {
+        ObjectNode connection = MAPPER.createObjectNode()
+            .put("connection_string", "jdbc:duckdb:" + directory.resolve("example.duckdb"))
+            .put("connect_timeout_secs", 45);
+        for (String sql : List.of("CREATE TABLE example (id INTEGER)", "INSERT INTO example VALUES (42)")) {
+            ObjectNode requestParams = MAPPER.createObjectNode();
+            requestParams.set("connection", connection);
+            requestParams.put("sql", sql);
+            JsonNode response = request("executeQuery", requestParams.toString());
+            assertFalse(response.has("error"), response.toString());
+        }
+        JsonNode closed = request("close", MAPPER.createObjectNode().set("connection", connection).toString());
+        assertFalse(closed.has("error"), closed.toString());
+        ObjectNode params = MAPPER.createObjectNode();
+        params.set("connection", connection);
+        params.put("sql", "SELECT id FROM example");
+        JsonNode response = request("executeQuery", params.toString());
+        assertFalse(response.has("error"), response.toString());
+        assertEquals(42, response.path("result").path("rows").path(0).path(0).asInt());
+    }
+
+    @Test
     void ordinaryConnectionsEnableAutoCommitWhenDriverDefaultsToManualTransactions() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod(
             "configureOrdinaryAutoCommit",
@@ -2486,6 +2548,62 @@ final class DbxJdbcPluginTest {
             assertFalse(response.has("error"), response.toString());
             assertEquals(MAPPER.readTree("[\"dbo\", \"sales\"]"), response.path("result"));
             assertEquals(List.of("appdb", "getSchemas()", ""), calls);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void listSchemasFallsBackWhenInformixStyleGetSchemasOverloadThrowsSqlException() throws Exception {
+        // #12213: IfxDatabaseMetaData.getSchemas(String, String) rejects the two-arg overload
+        // with a plain SQLException("不支持方法 ...") rather than AbstractMethodError.
+        String url = "jdbc:gbasedbt-sqli://gbase8s-mock.example.test:9088/sysmaster:GBASEDBTSERVER=gbase8s";
+        List<String> calls = new ArrayList<>();
+        DatabaseMetaData metadata = (DatabaseMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { DatabaseMetaData.class },
+            (proxy, method, args) -> {
+                if ("getSchemas".equals(method.getName())) {
+                    if (args != null && args.length == 2) {
+                        calls.add("getSchemas(" + args[0] + ", " + args[1] + ")");
+                        throw new SQLException("不支持方法 : IfxDatabaseMetaData.getSchemas(String, String)");
+                    }
+                    calls.add("getSchemas()");
+                    return rowsResultSet(
+                        new String[] { "TABLE_SCHEM" },
+                        new Object[][] { { "informix" }, { "appuser" } }
+                    );
+                }
+                return defaultValue(method.getReturnType());
+            }
+        );
+        Connection jdbcConnection = (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getMetaData" -> metadata;
+                case "getAutoCommit" -> true;
+                case "isClosed" -> false;
+                case "getSchema" -> "informix";
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+        Driver driver = testDriver(url, jdbcConnection);
+        String connection = """
+            { "connection_string": "%s" }
+            """.formatted(url);
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("listSchemas", """
+                {
+                  "connection": %s,
+                  "database": "sysmaster"
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(MAPPER.readTree("[\"informix\", \"appuser\"]"), response.path("result"));
+            assertEquals(List.of("getSchemas(sysmaster, null)", "getSchemas()"), calls);
         } finally {
             closeAndDeregister(connection, driver);
         }

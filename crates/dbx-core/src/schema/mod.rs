@@ -720,7 +720,11 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         {
             db::dolt::list_databases(p).await
         }
-        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata) => {
+        PoolKind::Mysql(p, _)
+            if db_config
+                .as_ref()
+                .is_some_and(|config| db::mysql_compatible::uses_show_metadata(config) || is_mycat_config(config)) =>
+        {
             db::mysql::list_databases_show_with_timeout(p, mysql_database_list_timeout)
                 .await
                 .map(|databases| filter_mysql_system_databases_for_config(databases, db_config.as_ref()))
@@ -742,12 +746,21 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
     }
 }
 
+fn uses_shared_database_comments(config: &ConnectionConfig) -> bool {
+    match config.db_type {
+        DatabaseType::Postgres => {
+            matches!(config.driver_profile.as_deref(), None | Some("postgres" | "opengauss" | "gaussdb"))
+        }
+        DatabaseType::OpenGauss | DatabaseType::Gaussdb => true,
+        _ => false,
+    }
+}
+
 async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     let config = connection_config(state, connection_id).await;
-    if config
-        .as_ref()
-        .is_some_and(|config| db::dolt::is_config(config) || db::mysql_compatible::uses_show_metadata(config))
-    {
+    if config.as_ref().is_some_and(|config| {
+        db::dolt::is_config(config) || db::mysql_compatible::uses_show_metadata(config) || is_mycat_config(config)
+    }) {
         return list_databases_once(state, connection_id).await;
     }
     let pool_handle = state.pool_handle(connection_id).await;
@@ -765,7 +778,8 @@ async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> R
         };
     }
     if let Some(pool) = extract_pool!(pool_handle.as_ref(), Postgres) {
-        return db::postgres::list_database_metadata(&pool).await;
+        let shared_comments = config.as_ref().is_some_and(uses_shared_database_comments);
+        return db::postgres::list_database_metadata(&pool, shared_comments).await;
     }
     list_databases_once(state, connection_id).await
 }
@@ -1228,6 +1242,108 @@ fn mysql_auto_increment_from_query_result(result: db::QueryResult) -> Result<Opt
     Ok(Some(text))
 }
 
+async fn get_table_comment_core_with_pool_key(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    pool_key: &str,
+) -> Result<Option<String>, String> {
+    let db_config = connection_config(state, connection_id).await;
+
+    {
+        let pool_handle = state.pool_handle(pool_key).await;
+        try_sqlserver!(pool_handle, get_table_comment, schema, table);
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
+            if is_oracle_external_driver_config(config.as_ref()) {
+                return external_driver_oracle_table_comment(session.clone(), config.as_ref(), database, schema, table)
+                    .await;
+            }
+        }
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
+            if db_config
+                .as_ref()
+                .is_some_and(|config| matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+            {
+                let sql = oracle_table_comment_sql(schema, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            Some(schema),
+                            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return single_table_comment_from_query_result(result);
+            }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::SqlServer) {
+                // JDBC `REMARKS` is always NULL on SQL Server, so the legacy Agent's
+                // table list cannot supply the `MS_Description` written by the editor.
+                let sql = db::sqlserver::sqlserver_table_comment_sql(schema, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            Some(schema),
+                            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return single_table_comment_from_query_result(result);
+            }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                return client.get_table_comment::<Option<String>>(database, schema, table, timeout).await;
+            }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine) {
+                let metadata_database = if schema.trim().is_empty() { database } else { schema };
+                let sql = tdengine_table_comment_sql(metadata_database, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            (!schema.trim().is_empty()).then_some(schema),
+                            QueryExecutionOptions { max_rows: Some(2), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return single_table_comment_from_query_result(result);
+            }
+        }
+    }
+
+    let pool = clone_metadata_pool(state, pool_key).await.ok_or("Pool not found")?;
+
+    match &pool {
+        PoolKind::Mysql(p, mode)
+            if *mode != MysqlMode::OceanBaseOracle
+                && !db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata)
+                && !db_config.as_ref().is_some_and(db::manticoresearch::is_config) =>
+        {
+            db::mysql::get_table_comment(p, database, table).await
+        }
+        PoolKind::Postgres(p) if !db_config.as_ref().is_some_and(is_questdb_config) => {
+            db::postgres::get_table_comment(p, schema, table).await
+        }
+        _ => Err("Table comment lookup is not supported for this connection".to_string()),
+    }
+}
+
 async fn get_table_comment_core_for_session(
     state: &AppState,
     connection_id: &str,
@@ -1239,103 +1355,7 @@ async fn get_table_comment_core_for_session(
     retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || async {
         let pool_key =
             state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await?;
-        let db_config = connection_config(state, connection_id).await;
-
-        {
-            let pool_handle = state.pool_handle(&pool_key).await;
-            try_sqlserver!(pool_handle, get_table_comment, schema, table);
-            if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
-                if is_oracle_external_driver_config(config.as_ref()) {
-                    return external_driver_oracle_table_comment(
-                        session.clone(),
-                        config.as_ref(),
-                        database,
-                        schema,
-                        table,
-                    )
-                    .await;
-                }
-            }
-            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
-                if db_config.as_ref().is_some_and(|config| {
-                    matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
-                }) {
-                    let sql = oracle_table_comment_sql(schema, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                Some(schema),
-                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return single_table_comment_from_query_result(result);
-                }
-                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::SqlServer) {
-                    // JDBC `REMARKS` is always NULL on SQL Server, so the legacy Agent's
-                    // table list cannot supply the `MS_Description` written by the editor.
-                    let sql = db::sqlserver::sqlserver_table_comment_sql(schema, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                Some(schema),
-                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return single_table_comment_from_query_result(result);
-                }
-                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    return client.get_table_comment::<Option<String>>(database, schema, table, timeout).await;
-                }
-                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine) {
-                    let metadata_database = if schema.trim().is_empty() { database } else { schema };
-                    let sql = tdengine_table_comment_sql(metadata_database, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                (!schema.trim().is_empty()).then_some(schema),
-                                QueryExecutionOptions { max_rows: Some(2), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return single_table_comment_from_query_result(result);
-                }
-            }
-        }
-
-        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
-
-        match &pool {
-            PoolKind::Mysql(p, mode)
-                if *mode != MysqlMode::OceanBaseOracle
-                    && !db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata)
-                    && !db_config.as_ref().is_some_and(db::manticoresearch::is_config) =>
-            {
-                db::mysql::get_table_comment(p, database, table).await
-            }
-            PoolKind::Postgres(p) if !db_config.as_ref().is_some_and(is_questdb_config) => {
-                db::postgres::get_table_comment(p, schema, table).await
-            }
-            _ => Err("Table comment lookup is not supported for this connection".to_string()),
-        }
+        get_table_comment_core_with_pool_key(state, connection_id, database, schema, table, &pool_key).await
     })
     .await
 }
@@ -3148,8 +3168,19 @@ fn is_shardingsphere_proxy_version(version: &str) -> bool {
     version.as_bytes().windows(MARKER.len()).any(|window| window.eq_ignore_ascii_case(MARKER))
 }
 
+pub(in crate::schema) fn is_mycat_version(version: &str) -> bool {
+    const MARKER: &[u8] = b"mycat";
+    version.as_bytes().windows(MARKER.len()).any(|window| window.eq_ignore_ascii_case(MARKER))
+}
+
+pub(in crate::schema) fn is_mycat_config(config: &ConnectionConfig) -> bool {
+    config.database_info.as_ref().and_then(|info| info.product_version.as_deref()).is_some_and(is_mycat_version)
+        || config.database_info.as_ref().and_then(|info| info.server_comment.as_deref()).is_some_and(is_mycat_version)
+}
+
 fn mysql_table_list_source_for_config(config: Option<&ConnectionConfig>) -> MysqlTableListSource {
     if config.is_some_and(db::tdsql_mysql::is_config)
+        || config.is_some_and(is_mycat_config)
         || config
             .and_then(|config| config.database_info.as_ref())
             .and_then(|info| info.product_version.as_deref())
@@ -3182,22 +3213,22 @@ mod tests {
         deduplicate_column_infos, ephemeral_agent_metadata_session_id, external_driver_statistics_dialect,
         external_driver_statistics_query_plan, external_driver_uses_generic_ddl, external_driver_uses_mysql_ddl,
         filter_mongodb_agent_collections, filter_mysql_system_databases_for_config, filter_object_infos,
-        filter_table_infos, filter_visible_schema_names, finalize_object_source, gaussdb_m_view_object_source_sql,
-        gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config,
-        is_oracle_external_driver_config, is_retryable_metadata_error, metadata_error_action,
-        metadata_name_or_comment_matches, mysql_auto_increment_from_query_result, mysql_auto_increment_metadata_sql,
-        mysql_database_list_timeout, mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
-        mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
-        mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
-        oracle_columns_sql, oracle_columns_sql_for_resolved_owner, oracle_completion_synonyms_sql,
-        oracle_current_schema_from_query_result, oracle_object_statistics_dba_segments_sql,
-        oracle_object_statistics_from_query_result, oracle_object_statistics_rows_only_sql,
-        oracle_object_statistics_sql, oracle_object_statistics_user_segments_sql,
-        oracle_synonym_target_from_query_result, oracle_synonym_target_sql, oracle_table_comment_sql,
-        oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
-        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
-        reference_key_columns_from_indexes, reference_keys_from_indexes, replace_metadata_runtime,
-        should_append_oracle_style_comment_ddl, should_query_oracle_columns_via_sql_first,
+        filter_table_infos, filter_visible_schema_names, finalize_object_source, gaussdb_m_indexes_sql,
+        gaussdb_m_view_object_source_sql, gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config,
+        is_mysql_external_driver_config, is_oracle_external_driver_config, is_retryable_metadata_error,
+        metadata_error_action, metadata_name_or_comment_matches, mysql_auto_increment_from_query_result,
+        mysql_auto_increment_metadata_sql, mysql_database_list_timeout, mysql_external_driver_ddl_from_query_result,
+        mysql_external_driver_ddl_sql, mysql_object_source_ddl_column_index, mysql_object_source_sql,
+        mysql_table_list_source_for_config, mysql_table_metadata_catalog, normalize_information_schema_table_type,
+        oracle_columns_from_query_result, oracle_columns_sql, oracle_columns_sql_for_resolved_owner,
+        oracle_completion_synonyms_sql, oracle_current_schema_from_query_result,
+        oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
+        oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
+        oracle_object_statistics_user_segments_sql, oracle_synonym_target_from_query_result, oracle_synonym_target_sql,
+        oracle_table_comment_sql, oracle_table_comments_sql, presto_like_columns_from_query_result,
+        presto_like_information_schema_columns_sql, presto_like_information_schema_tables_sql,
+        presto_like_tables_from_query_result, reference_key_columns_from_indexes, reference_keys_from_indexes,
+        replace_metadata_runtime, should_append_oracle_style_comment_ddl, should_query_oracle_columns_via_sql_first,
         single_table_comment_from_query_result, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
         uses_mongodb_agent_collection_listing, visible_schema_filter, ExternalDriverStatisticsDialect,
@@ -3415,6 +3446,8 @@ mod tests {
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),
@@ -4358,6 +4391,20 @@ done
     }
 
     #[test]
+    fn gaussdb_m_indexes_sql_excludes_system_attributes() {
+        let sql = gaussdb_m_indexes_sql("sec_acct", "main_sec_acct_info");
+        assert!(sql.contains("FROM information_schema.STATISTICS s"), "{sql}");
+        assert!(sql.contains("JOIN pg_catalog.pg_attribute a"), "{sql}");
+        assert!(sql.contains("a.attnum > 0"), "{sql}");
+        assert!(sql.contains("NOT a.attisdropped"), "{sql}");
+        assert!(sql.contains("s.TABLE_SCHEMA = 'sec_acct'"), "{sql}");
+        assert!(sql.contains("s.TABLE_NAME = 'main_sec_acct_info'"), "{sql}");
+        assert!(sql.contains("ORDER BY s.INDEX_NAME, s.SEQ_IN_INDEX"), "{sql}");
+        // Escaping still goes through `sql_string`.
+        assert!(gaussdb_m_indexes_sql("a'b", "c'd").contains("s.TABLE_SCHEMA = 'a''b'"));
+    }
+
+    #[test]
     fn mysql_external_driver_ddl_sql_uses_catalog_and_escaped_identifiers() {
         assert_eq!(
             mysql_external_driver_ddl_sql("app_db", "tenant`db", "user`events"),
@@ -4966,6 +5013,38 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn database_metadata_limits_shared_comments_to_verified_postgres_families() {
+        for (db_type, profile, expected) in [
+            (DatabaseType::Postgres, None, true),
+            (DatabaseType::Postgres, Some("postgres"), true),
+            (DatabaseType::Postgres, Some("opengauss"), true),
+            (DatabaseType::Postgres, Some("gaussdb"), true),
+            (DatabaseType::OpenGauss, None, true),
+            (DatabaseType::OpenGauss, Some("opengauss"), true),
+            (DatabaseType::Gaussdb, None, true),
+            (DatabaseType::Gaussdb, Some("gaussdb"), true),
+            (DatabaseType::Postgres, Some("cockroachdb"), false),
+            (DatabaseType::Postgres, Some("redshift"), false),
+            (DatabaseType::Postgres, Some("questdb"), false),
+            (DatabaseType::Postgres, Some("cloudberry"), false),
+            (DatabaseType::Postgres, Some("kwdb"), false),
+            (DatabaseType::Postgres, Some("unknown"), false),
+            (DatabaseType::Redshift, None, false),
+            (DatabaseType::Questdb, None, false),
+            (DatabaseType::Kwdb, None, false),
+            (DatabaseType::Mysql, None, false),
+        ] {
+            let mut config = test_connection_config(db_type);
+            config.driver_profile = profile.map(str::to_string);
+            assert_eq!(
+                super::uses_shared_database_comments(&config),
+                expected,
+                "unexpected shared comment support for {db_type:?} / {profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_paging_detection_avoids_double_offset_only_when_page_sized() {
         assert!(super::agent_paging_likely_applied(true, Some(500), 500));
         assert!(super::agent_paging_likely_applied(true, Some(500), 120));
@@ -5133,6 +5212,14 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn mycat_marker_is_ascii_case_insensitive_and_exact() {
+        assert!(super::is_mycat_version("5.6.29-mycat-1.6-RELEASE-20161028204710"));
+        assert!(super::is_mycat_version("5.6.29-mycat-1.6.7.6"));
+        assert!(super::is_mycat_version("5.7.22-MYCAT-1.6-RELEASE"));
+        assert!(!super::is_mycat_version("8.0.36-MySQL Community Server"));
+    }
+
+    #[test]
     fn mysql_table_list_source_uses_only_saved_shardingsphere_version() {
         let mut config = test_connection_config(DatabaseType::Mysql);
         assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::InformationSchema);
@@ -5146,6 +5233,27 @@ for line in sys.stdin:
         config.database_info.as_mut().unwrap().product_version = Some("8.0.36-MySQL Community Server".to_string());
         assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::InformationSchema);
         assert_eq!(mysql_table_list_source_for_config(None), MysqlTableListSource::InformationSchema);
+    }
+
+    #[test]
+    fn mysql_table_list_source_uses_mycat_version() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::InformationSchema);
+
+        config.database_info = Some(DatabaseConnectionInfo {
+            product_version: Some("5.6.29-mycat-1.6-RELEASE-20161028204710".to_string()),
+            ..DatabaseConnectionInfo::default()
+        });
+        assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::ShowFullTables);
+        assert!(super::is_mycat_config(&config));
+
+        config.database_info = Some(DatabaseConnectionInfo {
+            product_version: None,
+            server_comment: Some("MyCat Server 1.6".to_string()),
+            ..DatabaseConnectionInfo::default()
+        });
+        assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::ShowFullTables);
+        assert!(super::is_mycat_config(&config));
     }
 
     #[test]
@@ -7282,9 +7390,7 @@ async fn list_object_statistics_once(
             )
             .await;
         }
-        if db_config.as_ref().is_some_and(|config| {
-            config.db_type == DatabaseType::Gbase && config.driver_profile.as_deref() != Some("gbase8s")
-        }) {
+        if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Gbase) {
             let sql = gbase8a_object_statistics_sql(database);
             return agent_list_object_statistics(
                 client,
@@ -9529,7 +9635,9 @@ pub async fn get_table_owner_core(
 /// they already iterate every relation themselves. A selected table structure
 /// export and interactive display both recurse through the PostgreSQL
 /// partition tree, while only display includes access statements. Oracle
-/// exports additionally request portable DDL normalization.
+/// exports and transfers additionally request portable DDL normalization: a
+/// transfer target must not inherit the source tablespaces, which the target
+/// user may have no quota on (#11939).
 #[derive(Clone, Copy)]
 struct TableDdlOptions {
     include_postgres_access: bool,
@@ -9546,6 +9654,12 @@ impl TableDdlOptions {
         include_sqlserver_temporal: false,
     };
     const RELATION_EXPORT: Self = Self {
+        include_postgres_access: false,
+        include_partitions: false,
+        portable_oracle: true,
+        include_sqlserver_temporal: false,
+    };
+    const TRANSFER: Self = Self {
         include_postgres_access: false,
         include_partitions: false,
         portable_oracle: true,
@@ -9594,7 +9708,7 @@ pub async fn get_table_export_ddl_core(
     table: &str,
     object_type: Option<db::ObjectSourceKind>,
 ) -> Result<String, String> {
-    get_table_ddl_core_with_options(
+    let ddl = get_table_ddl_core_with_options(
         state,
         connection_id,
         database,
@@ -9602,6 +9716,28 @@ pub async fn get_table_export_ddl_core(
         table,
         object_type,
         TableDdlOptions::EXPORT,
+        None,
+    )
+    .await?;
+    Ok(rewrite_postgres_standard_serial_defaults(&ddl, schema))
+}
+
+/// Source DDL for a table transfer that reuses it on the target.
+pub(crate) async fn get_table_transfer_ddl_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    get_table_ddl_core_with_options(
+        state,
+        connection_id,
+        database,
+        schema,
+        table,
+        None,
+        TableDdlOptions::TRANSFER,
         None,
     )
     .await
@@ -9616,7 +9752,7 @@ pub(crate) async fn get_table_relation_export_ddl_core_for_session(
     object_type: Option<db::ObjectSourceKind>,
     client_session_id: Option<&str>,
 ) -> Result<String, String> {
-    get_table_ddl_core_with_options(
+    let ddl = get_table_ddl_core_with_options(
         state,
         connection_id,
         database,
@@ -9626,7 +9762,11 @@ pub(crate) async fn get_table_relation_export_ddl_core_for_session(
         TableDdlOptions::RELATION_EXPORT,
         client_session_id,
     )
-    .await
+    .await?;
+    // Whole-database exports and scheduled backups rely on the table DDL to
+    // recreate `created_by_table` sequences, so they need the same serial
+    // rewrite as the single-table export (#13058).
+    Ok(rewrite_postgres_standard_serial_defaults(&ddl, schema))
 }
 
 pub async fn get_table_display_ddl_core(
@@ -9703,9 +9843,25 @@ async fn get_table_ddl_core_with_options(
         // Oracle-family comments live in dictionary tables, not inside CREATE VIEW.
         // Append COMMENT ON so table-properties DDL / hover match the structure editor.
         if append_oracle_comments {
-            return Ok(enrich_ddl_with_oracle_style_comments(state, connection_id, database, schema, table, &ddl).await);
+            let pool_key = state
+                .get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id)
+                .await
+                .ok();
+            return Ok(sanitize_ddl_string(
+                enrich_ddl_with_oracle_style_comments(
+                    state,
+                    connection_id,
+                    database,
+                    schema,
+                    table,
+                    &ddl,
+                    client_session_id,
+                    pool_key.as_deref(),
+                )
+                .await,
+            ));
         }
-        return Ok(ddl);
+        return Ok(sanitize_ddl_string(ddl));
     }
     if matches!(object_type, Some(db::ObjectSourceKind::MaterializedView)) {
         let source = get_object_source_core(
@@ -9719,7 +9875,7 @@ async fn get_table_ddl_core_with_options(
             None,
         )
         .await?;
-        return Ok(source.source);
+        return Ok(sanitize_ddl_string(source.source));
     }
     if let Some(kind) = object_type.clone().filter(ddl_kind_uses_object_source) {
         // Routines, packages, triggers, types and the other schema objects have no
@@ -9728,7 +9884,7 @@ async fn get_table_ddl_core_with_options(
         // instead, and keep the previous behaviour when the driver cannot produce
         // one (engine without a source query, empty definition, …).
         match get_object_source_core(state, connection_id, database, schema, table, kind, None, None).await {
-            Ok(source) if !source.source.trim().is_empty() => return Ok(source.source),
+            Ok(source) if !source.source.trim().is_empty() => return Ok(sanitize_ddl_string(source.source)),
             Ok(_) => {}
             Err(error) => {
                 log::debug!(
@@ -9738,10 +9894,38 @@ async fn get_table_ddl_core_with_options(
         }
     }
 
-    retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || {
+    let ddl = retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || {
         get_table_ddl_once(state, connection_id, database, schema, table, options, client_session_id)
     })
-    .await
+    .await?;
+
+    let db_config = connection_config(state, connection_id).await;
+    if should_append_oracle_style_comment_ddl(db_config.as_ref()) {
+        let pool_key =
+            state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await.ok();
+        Ok(sanitize_ddl_string(
+            enrich_ddl_with_oracle_style_comments(
+                state,
+                connection_id,
+                database,
+                schema,
+                table,
+                &ddl,
+                client_session_id,
+                pool_key.as_deref(),
+            )
+            .await,
+        ))
+    } else {
+        Ok(sanitize_ddl_string(ddl))
+    }
+}
+
+pub(crate) fn sanitize_ddl_string(mut ddl: String) -> String {
+    if ddl.contains('\0') {
+        ddl.retain(|c| c != '\0');
+    }
+    ddl
 }
 
 /// Whether the DDL of this object kind is its own definition, rather than the
@@ -9923,6 +10107,7 @@ async fn get_table_ddl_once(
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
         PoolKind::Turso(client) => db::turso_driver::table_ddl(client, table).await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
+        PoolKind::InfluxDb(client) => db::influxdb_driver::table_ddl(client, database, table).await,
         _ => Err("DDL not supported for this database type".to_string()),
     }
 }
@@ -10234,20 +10419,7 @@ async fn external_driver_gaussdb_m_indexes(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::IndexInfo>, String> {
-    // Query information_schema.STATISTICS row by row (one row per index column,
-    // ordered by SEQ_IN_INDEX).
-    // Docs: https://support.huaweicloud.com/intl/en-us/centralized-m-comp-devg-v8-gaussdb/gaussdb-81-0134.html
-    // The STATISTICS view has no EXPRESSION column in GaussDB M-mode. Expression
-    // indexes are not supported via this path.
-    let sql = format!(
-        "SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE, \
-                INDEX_TYPE, INDEX_COMMENT, SUB_PART \
-         FROM information_schema.STATISTICS \
-         WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
-         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-        sql_string(schema),
-        sql_string(table),
-    );
+    let sql = gaussdb_m_indexes_sql(schema, table);
     log::debug!("[gaussdb-m][list_indexes] sql={sql}");
 
     let timeout = agent_metadata_timeout(Some(config));
@@ -10396,6 +10568,36 @@ async fn external_driver_gaussdb_m_indexes(
     }
 
     Ok(indexes)
+}
+
+/// Index-list SQL for GaussDB M-mode (one row per index column, ordered by `SEQ_IN_INDEX`).
+///
+/// A GaussDB/openGauss GLOBAL index carries system attributes in `pg_index.indkey` as
+/// negative attnums (e.g. `tableoid` = -7, `oid` = -2). `information_schema.STATISTICS`
+/// reports those system attributes as ordinary key columns, even though `pg_get_indexdef`
+/// omits them, so the object browser showed a bogus `tableoid` key part. Requiring a matching
+/// `pg_attribute` row with `attnum > 0` drops the system attributes while keeping real columns
+/// (including a genuine user column that happens to be named `oid`/`tableoid`).
+///
+/// Docs: https://support.huaweicloud.com/intl/en-us/centralized-m-comp-devg-v8-gaussdb/gaussdb-81-0134.html
+/// The STATISTICS view has no EXPRESSION column in GaussDB M-mode, so expression indexes are
+/// not represented via this path.
+fn gaussdb_m_indexes_sql(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT s.INDEX_NAME, s.COLUMN_NAME, s.SEQ_IN_INDEX, s.NON_UNIQUE, \
+                s.INDEX_TYPE, s.INDEX_COMMENT, s.SUB_PART \
+         FROM information_schema.STATISTICS s \
+         JOIN pg_catalog.pg_class c \
+           ON c.relname = s.TABLE_NAME \
+         JOIN pg_catalog.pg_namespace n \
+           ON n.oid = c.relnamespace AND n.nspname = s.TABLE_SCHEMA \
+         JOIN pg_catalog.pg_attribute a \
+           ON a.attrelid = c.oid AND a.attname = s.COLUMN_NAME AND a.attnum > 0 AND NOT a.attisdropped \
+         WHERE s.TABLE_SCHEMA = {} AND s.TABLE_NAME = {} \
+         ORDER BY s.INDEX_NAME, s.SEQ_IN_INDEX",
+        sql_string(schema),
+        sql_string(table),
+    )
 }
 
 fn gaussdb_m_view_object_source_sql(
@@ -11037,7 +11239,7 @@ async fn mysql_object_source(
 ) -> Result<String, String> {
     let primary_sql = mysql_object_source_sql(database, name, kind);
     let primary_column_index = mysql_object_source_ddl_column_index(kind);
-    let mut conn = db::mysql::get_conn_with_timeout(pool, db::connection_timeout()).await?;
+    let mut conn = db::mysql::get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
 
     match read_mysql_object_source_row(&mut conn, &primary_sql, primary_column_index).await {
         Ok(source) => Ok(source),
@@ -11682,33 +11884,84 @@ async fn enrich_ddl_with_oracle_style_comments(
     schema: &str,
     table: &str,
     ddl: &str,
+    client_session_id: Option<&str>,
+    existing_pool_key: Option<&str>,
 ) -> String {
-    let columns = match get_columns_core(state, connection_id, database, schema, table).await {
-        Ok(columns) => columns,
-        Err(error) => {
-            log::debug!(
-                "[schema][oracle:display-ddl:columns-for-comments-failed] connection_id={} schema={} table={} error={}",
-                connection_id,
-                schema,
-                table,
-                error
-            );
-            Vec::new()
+    if ddl.trim().is_empty() {
+        return String::new();
+    }
+    let existing_ddl_upper = ddl.to_ascii_uppercase();
+    let needs_column_comments = !existing_ddl_upper.contains("COMMENT ON COLUMN");
+    let needs_table_comment = !existing_ddl_upper.contains("COMMENT ON TABLE");
+    if !needs_column_comments && !needs_table_comment {
+        return crate::object_source_sql::ensure_oracle_ddl_terminated(ddl);
+    }
+
+    let columns = if !needs_column_comments {
+        Vec::new()
+    } else if let Some(pool_key) = existing_pool_key {
+        match get_columns_core_for_existing_pool(state, connection_id, database, schema, table, pool_key).await {
+            Ok(columns) => columns,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:columns-for-comments-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        match get_columns_core_for_session(state, connection_id, database, schema, table, client_session_id).await {
+            Ok(columns) => columns,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:columns-for-comments-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                Vec::new()
+            }
         }
     };
-    let table_comment = match get_table_comment_core(state, connection_id, database, schema, table).await {
-        Ok(comment) => comment,
-        Err(error) => {
-            log::debug!(
-                "[schema][oracle:display-ddl:table-comment-failed] connection_id={} schema={} table={} error={}",
-                connection_id,
-                schema,
-                table,
-                error
-            );
-            None
+
+    let table_comment = if !needs_table_comment {
+        None
+    } else if let Some(pool_key) = existing_pool_key {
+        match get_table_comment_core_with_pool_key(state, connection_id, database, schema, table, pool_key).await {
+            Ok(comment) => comment,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:table-comment-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                None
+            }
+        }
+    } else {
+        match get_table_comment_core_for_session(state, connection_id, database, schema, table, client_session_id).await
+        {
+            Ok(comment) => comment,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:table-comment-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                None
+            }
         }
     };
+
     append_oracle_comments_to_ddl(ddl, schema, table, table_comment.as_deref(), &columns)
 }
 
@@ -12744,6 +12997,32 @@ mod object_source_tests {
         assert!(!ddl.contains("New table comment"));
         assert!(!ddl.contains("New column comment"));
     }
+
+    #[test]
+    fn appends_oracle_comments_to_table_ddl_when_missing() {
+        let column = db::ColumnInfo {
+            name: "USER_NAME".to_string(),
+            data_type: "VARCHAR2(50)".to_string(),
+            is_nullable: true,
+            column_default: None,
+            is_primary_key: false,
+            extra: None,
+            comment: Some("User name comment".to_string()),
+            ..Default::default()
+        };
+
+        let ddl = append_oracle_comments_to_ddl(
+            "CREATE TABLE \"SYSDBA\".\"USERS\" (\n  \"USER_NAME\" VARCHAR(50)\n);",
+            "SYSDBA",
+            "USERS",
+            Some("Users table"),
+            &[column],
+        );
+
+        assert!(ddl.contains("CREATE TABLE \"SYSDBA\".\"USERS\""));
+        assert!(ddl.contains("COMMENT ON TABLE \"SYSDBA\".\"USERS\" IS 'Users table';"));
+        assert!(ddl.contains("COMMENT ON COLUMN \"SYSDBA\".\"USERS\".\"USER_NAME\" IS 'User name comment';"));
+    }
 }
 
 #[cfg(test)]
@@ -12825,6 +13104,12 @@ mod ddl_tests {
         assert_table_ddl_options(TableDdlOptions::EXPORT, true, true, false);
         assert_table_ddl_options(TableDdlOptions::RELATION_EXPORT, false, true, false);
         assert_table_ddl_options(TableDdlOptions::DISPLAY, true, false, true);
+    }
+
+    #[test]
+    fn table_transfer_requests_portable_oracle_ddl_for_one_relation() {
+        // Reused Oracle DDL must not carry source tablespaces into the target (#11939).
+        assert_table_ddl_options(TableDdlOptions::TRANSFER, false, true, false);
     }
 
     #[test]
@@ -13124,6 +13409,37 @@ mod ddl_tests {
         let ddl = render_postgres_table_ddl("public", "orders", &[id], &[], &[], None);
 
         assert!(ddl.contains("\"id\" bigint DEFAULT nextval('shared.custom_id_source'::regclass)"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn postgres_export_ddl_infers_standard_serial_defaults() {
+        // #13058: a standalone export must not keep `bigint DEFAULT nextval(...)`
+        // for the standard serial sequence, because restoring the SQL would
+        // reference a sequence that was never created.
+        for (data_type, serial_type) in [("smallint", "smallserial"), ("integer", "serial"), ("bigint", "bigserial")] {
+            let ddl = format!(
+                "CREATE TABLE \"public\".\"ceshi\" (\n  \"ID\" {data_type} DEFAULT nextval('\"ceshi_ID_seq\"'::regclass) NOT NULL,\n  \"name\" text\n)"
+            );
+            let rewritten = rewrite_postgres_standard_serial_defaults(&ddl, "public");
+            assert!(rewritten.contains(&format!("\"ID\" {serial_type} NOT NULL")), "ddl: {rewritten}");
+            assert!(!rewritten.contains("nextval("), "ddl: {rewritten}");
+        }
+
+        // A schema-qualified standard sequence name is also recognized.
+        let ddl = "CREATE TABLE \"app\".\"ceshi\" (\n  \"ID\" bigint DEFAULT nextval('\"app\".\"ceshi_ID_seq\"'::regclass)\n)";
+        let rewritten = rewrite_postgres_standard_serial_defaults(ddl, "app");
+        assert!(rewritten.contains("\"ID\" bigserial"), "ddl: {rewritten}");
+        assert!(!rewritten.contains("nextval("), "ddl: {rewritten}");
+
+        // Custom/shared sequences keep the explicit default.
+        let custom = "CREATE TABLE \"public\".\"orders\" (\n  \"id\" bigint DEFAULT nextval('shared.custom_id_source'::regclass) NOT NULL\n)";
+        assert_eq!(rewrite_postgres_standard_serial_defaults(custom, "public"), custom);
+
+        // A standard-looking sequence name that lives in another schema belongs to
+        // a shared or manually attached sequence: keep the explicit default, or a
+        // restore would re-bind the column to a fresh sequence.
+        let shared = "CREATE TABLE \"public\".\"ceshi\" (\n  \"ID\" bigint DEFAULT nextval('\"app\".\"ceshi_ID_seq\"'::regclass) NOT NULL\n)";
+        assert_eq!(rewrite_postgres_standard_serial_defaults(shared, "public"), shared);
     }
 
     #[test]
@@ -15622,6 +15938,71 @@ pub async fn opentenbase_ddl(
     }
 }
 
+/// Whether a `nextval` sequence is the standard `<table>_<column>_seq` serial
+/// sequence for this column, and which serial spelling it maps to.
+fn postgres_serial_type_for_sequence(
+    table: &str,
+    table_schema: &str,
+    column: &str,
+    data_type: &str,
+    sequence: &str,
+) -> Option<&'static str> {
+    // A schema-qualified reference must point into the table's own schema: a
+    // shared or manually attached sequence in another schema that merely matches
+    // the standard name pattern must keep its explicit default, otherwise a
+    // restore would re-bind the column to a freshly created sequence.
+    if let Some((sequence_schema, _)) = sequence.split_once('.') {
+        let sequence_schema = sequence_schema.trim().trim_matches('"').replace("\"\"", "\"");
+        if !sequence_schema.eq_ignore_ascii_case(table_schema) {
+            return None;
+        }
+    }
+    let unqualified = sequence.rsplit('.').next().unwrap_or(sequence).trim().trim_matches('"').replace("\"\"", "\"");
+    if !unqualified.eq_ignore_ascii_case(&format!("{table}_{column}_seq")) {
+        return None;
+    }
+    match data_type.trim().to_ascii_lowercase().as_str() {
+        "smallint" | "int2" => Some("smallserial"),
+        "integer" | "int" | "int4" => Some("serial"),
+        "bigint" | "int8" => Some("bigserial"),
+        _ => None,
+    }
+}
+
+/// Rewrites standard serial defaults in an exported PostgreSQL table DDL.
+///
+/// `BIGSERIAL` is stored as `bigint DEFAULT nextval('<table>_<column>_seq'::regclass)`.
+/// The renderer keeps that spelling when the metadata does not carry the serial
+/// marker, which is correct for transfers (the sequence is copied separately) but
+/// not for a standalone export: restoring the exported SQL would reference a
+/// sequence that was never created. Rewrite only the standard serial sequence
+/// name; shared/custom sequences keep their explicit default.
+fn rewrite_postgres_standard_serial_defaults(ddl: &str, table_schema: &str) -> String {
+    let create_table = Regex::new(r#"(?i)^CREATE TABLE\s+(?:"(?:[^"]|"")*"\.)?"((?:[^"]|"")*)""#).unwrap();
+    let serial_column = Regex::new(
+        r#"(?i)^(\s*)"((?:[^"]|"")*)"\s+(smallint|integer|bigint)\s+DEFAULT\s+nextval\('([^']*)'::regclass\)(.*)$"#,
+    )
+    .unwrap();
+    let mut current_table: Option<String> = None;
+    let mut output = Vec::with_capacity(ddl.len());
+    for line in ddl.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("CREATE TABLE ") {
+            current_table = create_table.captures(trimmed).map(|caps| caps[1].replace("\"\"", "\""));
+        } else if trimmed.starts_with(')') {
+            current_table = None;
+        }
+        let rewritten = current_table.as_deref().and_then(|table| {
+            let caps = serial_column.captures(line)?;
+            let column = caps[2].replace("\"\"", "\"");
+            let serial_type = postgres_serial_type_for_sequence(table, table_schema, &column, &caps[3], &caps[4])?;
+            Some(format!("{}\"{}\" {}{}", &caps[1], &caps[2], serial_type, &caps[5]))
+        });
+        output.push(rewritten.unwrap_or_else(|| line.to_string()));
+    }
+    output.join("\n")
+}
+
 pub fn render_postgres_table_ddl(
     schema: &str,
     table: &str,
@@ -16306,4 +16687,17 @@ fn render_sqlserver_table_ddl_details(
         ));
     }
     ddl
+}
+
+#[test]
+fn sanitize_ddl_string_removes_nul_characters() {
+    assert_eq!(
+        sanitize_ddl_string("CREATE TABLE t (id INT DEFAULT 0\0\0);".to_string()),
+        "CREATE TABLE t (id INT DEFAULT 0);"
+    );
+    assert_eq!(
+        sanitize_ddl_string("CREATE TABLE t (name VARCHAR DEFAULT ''\0\0);".to_string()),
+        "CREATE TABLE t (name VARCHAR DEFAULT '');"
+    );
+    assert_eq!(sanitize_ddl_string("no nul chars".to_string()), "no nul chars");
 }

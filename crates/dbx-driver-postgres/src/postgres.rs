@@ -1871,6 +1871,16 @@ fn mark_postgres_client_unnamed_statements(client: &deadpool_postgres::Client) {
     clients.insert(key, Arc::downgrade(statement_cache));
 }
 
+/// TBase (observed on v3.16.4.7) answers a request for binary result columns
+/// with text-format bytes for values read from tables, while values computed
+/// on the coordinator (a bare `SELECT 123::numeric`) are binary. Decoding that text as binary turns
+/// `numeric` into NULL and can misread other fixed-width types, so such
+/// servers are read through the text protocol only (issue #11601).
+/// OpenTenBase v2.6.0, the open-source branch, returns real binary values.
+fn postgres_server_ignores_binary_result_format(server_version: &str) -> bool {
+    server_version.contains("TBase")
+}
+
 fn postgres_typed_params<'a>(
     params: &[&'a (dyn tokio_postgres::types::ToSql + Sync)],
     param_types: &[Type],
@@ -2048,6 +2058,13 @@ async fn start_postgres_select_stream(
     force_unnamed: bool,
 ) -> Result<PostgresSelectStreamOutcome, PgError> {
     let client = &EncodingClient::new(client);
+    if postgres_client_requires_text_results(client).await {
+        let metadata = prepare_unnamed_select_metadata(client, sql).await?;
+        return Ok(PostgresSelectStreamOutcome::TextFallback {
+            column_types: metadata.column_types,
+            unsupported_type: "binary result format".to_string(),
+        });
+    }
     if force_unnamed || postgres_client_uses_unnamed_statements(client) {
         let metadata = prepare_unnamed_select_metadata(client, sql).await?;
         if let Some(unsupported_type) = metadata.unsupported_type {
@@ -2797,6 +2814,39 @@ fn postgres_notice_buffers() -> &'static Mutex<PostgresNoticeBuffers> {
     BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Connections whose server ignores the binary result format. Each entry holds
+/// the connection's notice buffer weakly, only as a liveness token, so it
+/// expires with the connection like the notice buffer itself.
+fn postgres_text_result_connections() -> &'static Mutex<PostgresNoticeBuffers> {
+    static CONNECTIONS: OnceLock<Mutex<PostgresNoticeBuffers>> = OnceLock::new();
+    CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mark_postgres_connection_text_results(key: &PostgresConnectionKey) {
+    let Some(buffer) = postgres_notice_buffers().lock().unwrap_or_else(|error| error.into_inner()).get(key).cloned()
+    else {
+        return;
+    };
+    let mut connections = postgres_text_result_connections().lock().unwrap_or_else(|error| error.into_inner());
+    connections.retain(|_, weak| weak.strong_count() > 0);
+    connections.insert(key.clone(), buffer);
+}
+
+async fn postgres_client_requires_text_results(client: &deadpool_postgres::Client) -> bool {
+    // Avoid resolving the connection identity for the common case of no such server.
+    if postgres_text_result_connections().lock().unwrap_or_else(|error| error.into_inner()).is_empty() {
+        return false;
+    }
+    let Some(key) = postgres_client_key(&EncodingClient::new(client)).await else {
+        return false;
+    };
+    postgres_text_result_connections()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .is_some_and(|weak| weak.strong_count() > 0)
+}
+
 /// Connection identity cache, keyed by the per-physical-connection statement
 /// cache pointer (same identity pattern as `postgres_single_schema_clients`).
 /// The `Weak` guards against pointer reuse: a new connection whose
@@ -2968,6 +3018,8 @@ where
             // is tried (issue #10955).
             let pg_config = pin_postgres_hostaddr(&pg_config).await;
             let (client, mut connection) = pg_config.connect(tls).await?;
+            let ignores_binary_results =
+                connection.parameter("server_version").is_some_and(postgres_server_ignores_binary_result_format);
             // No query can complete before the connection is being driven, so
             // the notice buffer is handed to the driver task through a slot
             // that is filled once the backend PID is known.
@@ -2997,7 +3049,9 @@ where
                         // LISTEN/NOTIFY messages are not surfaced anywhere.
                         Some(Ok(_)) => {}
                         Some(Err(err)) => {
-                            log::warn!("[postgres] connection driver error: {err}");
+                            // `tokio_postgres::Error`'s `Display` omits the underlying
+                            // I/O error, which is the only clue to why the socket died.
+                            log::warn!("[postgres] connection driver error: {}", error_with_sources_to_string(&err));
                             break;
                         }
                         None => break,
@@ -3013,9 +3067,13 @@ where
                     let buffer = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
                     let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     buffers.retain(|_, weak| weak.strong_count() > 0);
-                    buffers.insert(key, Arc::downgrade(&buffer));
+                    buffers.insert(key.clone(), Arc::downgrade(&buffer));
                     drop(buffers);
                     *notice_buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(buffer);
+                    if ignores_binary_results {
+                        log::info!("[postgres][server_version] binary result format unsupported, using text protocol");
+                        mark_postgres_connection_text_results(&key);
+                    }
                 }
             }
 
@@ -3809,8 +3867,12 @@ fn list_opengauss_databases_sql() -> &'static str {
      ORDER BY datname"
 }
 
-fn database_metadata_sql() -> &'static str {
-    "SELECT d.datname, \
+fn database_metadata_sql(shared_comments: bool) -> String {
+    // Database comments are shared objects on PostgreSQL and openGauss, but
+    // other PG-protocol servers must keep their existing catalog query.
+    let comment_function = if shared_comments { "shobj_description" } else { "obj_description" };
+    format!(
+        "SELECT d.datname, \
             CASE \
               WHEN has_database_privilege(d.datname, 'CONNECT') \
                 OR COALESCE(( \
@@ -3821,11 +3883,12 @@ fn database_metadata_sql() -> &'static str {
               THEN pg_database_size(d.oid) \
               ELSE NULL \
             END AS size_bytes, \
-            obj_description(d.oid, 'pg_database') AS comment, \
+            {comment_function}(d.oid, 'pg_database') AS comment, \
             pg_encoding_to_char(d.encoding) AS default_charset \
      FROM pg_database d \
      WHERE datallowconn = true \
      ORDER BY d.datname"
+    )
 }
 
 fn database_storage_sql() -> &'static str {
@@ -3889,10 +3952,11 @@ pub async fn list_opengauss_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, 
         .collect())
 }
 
-pub async fn list_database_metadata(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
+pub async fn list_database_metadata(pool: &Pool, shared_comments: bool) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let client = &EncodingClient::new(&client);
-    let rows = postgres_query_cached(client, database_metadata_sql(), &[]).await.map_err(|e| e.to_string())?;
+    let sql = database_metadata_sql(shared_comments);
+    let rows = postgres_query_cached(client, &sql, &[]).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| DatabaseInfo {
@@ -5113,15 +5177,14 @@ fn postgres_columns_for_relations_query_tiers() -> [&'static str; 3] {
 // 4880): same column list and detection logic (identity/serial inference,
 // numeric precision/scale, enum values), batched by oid instead of a single
 // (schema, table) pair. Kept as a separate literal rather than sharing a
-// fragment — `pg_class` needs the `c` alias here for the oid filter, which
-// pushes `information_schema.columns` to `ic` instead of the single-relation
-// version's `c`, and every column's position in the SELECT list is relied on
+// fragment — `pg_class` needs the `c` alias here for the oid filter,
+// and every column's position in the SELECT list is relied on
 // positionally by `column_info_from_row_offset`. A change to one almost
 // certainly needs the same change in the other.
 fn postgres_columns_for_relations_sql() -> &'static str {
     "SELECT c.oid::bigint AS relid, a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(ic.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              CASE WHEN a.attgenerated <> '' THEN NULL ELSE pg_get_expr(ad.adbin, ad.adrelid) END AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -5157,7 +5220,6 @@ fn postgres_columns_for_relations_sql() -> &'static str {
                               FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]') END AS enum_values \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
@@ -5183,8 +5245,6 @@ fn postgres_columns_for_relations_sql() -> &'static str {
                LIMIT 1 \
              ) dep ON TRUE \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
-             LEFT JOIN information_schema.columns ic \
-               ON ic.table_schema = n.nspname AND ic.table_name = c.relname AND ic.column_name = a.attname \
              WHERE c.oid = ANY($1::bigint[]) \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY c.oid, a.attnum"
@@ -5195,7 +5255,7 @@ fn postgres_columns_for_relations_sql() -> &'static str {
 fn postgres_columns_for_relations_compat_sql() -> &'static str {
     "SELECT c.oid::bigint AS relid, a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(ic.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -5220,7 +5280,6 @@ fn postgres_columns_for_relations_compat_sql() -> &'static str {
              NULL::text AS enum_values \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN pg_catalog.pg_class serial_seq ON serial_seq.oid = ( \
@@ -5243,8 +5302,6 @@ fn postgres_columns_for_relations_compat_sql() -> &'static str {
                ORDER BY sequence_dep.objid \
                LIMIT 1 \
              ) AND serial_seq.relkind = 'S' \
-             LEFT JOIN information_schema.columns ic \
-               ON ic.table_schema = n.nspname AND ic.table_name = c.relname AND ic.column_name = a.attname \
              WHERE c.oid = ANY($1::bigint[]) \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY c.oid, a.attnum"
@@ -5414,6 +5471,7 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
              LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
              WHERE t.oid = ANY($1::bigint[]) \
+             AND k.attnum >= 0 \
              GROUP BY t.oid, i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY t.oid, i.relname"
 }
@@ -5429,6 +5487,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS columns, \
              ARRAY( \
@@ -5442,6 +5501,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum > 0 \
                LEFT JOIN pg_opclass oc \
                  ON oc.oid = (string_to_array(ix.indclass::text, ' '))[pos.n]::oid \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
@@ -5458,6 +5518,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
@@ -8045,7 +8106,7 @@ pub async fn list_schema_infos_with_system(pool: &Pool, show_system_schemas: boo
 // note there about why these aren't merged into a shared fragment.
 const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(c.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              CASE WHEN a.attgenerated <> '' THEN NULL ELSE pg_get_expr(ad.adbin, ad.adrelid) END AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -8081,8 +8142,6 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
                               FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]') END AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
-             JOIN pg_class relation_class ON relation_class.oid = a.attrelid \
-             JOIN pg_namespace relation_namespace ON relation_namespace.oid = relation_class.relnamespace \
              LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN LATERAL ( \
@@ -8107,9 +8166,7 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
                LIMIT 1 \
              ) dep ON TRUE \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
-             LEFT JOIN information_schema.columns c \
-               ON c.table_schema = relation_namespace.nspname AND c.table_name = relation_class.relname AND c.column_name = a.attname \
-             WHERE a.attrelid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -8117,7 +8174,7 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
 // 3148) — see the note on `POSTGRES_COLUMNS_SQL` above.
 const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
-             COALESCE(c.is_nullable = 'YES', NOT a.attnotnull) AS is_nullable, \
+             NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable, \
              pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
@@ -8142,8 +8199,6 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
              NULL::text AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
-             JOIN pg_class relation_class ON relation_class.oid = a.attrelid \
-             JOIN pg_namespace relation_namespace ON relation_namespace.oid = relation_class.relnamespace \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN pg_catalog.pg_class serial_seq ON serial_seq.oid = ( \
                SELECT sequence_dep.objid \
@@ -8165,9 +8220,7 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
                ORDER BY sequence_dep.objid \
                LIMIT 1 \
              ) AND serial_seq.relkind = 'S' \
-             LEFT JOIN information_schema.columns c \
-               ON c.table_schema = relation_namespace.nspname AND c.table_name = relation_class.relname AND c.column_name = a.attname \
-             WHERE a.attrelid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -8195,7 +8248,7 @@ const POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL: &str = "SELECT c.column_name, \
              CAST(c.character_maximum_length AS int) AS character_maximum_length, \
              NULL::text AS enum_values \
              FROM information_schema.columns c \
-             WHERE c.table_schema = (CASE WHEN coalesce(length($1), 0) = 0 THEN current_schema() ELSE $1 END) \
+             WHERE c.table_schema = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN current_schema() ELSE $1 END) \
              AND c.table_name = $2 \
              ORDER BY c.ordinal_position";
 
@@ -8502,6 +8555,42 @@ fn is_postgres_user_placeholder(element: &str) -> bool {
     matches!(element, "$user" | "\"$user\"")
 }
 
+fn postgres_quoted_search_path_elements(configured: &str) -> Vec<String> {
+    let mut elements = Vec::new();
+    // Match PostgreSQL's scanner_isspace; Unicode whitespace can be name data.
+    let is_space = |ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}');
+    let mut remaining = configured.trim_matches(is_space);
+    // The server has already validated this GUC list. Its unquoted names can
+    // contain punctuation that SQL identifiers require us to quote.
+    while !remaining.is_empty() {
+        let quoted = remaining.starts_with('"');
+        let mut end = remaining.len();
+        if quoted {
+            let mut chars = remaining.char_indices().skip(1).peekable();
+            while let Some((index, ch)) = chars.next() {
+                if ch == '"' {
+                    if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                        chars.next();
+                    } else {
+                        end = index + 1;
+                        break;
+                    }
+                }
+            }
+        } else if let Some(index) = remaining.find(',') {
+            end = index;
+        }
+        let (element, rest) = remaining.split_at(end);
+        elements.push(if quoted {
+            element.to_string()
+        } else {
+            pg_quote_ident(&element.trim_matches(is_space).to_ascii_lowercase())
+        });
+        remaining = rest.trim_start_matches(is_space).strip_prefix(',').unwrap_or("").trim_start_matches(is_space);
+    }
+    elements
+}
+
 fn postgres_set_preserved_search_path_sql(
     schema: &str,
     context: PostgresSearchPathContext,
@@ -8515,7 +8604,6 @@ fn postgres_set_preserved_search_path_sql(
     } else {
         ""
     };
-    let configured = baseline.configured.trim();
     // Redshift rejects the "$user" placeholder inside `SET search_path` even
     // though `current_setting('search_path')` reports it, so any preserved-path
     // statement containing the element fails with a syntax error. Drop the
@@ -8523,25 +8611,20 @@ fn postgres_set_preserved_search_path_sql(
     // also mangle ordinary identifiers containing that substring); keeping the
     // placeholder is pointless while switching schemas anyway because the
     // selected schema is already prepended first.
-    let configured_elements: Vec<&str> = configured.split(',').map(str::trim).collect();
+    let configured_elements = postgres_quoted_search_path_elements(&baseline.configured);
     let drops_user_placeholder = configured_elements.iter().any(|element| is_postgres_user_placeholder(element));
-    let configured = if drops_user_placeholder {
-        configured_elements
-            .iter()
-            .filter(|element| !is_postgres_user_placeholder(element))
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        configured.to_string()
-    };
+    let configured = configured_elements
+        .iter()
+        .filter(|element| !is_postgres_user_placeholder(element))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
     let selected_schema = pg_quote_ident(schema);
     // The first resolved schema can come from "$user". Once that placeholder is
     // removed for compatible servers, the selected schema must replace it unless
     // the configured path also contains that schema explicitly.
-    let selected_schema_is_explicit = configured_elements
-        .iter()
-        .any(|element| !is_postgres_user_placeholder(element) && (*element == schema || *element == selected_schema));
+    let selected_schema_is_explicit =
+        configured_elements.iter().any(|element| !is_postgres_user_placeholder(element) && *element == selected_schema);
     let selected_schema_was_removed = drops_user_placeholder
         && baseline.first_resolved_schema.as_deref() == Some(schema)
         && !selected_schema_is_explicit;
@@ -9677,6 +9760,13 @@ pub async fn execute_query_on_client_unnamed(
 // relation: a FOREIGN KEY stores the referenced table's unique index in
 // `conindid`, so matching on `conindid` alone marked that standalone index as
 // constraint-backed and dropped it from generated DDL (#10484).
+//
+// `AND k.attnum >= 0` skips system attributes (negative `indkey` entries such as
+// `tableoid`) that openGauss / GaussDB can carry in `pg_index.indkey`: because the
+// `pg_attribute` join is restricted to `attnum > 0`, `pg_get_indexdef` would
+// otherwise render the raw system-column name as a key part and the UI would show
+// a bogus `tableoid` column. Only non-negative attnums (0 = expression, positive =
+// user column) are real, displayable index key parts.
 const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              array_agg(COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
              array_agg(CASE WHEN oc.opcdefault THEN NULL ELSE quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname) END ORDER BY k.n) AS column_opclasses, \
@@ -9699,12 +9789,18 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
              LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
              LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
-             WHERE t.oid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             AND k.attnum >= 0 \
              GROUP BY i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY i.relname";
 
 // Compat-tier sibling of `postgres_indexes_for_relations_compat_sql` (~line
 // 3312) — see the note on `POSTGRES_INDEXES_SQL` above.
+//
+// The opclass subquery has to join `pg_opclass` before its WHERE: a JOIN after
+// WHERE is a syntax error, and this tier is the only one GaussDB / openGauss
+// ever run (`list_indexes_compat_first`), so the misordered join broke every
+// index listing there with `syntax error at or near "LEFT"` (#12650, #12675).
 const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              ARRAY( \
                SELECT COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, pos.n, false)) \
@@ -9713,6 +9809,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS columns, \
              ARRAY( \
@@ -9726,6 +9823,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum > 0 \
                LEFT JOIN pg_opclass oc \
                  ON oc.oid = (string_to_array(ix.indclass::text, ' '))[pos.n]::oid \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
@@ -9742,6 +9840,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                  ON a.attrelid = t.oid \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
+               WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 \
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
@@ -9751,7 +9850,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
-             WHERE t.oid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              ORDER BY i.relname";
 
 const POSTGRES_OWNERS_SQL: &str =
@@ -10277,12 +10376,7 @@ pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInf
         .iter()
         .map(|row| {
             let def: String = pg_row_try_string(row, 3);
-            // Remove schema qualification from CREATE FUNCTION statement
-            // to avoid false differences when comparing across schemas.
-            // Handle both "schema.name" and schema.name formats.
-            let normalized_def = def
-                .replace(&format!("CREATE OR REPLACE FUNCTION \"{}\".", schema), "CREATE OR REPLACE FUNCTION ")
-                .replace(&format!("CREATE OR REPLACE FUNCTION {}.", schema), "CREATE OR REPLACE FUNCTION ");
+            let normalized_def = strip_routine_schema_qualifier(&def, schema);
             FunctionInfo {
                 name: pg_row_try_string(row, 0),
                 function_type: pg_row_try_string(row, 1),
@@ -10292,6 +10386,20 @@ pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInf
             }
         })
         .collect())
+}
+
+/// Remove the schema qualification that `pg_get_functiondef` puts on the routine
+/// name, so routines in differently named schemas compare equal.
+fn strip_routine_schema_qualifier(definition: &str, schema: &str) -> String {
+    let quoted_schema = pg_quote_ident(schema);
+    for kind in ["FUNCTION", "PROCEDURE"] {
+        for qualifier in [quoted_schema.as_str(), schema] {
+            if let Some(rest) = definition.strip_prefix(&format!("CREATE OR REPLACE {kind} {qualifier}.")) {
+                return format!("CREATE OR REPLACE {kind} {rest}");
+            }
+        }
+    }
+    definition.to_string()
 }
 
 fn postgres_sequences_sql() -> &'static str {
@@ -11924,6 +12032,15 @@ mod tests {
     }
 
     #[test]
+    fn tbase_server_version_requires_text_results() {
+        assert!(postgres_server_ignores_binary_result_format(
+            "10.0 @ TBase_v3.16.4.7 (commit: afc4893aa) 2024-08-06 14:20:47"
+        ));
+        assert!(!postgres_server_ignores_binary_result_format("10.0 OpenTenBase V2"));
+        assert!(!postgres_server_ignores_binary_result_format("17.10 (Debian 17.10-1.pgdg12+1)"));
+    }
+
+    #[test]
     fn postgres_custom_other_type_requires_text_protocol() {
         assert!(pg_scalar_type_requires_text_protocol(8_880, PgColType::Other));
         assert!(pg_scalar_type_requires_text_protocol(98_765, PgColType::Other));
@@ -12134,8 +12251,66 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("application", PostgresSearchPathContext::Query, &baseline),
-            "SET search_path TO application, extensions, public, pg_catalog"
+            "SET search_path TO \"application\", \"extensions\", \"public\", pg_catalog"
         );
+    }
+
+    #[test]
+    fn postgres_search_path_quotes_preserved_identifiers() {
+        for (configured, first_schema, selected_schema, expected_path) in [
+            (
+                "certification-lvpeng3, public",
+                "certification-lvpeng3",
+                "certification-lvpeng3",
+                r#""certification-lvpeng3", "public", pg_catalog"#,
+            ),
+            (
+                "certification-lvpeng3, public",
+                "certification-lvpeng3",
+                "other-schema",
+                r#""other-schema", "certification-lvpeng3", "public", pg_catalog"#,
+            ),
+            (
+                r#""tenant,alpha", "$user", public"#,
+                "tenant,alpha",
+                "tenant,alpha",
+                r#""tenant,alpha", "public", pg_catalog"#,
+            ),
+            (r#""a""b", public"#, "a\"b", "a\"b", r#""a""b", "public", pg_catalog"#),
+            (r#"foo"bar, public"#, "foo\"bar", "foo\"bar", r#""foo""bar", "public", pg_catalog"#),
+            ("MiXeD-Name, public", "mixed-name", "mixed-name", r#""mixed-name", "public", pg_catalog"#),
+            (r#""MiXeD Name", public"#, "MiXeD Name", "MiXeD Name", r#""MiXeD Name", "public", pg_catalog"#),
+            ("select, public", "select", "select", r#""select", "public", pg_catalog"#),
+            ("APPLICATION, $user, public", "application", "application", r#""application", "public", pg_catalog"#),
+            ("$USER, public", "public", "application", r#""application", "public", pg_catalog"#),
+            (r#""$USER", public"#, "$USER", "$USER", r#""$USER", "public", pg_catalog"#),
+            ("\u{2003}tenant,public", "\u{2003}tenant", "\u{2003}tenant", "\"\u{2003}tenant\", \"public\", pg_catalog"),
+            ("tenant\u{2003},public", "tenant\u{2003}", "tenant\u{2003}", "\"tenant\u{2003}\", \"public\", pg_catalog"),
+            (
+                "\u{b}application\u{b},\u{c}public\u{c}",
+                "application",
+                "application",
+                r#""application", "public", pg_catalog"#,
+            ),
+        ] {
+            let baseline = PostgresSearchPathBaseline {
+                configured: configured.to_string(),
+                first_resolved_schema: Some(first_schema.to_string()),
+                has_explicit_pg_catalog: false,
+            };
+            for (context, scope) in [
+                (PostgresSearchPathContext::Query, ""),
+                (PostgresSearchPathContext::Transaction, ""),
+                (PostgresSearchPathContext::LocalTransaction, " LOCAL"),
+                (PostgresSearchPathContext::LocalQueryTransaction, " LOCAL"),
+            ] {
+                assert_eq!(
+                    postgres_set_preserved_search_path_sql(selected_schema, context, &baseline),
+                    format!("SET{scope} search_path TO {expected_path}"),
+                    "configured={configured:?}, selected={selected_schema:?}, context={context:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -12147,7 +12322,7 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("application", PostgresSearchPathContext::Query, &baseline),
-            "SET search_path TO \"application\", extensions, public, pg_catalog"
+            "SET search_path TO \"application\", \"extensions\", \"public\", pg_catalog"
         );
         assert_eq!(
             postgres_set_preserved_search_path_sql(
@@ -12155,7 +12330,7 @@ mod tests {
                 PostgresSearchPathContext::LocalQueryTransaction,
                 &baseline,
             ),
-            "SET LOCAL search_path TO \"application\", extensions, public, pg_catalog"
+            "SET LOCAL search_path TO \"application\", \"extensions\", \"public\", pg_catalog"
         );
     }
 
@@ -12168,7 +12343,7 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &baseline),
-            "SET search_path TO \"dwd_views\", public, pg_catalog"
+            "SET search_path TO \"dwd_views\", \"public\", pg_catalog"
         );
 
         let bare_baseline = PostgresSearchPathBaseline {
@@ -12178,7 +12353,7 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &bare_baseline),
-            "SET search_path TO \"dwd_views\", public, pg_catalog"
+            "SET search_path TO \"dwd_views\", \"public\", pg_catalog"
         );
     }
 
@@ -12192,7 +12367,7 @@ mod tests {
 
         assert_eq!(
             postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &baseline),
-            "SET search_path TO \"dbx_test\", public, pg_catalog"
+            "SET search_path TO \"dbx_test\", \"public\", pg_catalog"
         );
 
         let explicit_baseline = PostgresSearchPathBaseline {
@@ -12202,7 +12377,7 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &explicit_baseline),
-            "SET search_path TO dbx_test, public, pg_catalog"
+            "SET search_path TO \"dbx_test\", \"public\", pg_catalog"
         );
     }
 
@@ -12259,7 +12434,7 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &baseline),
-            "SET search_path TO \"dwd_views\", my$user_schema, \"$user_backup\", public, pg_catalog"
+            "SET search_path TO \"dwd_views\", \"my$user_schema\", \"$user_backup\", \"public\", pg_catalog"
         );
     }
 
@@ -12272,7 +12447,7 @@ mod tests {
         };
         assert_eq!(
             postgres_set_preserved_search_path_sql("application", PostgresSearchPathContext::Query, &baseline),
-            "SET search_path TO \"application\", extensions, pg_catalog, public"
+            "SET search_path TO \"application\", \"extensions\", \"pg_catalog\", \"public\""
         );
     }
 
@@ -12362,6 +12537,22 @@ mod tests {
     fn database_list_does_not_collect_storage_usage() {
         assert!(list_databases_sql().contains("pg_database"));
         assert!(!list_databases_sql().contains("pg_database_size"));
+    }
+
+    #[test]
+    fn database_metadata_reads_shared_database_comments() {
+        let sql = database_metadata_sql(true);
+        assert!(sql.contains("shobj_description(d.oid, 'pg_database') AS comment"));
+        assert!(sql.contains("FROM pg_database d"));
+        assert!(sql.contains("has_database_privilege"));
+        assert!(sql.contains("pg_database_size(d.oid)"));
+    }
+
+    #[test]
+    fn database_metadata_keeps_legacy_comments_for_other_pg_servers() {
+        let sql = database_metadata_sql(false);
+        assert!(sql.contains("obj_description(d.oid, 'pg_database') AS comment"));
+        assert!(!sql.contains("shobj_description"));
     }
 
     #[test]
@@ -12613,8 +12804,7 @@ mod tests {
             return None;
         }
 
-        let port = portpicker::pick_unused_port().expect("pick unused postgres port");
-        let container = DockerPostgres { name: format!("dbx-postgres-enum-{}", uuid::Uuid::new_v4()), port };
+        let mut container = DockerPostgres { name: format!("dbx-postgres-enum-{}", uuid::Uuid::new_v4()), port: 0 };
 
         let status = Command::new("docker")
             .args(["run", "-d", "--rm", "--name", &container.name])
@@ -12627,13 +12817,29 @@ mod tests {
                 "-e",
                 "POSTGRES_DB=postgres",
                 "-p",
-                &format!("{port}:5432"),
+                "127.0.0.1::5432",
                 image,
             ])
             .args(postgres_args)
             .status()
             .expect("start docker postgres");
         assert!(status.success(), "docker run postgres container should succeed");
+
+        let binding = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{(index (index .NetworkSettings.Ports \"5432/tcp\") 0).HostPort}}",
+                &container.name,
+            ])
+            .output()
+            .expect("inspect docker postgres port");
+        assert!(binding.status.success(), "docker inspect postgres port should succeed");
+        container.port = String::from_utf8(binding.stdout)
+            .expect("docker postgres port is UTF-8")
+            .trim()
+            .parse()
+            .expect("docker postgres port is a u16");
 
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -14382,8 +14588,10 @@ mod tests {
         assert!(POSTGRES_COLUMNS_SQL.contains("pg_sequence"));
         assert!(POSTGRES_COLUMNS_SQL.contains("generated by default as identity"));
         assert!(POSTGRES_COLUMNS_SQL.contains("generated always as identity"));
-        assert!(POSTGRES_COLUMNS_SQL.contains("COALESCE(c.is_nullable = 'YES', NOT a.attnotnull)"));
-        assert!(POSTGRES_COLUMNS_SQL.contains("LEFT JOIN information_schema.columns"));
+        assert!(
+            POSTGRES_COLUMNS_SQL.contains("NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable")
+        );
+        assert!(!POSTGRES_COLUMNS_SQL.contains("information_schema.columns"));
         assert!(POSTGRES_COLUMNS_SQL.contains("pg_enum"));
         assert!(POSTGRES_COLUMNS_SQL.contains("AS enum_values"));
     }
@@ -14391,18 +14599,18 @@ mod tests {
     #[test]
     fn postgres_single_relation_metadata_can_resolve_through_search_path() {
         // GaussDB A mode folds `''` to NULL, so `$1 = ''` is never true there and the
-        // unqualified branch was skipped (issue #12198). `coalesce(length($1), 0) = 0`
+        // unqualified branch was skipped (issue #12198). `coalesce(length($1::text), 0) = 0`
         // matches both NULL and the empty string on every PostgreSQL-compatible kernel.
         for sql in [POSTGRES_COLUMNS_SQL, POSTGRES_COLUMNS_COMPAT_SQL] {
-            assert!(sql.contains("CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2)"), "{sql}");
-            assert!(sql.contains("c.table_schema = relation_namespace.nspname"));
+            assert!(sql.contains("CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2)"), "{sql}");
+            assert!(!sql.contains("information_schema.columns"));
         }
         for sql in [POSTGRES_INDEXES_SQL, POSTGRES_INDEXES_COMPAT_SQL] {
-            assert!(sql.contains("t.oid = (CASE WHEN coalesce(length($1), 0) = 0 THEN quote_ident($2)"), "{sql}");
+            assert!(sql.contains("t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2)"), "{sql}");
         }
         assert!(
             POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL
-                .contains("CASE WHEN coalesce(length($1), 0) = 0 THEN current_schema() ELSE $1 END"),
+                .contains("CASE WHEN coalesce(length($1::text), 0) = 0 THEN current_schema() ELSE $1 END"),
             "{POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL}"
         );
     }
@@ -14486,10 +14694,12 @@ mod tests {
         assert_eq!(column_tiers.len(), 3);
         assert!(column_tiers.iter().all(|sql| sql.contains("c.oid = ANY($1::bigint[])")));
         assert!(column_tiers[0].contains("a.attgenerated"));
+        assert!(!column_tiers[0].contains("information_schema.columns"));
         assert!(!column_tiers[1].contains("a.attgenerated"));
         assert!(!column_tiers[1].contains("pg_sequence"));
         assert!(column_tiers[1].contains("sequence_dep.deptype = 'a'"));
         assert!(!column_tiers[1].contains("LEFT JOIN LATERAL"));
+        assert!(!column_tiers[1].contains("information_schema.columns"));
         assert!(column_tiers[2].contains("information_schema.columns"));
         assert!(!column_tiers[2].contains("pg_attribute"));
 
@@ -14543,10 +14753,27 @@ mod tests {
         assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("pg_sequence"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("AS column_extra"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("col_description"));
-        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("COALESCE(c.is_nullable = 'YES', NOT a.attnotnull)"));
-        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("LEFT JOIN information_schema.columns"));
+        assert!(POSTGRES_COLUMNS_COMPAT_SQL
+            .contains("NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable"));
+        assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("information_schema.columns"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("NULL::text AS enum_values"));
         assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("pg_enum"));
+    }
+
+    #[test]
+    fn postgres_columns_queries_avoid_information_schema_columns_join() {
+        // Issue #12393: information_schema.columns join took 34-42s in GaussDB/openGauss/PG.
+        // Direct catalog query using pg_type domain nullability drops it to <1s.
+        for sql in [
+            POSTGRES_COLUMNS_SQL,
+            POSTGRES_COLUMNS_COMPAT_SQL,
+            postgres_columns_for_relations_sql(),
+            postgres_columns_for_relations_compat_sql(),
+        ] {
+            assert!(sql.contains("NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable"), "{sql}");
+            assert!(!sql.contains("information_schema.columns"), "{sql}");
+            assert!(!sql.contains("relation_namespace"), "{sql}");
+        }
     }
 
     #[test]
@@ -15441,6 +15668,39 @@ mod tests {
     }
 
     #[test]
+    fn postgres_index_metadata_skips_system_columns() {
+        // openGauss / GaussDB can carry system attributes (negative `indkey` entries such as
+        // `tableoid`) inside `pg_index.indkey`. The `pg_attribute` join only matches `attnum > 0`,
+        // so without an explicit attnum guard `pg_get_indexdef` renders the raw system-column
+        // name and the object browser shows a bogus `tableoid` key part.
+        for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
+            assert!(sql.contains("AND k.attnum >= 0"), "expected system-column guard in {sql}");
+        }
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            assert!(
+                sql.contains("WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0"),
+                "expected system-column guard in {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_index_metadata_sql_has_valid_join_order() {
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            assert!(
+                !sql.contains("WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0 LEFT JOIN"),
+                "WHERE clause must not precede LEFT JOIN in {sql}"
+            );
+            let opclass_pos = sql.find("LEFT JOIN pg_opclass oc").expect("must contain opclass join");
+            let col_opclasses_end = sql.find(") AS column_opclasses").expect("must contain column_opclasses");
+            let where_pos = sql[opclass_pos..col_opclasses_end]
+                .find("WHERE (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 >= 0")
+                .expect("must contain where guard after opclass join");
+            assert!(where_pos > 0, "WHERE guard must appear after LEFT JOIN pg_opclass oc in column_opclasses");
+        }
+    }
+
+    #[test]
     fn postgres_index_metadata_tracks_per_key_ordering_without_include_columns() {
         for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
             assert!(sql.contains("ix.indoption[(k.n - 1)::int]"));
@@ -15449,6 +15709,50 @@ mod tests {
         for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
             assert!(sql.contains("string_to_array(ix.indoption::text, ' ')") && sql.contains("AS key_options"));
         }
+    }
+
+    #[test]
+    fn compat_index_queries_keep_the_opclass_join_before_the_where_clause() {
+        // Both compat queries used to build the opclass subquery as
+        // `FROM generate_series(...) LEFT JOIN pg_attribute ... WHERE <key filter> LEFT JOIN pg_opclass ...`.
+        // A JOIN after WHERE is a syntax error, and GaussDB / openGauss never run the modern tier
+        // (`list_indexes_compat_first`), so every index listing — and every schema comparison that
+        // loads one — died with `syntax error at or near "LEFT"` on the opclass join (#12650, #12675).
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(compact.matches("LEFT JOIN pg_opclass oc").count(), 1, "expected one opclass join in {sql}");
+            assert!(!compact.contains(">= 0 LEFT JOIN"), "a JOIN after the key filter's WHERE is invalid: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn compat_index_query_parses_and_reports_index_columns() {
+        // The compat tier is the only tier GaussDB and openGauss ever run, so it has to be valid
+        // SQL against a real server and not merely a plausible-looking string (#12650, #12675).
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let timeout = crate::db::connection_timeout();
+        let client = checkout_postgres_client(&pool, None, timeout).await.expect("checkout client");
+        let table = format!("dbx_compat_index_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS public.{table}; \
+                 CREATE TABLE public.{table} (id int PRIMARY KEY, email text, tag text); \
+                 CREATE INDEX {table}_email_tag ON public.{table} (email, tag)"
+            ))
+            .await
+            .expect("create index fixtures");
+        let indexes = list_indexes_compat_first(&pool, "public", &table).await.expect("compat index listing");
+        client.batch_execute(&format!("DROP TABLE IF EXISTS public.{table}")).await.expect("drop index fixtures");
+        let primary_name = format!("{table}_pkey");
+        let primary = indexes.iter().find(|index| index.name == primary_name).expect("primary key index");
+        assert_eq!(primary.columns, vec!["id".to_string()]);
+        assert!(primary.is_primary && primary.is_unique);
+        let composite_name = format!("{table}_email_tag");
+        let composite = indexes.iter().find(|index| index.name == composite_name).expect("composite index");
+        assert_eq!(composite.columns, vec!["email".to_string(), "tag".to_string()]);
+        assert!(!composite.is_primary && !composite.is_unique);
     }
 
     #[test]
@@ -16350,6 +16654,32 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn text_result_connection_reads_selects_through_text_protocol() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(5), "UTC")
+            .await
+            .expect("connect PostgreSQL database");
+        let client = pool.get().await.expect("checkout postgres");
+        assert!(!postgres_client_requires_text_results(&client).await);
+
+        let key = postgres_client_key(&client).await.expect("resolve connection identity");
+        mark_postgres_connection_text_results(&key);
+        assert!(postgres_client_requires_text_results(&client).await);
+        let result = execute_select_query(
+            &client,
+            "SELECT 532::numeric(18,0) AS a, '\\x0102'::bytea AS bin",
+            Instant::now(),
+            10,
+        )
+        .await
+        .expect("select through text protocol");
+        // The binary path renders bytea as `0x0102`; the PostgreSQL text form
+        // proves the statement was read through the simple query protocol.
+        assert_eq!(result.rows, vec![vec![serde_json::json!("532"), serde_json::json!("\\x0102")]]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
     async fn cached_queries_downgrade_connection_after_server_deallocates_statements() {
         let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
         let pool = connect_with_local_timezone(&url, Duration::from_secs(5), "UTC")
@@ -16982,6 +17312,25 @@ mod tests {
         config.hostaddr("127.0.0.1".parse().unwrap());
         let pinned = pin_postgres_hostaddr(&config).await;
         assert_eq!(pinned.get_hostaddrs().first(), Some(&"127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn routine_definitions_drop_their_schema_qualifier() {
+        let body = "(IN a integer)\n LANGUAGE plpgsql\nAS $procedure$ BEGIN NULL; END $procedure$\n";
+        assert_eq!(
+            strip_routine_schema_qualifier(&format!("CREATE OR REPLACE PROCEDURE cux_test.p1{body}"), "cux_test"),
+            format!("CREATE OR REPLACE PROCEDURE p1{body}")
+        );
+        assert_eq!(
+            strip_routine_schema_qualifier(&format!("CREATE OR REPLACE PROCEDURE \"AB_TEST\".p1{body}"), "AB_TEST"),
+            format!("CREATE OR REPLACE PROCEDURE p1{body}")
+        );
+        assert_eq!(
+            strip_routine_schema_qualifier("CREATE OR REPLACE FUNCTION \"a\"\"b\".f1() RETURNS integer", "a\"b"),
+            "CREATE OR REPLACE FUNCTION f1() RETURNS integer"
+        );
+        let other_schema = format!("CREATE OR REPLACE PROCEDURE other.p1{body}");
+        assert_eq!(strip_routine_schema_qualifier(&other_schema, "cux"), other_schema);
     }
 }
 
