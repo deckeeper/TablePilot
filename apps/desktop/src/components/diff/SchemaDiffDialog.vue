@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount, nextTick } from "vue";
+import { computed, reactive, ref, watch, onBeforeUnmount, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogHeader, DialogTitle, DialogFooter, DialogContent } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -23,14 +23,27 @@ import SideBySideTextDiff, { type TextDiffSide } from "@/components/common/SideB
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import { getSchemaDiffOptionsForDbType } from "@/lib/schema/schemaDiffOptions";
-import { buildDeployTxResult } from "@/lib/schema/deployTxResult";
+import { buildContinueOnErrorDeployLog, buildDeployTxResult, type DeployTxResult } from "@/lib/schema/deployTxResult";
 import { getSchemaDiffNextProgressStep, isSchemaDiffPostgresLike, shouldLoadSchemaDiffExtraObjectPhase, type SchemaDiffProgressPhase } from "@/lib/schema/schemaDiffProgress";
 import { createSchemaDiffTableListLoader } from "@/lib/schema/schemaDiffTableList";
 import { countSchemaDiffActionableObjects, partitionSchemaDiffObjectsByResultTab, swapSchemaDiffRoutineMappings } from "@/lib/schema/schemaDiffRoutine";
-import { schemaDiffRoutineObjectTypesIntersection } from "@/lib/database/databaseObjectCapabilities";
+import { schemaDiffRoutineObjectTypesIntersection, schemaDiffRoutineProductType } from "@/lib/database/databaseObjectCapabilities";
 import { loadObjectSourceWithRoutineFallback } from "@/lib/table/objectSourceLoad";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { normalizeSchemaDiffCompareOptions } from "@/types/schemaDiff";
+import {
+  createOracleRoutineDeployment,
+  editOracleRoutineDraft,
+  executeOracleRoutineDeployment,
+  observeOracleRoutineDeployment,
+  oracleRoutineActiveStep,
+  oracleRoutinePlanSql,
+  prepareOracleRoutineRecovery,
+  refreshOracleRoutineDeployment,
+  selectOracleRoutineDraft,
+  synchronizeOracleRoutineSelection,
+  validateOracleRoutineDeployment,
+} from "@/lib/schema/oracleRoutineDeploy";
 import type { SchemaDiffCompareOptions, SchemaDiffConfig, FieldMappingEntry, SchemaDiffTableMapping, SchemaDiffRoutineMapping } from "@/types/schemaDiff";
 import { getSchemaDiffSession, schemaDiffSessionObjects, startSchemaDiffSession, type SchemaDiffSession } from "@/composables/useSchemaDiffSession";
 import type { DatabaseType, ObjectSourceKind } from "@/types/database";
@@ -141,6 +154,7 @@ const activeSessionId = ref<string | null>(props.sessionId ?? null);
 let appliedSessionResult: SchemaDiffPreparation | null = null;
 let shownSessionError = "";
 let componentUnmounted = false;
+let suppressTargetIdentityReset = false;
 const diffObjects = ref<SchemaDiffObject[]>([]);
 const tableDiffGroups = ref<OperationGroup[]>([]);
 const routineDiffGroups = ref<OperationGroup[]>([]);
@@ -164,7 +178,7 @@ const executing = ref(false);
 const lastDiffResult = ref<SchemaDiffPreparation | null>(null);
 const targetDbVersion = ref<string | null>(null);
 const showResultDialog = ref(false);
-const deployResult = ref<{ success: boolean; status?: string; message: string; affectedRows?: number; error?: string } | null>(null);
+const deployResult = ref<DeployTxResult | null>(null);
 
 const partitionedDiffObjects = computed(() => partitionSchemaDiffObjectsByResultTab(diffObjects.value));
 const tableDiffObjects = computed(() => partitionedDiffObjects.value.tableObjects);
@@ -175,13 +189,78 @@ const tableActionableCount = computed(() => countSchemaDiffActionableObjects(tab
 const routineActionableCount = computed(() => countSchemaDiffActionableObjects(routineDiffObjects.value));
 const tablesCompareEnabled = computed(() => !!schemaDiffPanelOptions.value.tables);
 const routinesCompareEnabled = computed(() => !!schemaDiffPanelOptions.value.functions);
-const canEnableRoutinesCompare = computed(() => schemaDiffRoutineObjectTypesIntersection(sourceDbType.value as DatabaseType | undefined, targetDbType.value as DatabaseType | undefined).length > 0);
+const canEnableRoutinesCompare = computed(() => schemaDiffRoutineObjectTypesIntersection(schemaDiffRoutineProductType(sourceDbType.value, sourceEngineDbType.value), schemaDiffRoutineProductType(targetDbType.value, targetEngineDbType.value)).length > 0);
 const effectiveRoutinesEnabled = computed(() => routinesCompareEnabled.value && canEnableRoutinesCompare.value);
 const showTableResultTab = computed(() => tablesCompareEnabled.value);
 const showRoutineResultTab = computed(() => effectiveRoutinesEnabled.value);
 const showResultTabList = computed(() => showTableResultTab.value && showRoutineResultTab.value);
 const showNoDifferences = computed(() => showTableResultTab.value && tableDiffObjects.value.length === 0);
-const showRoutineNoDifferences = computed(() => showRoutineResultTab.value && routineDiffObjects.value.length === 0);
+const routineInventoriesComplete = computed(() => !!comparisonSession.value?.routineSnapshots?.source?.enumerationComplete && !!comparisonSession.value?.routineSnapshots?.target?.enumerationComplete);
+const showRoutineNoDifferences = computed(() => showRoutineResultTab.value && routineDiffObjects.value.length === 0 && (!isOracleRoutineComparison.value || routineInventoriesComplete.value));
+const comparisonSession = computed(() => getSchemaDiffSession(activeSessionId.value));
+const isOracleRoutineComparison = computed(() => {
+  const snapshots = comparisonSession.value?.routineSnapshots;
+  return !!snapshots?.source && !!snapshots.target && [snapshots.source.endpoint.databaseType, snapshots.target.endpoint.databaseType].every((type) => type === "oracle" || type === "oceanbase-oracle");
+});
+const isOracleRoutineDeploy = computed(() => resultTab.value === "routines" && isOracleRoutineComparison.value);
+const routineDeployment = computed(() => comparisonSession.value?.routineDeployment);
+const routineTargetIsCurrent = computed(() => {
+  const snapshots = comparisonSession.value?.routineSnapshots;
+  return (
+    !!snapshots?.source &&
+    !!snapshots.target &&
+    snapshots.source.endpoint.databaseType === snapshots.target.endpoint.databaseType &&
+    snapshots.source.endpoint.connectionId === sourceConnectionId.value &&
+    snapshots.source.endpoint.database === sourceDatabase.value &&
+    snapshots.source.endpoint.schema === sourceSchema.value &&
+    snapshots.target.endpoint.connectionId === targetConnectionId.value &&
+    snapshots.target.endpoint.database === targetDatabase.value &&
+    snapshots.target.endpoint.schema === targetSchema.value &&
+    sourceEngineDbType.value === snapshots.source.endpoint.databaseType &&
+    targetEngineDbType.value === snapshots.target.endpoint.databaseType
+  );
+});
+const deployIsBusy = computed(() => executing.value || !!routineDeployment.value?.executing || !!routineDeployment.value?.validating);
+const routineReadIssues = computed(() => {
+  if (!isOracleRoutineComparison.value) return [];
+  return (["source", "target"] as const).flatMap((side) => {
+    const snapshot = comparisonSession.value?.routineSnapshots?.[side];
+    const object = snapshot?.objects.find((object) => object.version.identity.name === selectedObject.value?.name);
+    return [...(snapshot?.issues ?? []), ...(object?.issues ?? [])].map((issue) => ({ side, message: issue.message }));
+  });
+});
+const deployEditorSql = computed({
+  get: () => {
+    if (!isOracleRoutineDeploy.value || !routineDeployment.value) return selectedDeploySql.value;
+    const state = routineDeployment.value;
+    return state.recoveryPlan ? (oracleRoutineActiveStep(state)?.sql ?? "") : (state.drafts.find((draft) => draft.objectId === state.selectedObjectId)?.sql ?? "");
+  },
+  set: (sql: string) => {
+    if (!isOracleRoutineDeploy.value || !routineDeployment.value) {
+      selectedDeploySql.value = sql;
+      return;
+    }
+    if (!routineDeployment.value.recoveryPlan && routineDeployment.value.selectedObjectId) editOracleRoutineDraft(routineDeployment.value, routineDeployment.value.selectedObjectId, sql);
+  },
+});
+let routineConfirmRevision: number | null = null;
+
+function ensureRoutineDeployment() {
+  const session = comparisonSession.value;
+  if (!isOracleRoutineComparison.value || !session?.routineSnapshots?.source || !session.routineSnapshots.target) return;
+  session.routineDeployment ??= reactive(createOracleRoutineDeployment(session.routineSnapshots.source, session.routineSnapshots.target));
+  synchronizeOracleRoutineSelection(session.routineDeployment, routineDiffObjects.value);
+  return session.routineDeployment;
+}
+
+function leaveDeployReview() {
+  const state = routineDeployment.value;
+  if (state) {
+    state.stopRequested = true;
+    state.reviewOpen = false;
+  }
+  step.value = "result";
+}
 
 // Phase 4 result fields
 const rollbackSql = ref("");
@@ -205,6 +284,7 @@ const deploySqlMode = ref<"forward" | "rollback">("forward");
 // the backend — for MySQL targets alone; the backend re-checks the target type and
 // returns every other engine's script unchanged.
 const ignoreForeignKeyChecks = ref(false);
+const continueOnError = ref(false);
 const isMysqlDeployTarget = computed(() => targetEngineDbType.value === "mysql");
 const effectiveIgnoreForeignKeyChecks = computed(() => ignoreForeignKeyChecks.value && isMysqlDeployTarget.value);
 
@@ -338,6 +418,7 @@ watch(
 
 onBeforeUnmount(() => {
   componentUnmounted = true;
+  if (routineDeployment.value) routineDeployment.value.stopRequested = true;
   teardownResizeObserver();
 });
 
@@ -362,7 +443,7 @@ const selectedTreeObject = computed(() => {
   return findSchemaDiffObject(diffObjects.value, selectedObjectId.value);
 });
 
-const canDeployRoutines = computed(() => isSchemaDiffPostgresLike(targetDbType.value));
+const canDeployRoutines = computed(() => (isOracleRoutineComparison.value ? routineTargetIsCurrent.value : isSchemaDiffPostgresLike(targetDbType.value)));
 
 const canDeploy = computed(() => {
   // MySQL/SQL Server routine sync is deferred (copy DDL only). Postgres-family
@@ -437,6 +518,7 @@ function resetComparisonResultState() {
   dependencyGraph.value = null;
   deploySqlMode.value = "forward";
   ignoreForeignKeyChecks.value = false;
+  continueOnError.value = false;
   showConfirmDialog.value = false;
   showResultDialog.value = false;
   deployResult.value = null;
@@ -468,12 +550,12 @@ function restoreSchemaDiffSession(session: SchemaDiffSession): void {
     targetSchema: config.targetSchema,
   });
   updateActiveConfigOptions(config.options);
-  schemaDiffHasExtraObjectPhase.value = shouldLoadSchemaDiffExtraObjectPhase(config.sourceDbType, config.targetDbType, config.options);
+  schemaDiffHasExtraObjectPhase.value = shouldLoadSchemaDiffExtraObjectPhase(schemaDiffRoutineProductType(config.sourceDbType, config.sourceEngineDbType), schemaDiffRoutineProductType(config.targetDbType, config.targetEngineDbType), config.options);
 }
 
 function applySchemaDiffSession(session: SchemaDiffSession | undefined): void {
   if (!session) return;
-  schemaDiffHasExtraObjectPhase.value = shouldLoadSchemaDiffExtraObjectPhase(session.config.sourceDbType, session.config.targetDbType, session.config.options);
+  schemaDiffHasExtraObjectPhase.value = shouldLoadSchemaDiffExtraObjectPhase(schemaDiffRoutineProductType(session.config.sourceDbType, session.config.sourceEngineDbType), schemaDiffRoutineProductType(session.config.targetDbType, session.config.targetEngineDbType), session.config.options);
   if (session.status === "running") {
     loading.value = true;
     step.value = "compare";
@@ -504,6 +586,12 @@ function applySchemaDiffSession(session: SchemaDiffSession | undefined): void {
   permissionDiffs.value = session.result.permissionDiffs ?? [];
   dependencyGraph.value = normalizeSchemaDiffDependencyGraph(session.result.dependencyGraph);
   diffObjects.value = schemaDiffSessionObjects(session.result);
+  if (session.routineDeployment) {
+    for (const object of diffObjects.value) {
+      const saved = session.routineDeployment.drafts.find((draft) => draft.objectId === object.id);
+      if (saved) object.selected = saved.included;
+    }
+  }
   rebuildDiffGroups();
   const hasTableActions = showTableResultTab.value && countSchemaDiffActionableObjects(tableDiffObjects.value) > 0;
   const hasRoutineActions = showRoutineResultTab.value && countSchemaDiffActionableObjects(routineDiffObjects.value) > 0;
@@ -528,6 +616,7 @@ function applySchemaDiffSession(session: SchemaDiffSession | undefined): void {
   deploySqlMode.value = "forward";
   void regenerateSelectedDeploySql();
   void regenerateFocusedDeploySql();
+  if (session.routineDeployment?.reviewOpen) step.value = "deploy-review";
 }
 
 // A Compare session deliberately outlives this v-if-mounted dialog. Closing the
@@ -535,7 +624,10 @@ function applySchemaDiffSession(session: SchemaDiffSession | undefined): void {
 watch(
   [() => open.value, () => props.sessionId],
   ([isOpen]) => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      if (routineDeployment.value) routineDeployment.value.stopRequested = true;
+      return;
+    }
     const session = getSchemaDiffSession(props.sessionId);
     activeSessionId.value = session?.id ?? null;
     appliedSessionResult = null;
@@ -591,9 +683,6 @@ watch([sourceConnectionId, sourceDatabase, sourceSchema, targetConnectionId, tar
   });
 });
 
-/** Suppress target-identity resets while restoring session/history/swap. */
-let suppressTargetIdentityReset = false;
-
 function runWithoutTargetIdentityReset(action: () => void): void {
   suppressTargetIdentityReset = true;
   try {
@@ -604,6 +693,10 @@ function runWithoutTargetIdentityReset(action: () => void): void {
     });
   }
 }
+
+watch([sourceConnectionId, sourceDatabase, sourceSchema, targetConnectionId, targetDatabase, targetSchema], () => {
+  if (!suppressTargetIdentityReset && routineDeployment.value) routineDeployment.value.stopRequested = true;
+});
 
 function handleSourceConnectionChange(connectionId: string): void {
   if (connectionId === sourceConnectionId.value) return;
@@ -763,7 +856,7 @@ function handleCompare(): void {
   appliedSessionResult = null;
   shownSessionError = "";
   resetComparisonResultState();
-  schemaDiffHasExtraObjectPhase.value = shouldLoadSchemaDiffExtraObjectPhase(sourceDbType, targetDbType, options);
+  schemaDiffHasExtraObjectPhase.value = shouldLoadSchemaDiffExtraObjectPhase(schemaDiffRoutineProductType(sourceDbType, sourceEngineDbType.value), schemaDiffRoutineProductType(targetDbType, targetEngineDbType.value), options);
   const session = startSchemaDiffSession(
     {
       sourceConnectionId: sourceConnectionId.value,
@@ -873,6 +966,10 @@ async function regenerateSelectedDeploySql() {
   if (!result) {
     return;
   }
+  if (isOracleRoutineDeploy.value) {
+    ensureRoutineDeployment();
+    return;
+  }
 
   const options = normalizeSchemaDiffCompareOptions(activeConfig.value?.options, getDbType());
   const input = selectSchemaDiffInput(result, currentTabDiffObjects.value);
@@ -899,6 +996,7 @@ async function regenerateFocusedDeploySql(objectId: string | null = selectedObje
   focusedForwardDeploySql.value = "";
   focusedRollbackSql.value = "";
   focusedDeploySql.value = "";
+  if (isOracleRoutineDeploy.value) return;
   if (!result || !objectId || !findSchemaDiffObject(diffObjects.value, objectId)) {
     return;
   }
@@ -934,6 +1032,10 @@ function switchDeploySqlMode(mode: "forward" | "rollback") {
 }
 
 const canExecuteDeploy = computed(() => {
+  if (isOracleRoutineDeploy.value) {
+    const state = routineDeployment.value;
+    return routineTargetIsCurrent.value && !!(state?.recoveryPlan ?? state?.plan)?.ready && !deployIsBusy.value;
+  }
   if (deploySqlMode.value === "rollback" && rollbackCompleteness.value === "incomplete") {
     return false;
   }
@@ -943,7 +1045,7 @@ const canExecuteDeploy = computed(() => {
 
 const destructiveStatements = computed(() => {
   const databaseType = store.getConfig(targetConnectionId.value)?.db_type;
-  return detectDestructiveSchemaDiffStatements(selectedDeploySql.value, databaseType);
+  return detectDestructiveSchemaDiffStatements(isOracleRoutineDeploy.value && routineDeployment.value ? oracleRoutinePlanSql(routineDeployment.value) : selectedDeploySql.value, databaseType);
 });
 
 function applyRename(rc: RenameCandidate) {
@@ -993,6 +1095,10 @@ function ignoreRename(index: number) {
 }
 
 async function handleExecuteScript() {
+  if (isOracleRoutineDeploy.value) {
+    await handleDeployReview();
+    return;
+  }
   if (!selectedDeploySql.value.trim() || selectedDeploySql.value.trim() === "-- No objects selected") {
     toast(t("diff.noObjectsSelected"), 3000);
     return;
@@ -1006,6 +1112,20 @@ async function handleExecuteScript() {
 }
 
 async function executeDeploySql() {
+  if (isOracleRoutineDeploy.value && routineDeployment.value) {
+    const state = routineDeployment.value;
+    if (!routineTargetIsCurrent.value) return;
+    await executeOracleRoutineDeployment(state, (sql, execute) =>
+      executeWithProductionSqlGuard({
+        connection: store.getConfig(state.target.endpoint.connectionId),
+        database: state.target.endpoint.database,
+        sql,
+        source: t("production.sourceSchemaDiff"),
+        execute,
+      }),
+    );
+    return;
+  }
   executing.value = true;
   try {
     const targetConnection = store.getConfig(targetConnectionId.value);
@@ -1015,6 +1135,13 @@ async function executeDeploySql() {
       sql: selectedDeploySql.value,
       source: t("production.sourceSchemaDiff"),
       execute: async () => {
+        if (continueOnError.value) {
+          const results = await api.executeMulti(targetConnectionId.value, targetDatabase.value, selectedDeploySql.value, targetSchema.value || undefined, undefined, {
+            continueOnError: true,
+            maxRows: 1,
+          });
+          return buildContinueOnErrorDeployLog(results);
+        }
         const txLog = await api.executeScriptWith2pc(targetConnectionId.value, targetDatabase.value, [selectedDeploySql.value], targetSchema.value, destructiveStatements.value.length > 0);
         return txLog;
       },
@@ -1070,6 +1197,9 @@ async function handleSelectObject(reviewObject: SchemaDiffObject) {
   }
 
   if (obj.objectKind !== "function") return;
+  // Strict snapshots retain incomplete reads and their issues; an ordinary
+  // fallback must not silently replace that evidence with an unverified source.
+  if (isOracleRoutineComparison.value) return;
 
   const preferredKind: ObjectSourceKind = obj.routineType === "PROCEDURE" ? "PROCEDURE" : "FUNCTION";
 
@@ -1253,7 +1383,7 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
   }
 }
 
-function handleDeployReview() {
+async function handleDeployReview() {
   if (resultTab.value === "routines" && !canDeployRoutines.value) return;
   const selectedObjects = selectedSchemaDiffObjects(currentTabDiffObjects.value);
   if (selectedObjects.length === 0) {
@@ -1261,10 +1391,21 @@ function handleDeployReview() {
     return;
   }
   step.value = "deploy-review";
+  if (isOracleRoutineDeploy.value) {
+    const state = ensureRoutineDeployment();
+    if (state) {
+      state.reviewOpen = true;
+      if (!state.plan && !state.recoveryPlan && !state.executing) await validateOracleRoutineDeployment(state);
+    }
+  }
   fetchDbVersion(targetConnectionId.value, targetDatabase.value, targetSchema.value);
 }
 
 async function handleDeploy() {
+  if (isOracleRoutineDeploy.value) {
+    if (!canExecuteDeploy.value) return;
+    routineConfirmRevision = routineDeployment.value?.revision ?? null;
+  }
   if (deploySqlMode.value === "rollback" && rollbackCompleteness.value === "incomplete") {
     toast(t("diff.rollbackIncompleteBlocked"), 5000);
     return;
@@ -1274,6 +1415,7 @@ async function handleDeploy() {
 
 async function onConfirmDeploy() {
   showConfirmDialog.value = false;
+  if (isOracleRoutineDeploy.value && (routineConfirmRevision !== routineDeployment.value?.revision || !canExecuteDeploy.value)) return;
   if (deploySqlMode.value === "rollback" && rollbackCompleteness.value === "incomplete") {
     toast(t("diff.rollbackIncompleteBlocked"), 5000);
     return;
@@ -1283,6 +1425,10 @@ async function onConfirmDeploy() {
 }
 
 const deployStats = computed(() => {
+  if (isOracleRoutineDeploy.value && routineDeployment.value) {
+    const steps = (routineDeployment.value.recoveryPlan ?? routineDeployment.value.plan)?.steps ?? [];
+    return { create: steps.filter((step) => step.action === "create").length, modify: steps.filter((step) => step.action === "replace").length, delete: steps.filter((step) => step.action === "delete").length, total: steps.length };
+  }
   const counts = summarizeSchemaDiffOperations(currentTabDiffObjects.value);
   return {
     create: counts.create,
@@ -1484,13 +1630,24 @@ const targetConnectionInfo = computed(() => {
             </TabsContent>
 
             <TabsContent v-if="showRoutineResultTab" value="routines" class="mt-0 flex min-h-0 flex-1 flex-col outline-none data-[state=inactive]:hidden">
+              <div v-if="routineReadIssues.length || (selectedObject?.operationType === 'none' && selectedObject.changes?.length)" role="status" class="mx-3 mt-2 max-h-32 shrink-0 space-y-1 overflow-auto text-xs text-amber-700 dark:text-amber-300">
+                <p v-for="(issue, index) in routineReadIssues" :key="index">{{ t(issue.side === "source" ? "diff.sourceObject" : "diff.targetObject") }} — {{ issue.message }}</p>
+                <p v-for="(change, index) in selectedObject?.operationType === 'none' ? (selectedObject.changes ?? []) : []" :key="`change-${index}`">{{ change }}</p>
+              </div>
               <div v-if="showRoutineNoDifferences" class="mx-3 mt-2 shrink-0 rounded-md border border-dashed bg-muted/20 px-3 py-2 text-center text-xs text-muted-foreground">
                 {{ t("diff.noDifferences") }}
               </div>
               <Splitpanes horizontal class="min-h-0 flex-1" @resized="handleSplitpanesResized">
                 <Pane :size="splitpanesSize" min-size="20">
                   <div class="h-full overflow-auto">
-                    <SchemaDiffRoutineList :objects="routineDiffObjects" :viewing-object-id="selectedRoutineObjectId" :selectable="canDeployRoutines" :empty-text="t('diff.noDifferences')" @toggle-selection="handleToggleObjectSelection" @view-diff="handleViewRoutineDiff" />
+                    <SchemaDiffRoutineList
+                      :objects="routineDiffObjects"
+                      :viewing-object-id="selectedRoutineObjectId"
+                      :selectable="canDeployRoutines"
+                      :empty-text="t(isOracleRoutineComparison && !routineInventoriesComplete ? 'diff.routineUnreadable' : 'diff.noDifferences')"
+                      @toggle-selection="handleToggleObjectSelection"
+                      @view-diff="handleViewRoutineDiff"
+                    />
                   </div>
                 </Pane>
                 <Pane :size="100 - splitpanesSize" min-size="20">
@@ -1524,15 +1681,18 @@ const targetConnectionInfo = computed(() => {
         <!-- Deploy Review Step -->
         <template v-else-if="step === 'deploy-review'">
           <SchemaDiffDeployStep
-            v-model:deploy-sql="selectedDeploySql"
+            v-model:deploy-sql="deployEditorSql"
             v-model:ignore-foreign-key-checks="ignoreForeignKeyChecks"
+            v-model:continue-on-error="continueOnError"
             :show-ignore-foreign-key-checks="isMysqlDeployTarget"
             :selected-objects="currentTabDiffObjects"
             :target-connection-id="targetConnectionId"
             :target-database="targetDatabase"
             :target-schema="targetSchema"
-            :executing="executing"
-            :rollback-sql="rollbackSql"
+            :executing="deployIsBusy"
+            :database-type="targetEngineDbType"
+            :routine-deployment="isOracleRoutineDeploy ? routineDeployment : null"
+            :rollback-sql="isOracleRoutineDeploy ? undefined : rollbackSql"
             :deploy-sql-mode="deploySqlMode"
             :compatibility-warnings="selectedCompatibilityWarnings"
             :rename-candidates="renameCandidates"
@@ -1541,8 +1701,17 @@ const targetConnectionInfo = computed(() => {
             :can-execute="canExecuteDeploy"
             :destructive-statement-count="destructiveStatements.length"
             @update:deploy-sql-mode="switchDeploySqlMode"
-            @back="step = 'result'"
+            @back="leaveDeployReview"
             @deploy="handleDeploy"
+            @select-routine="
+              (id) => {
+                if (routineDeployment) selectOracleRoutineDraft(routineDeployment, id);
+              }
+            "
+            @validate-routines="routineDeployment && validateOracleRoutineDeployment(routineDeployment)"
+            @refresh-routines="routineDeployment && refreshOracleRoutineDeployment(routineDeployment)"
+            @observe-routine="(id) => routineDeployment && observeOracleRoutineDeployment(routineDeployment, id)"
+            @recover-routine="(id) => routineDeployment && prepareOracleRoutineRecovery(routineDeployment, id)"
           />
         </template>
       </div>
@@ -1565,8 +1734,8 @@ const targetConnectionInfo = computed(() => {
           <p v-if="showRoutineDeployDeferredHint" class="max-w-md text-right text-[11px] text-muted-foreground">
             {{ t("diff.routineSyncDeferredHint") }}
           </p>
-          <Button v-else size="sm" :disabled="!canDeploy || executing" @click="handleDeployReview">
-            <Loader2 v-if="executing" class="w-3.5 h-3.5 mr-1 animate-spin" />
+          <Button v-else size="sm" :disabled="!canDeploy || deployIsBusy" @click="handleDeployReview">
+            <Loader2 v-if="deployIsBusy" class="w-3.5 h-3.5 mr-1 animate-spin" />
             <Play v-else class="w-3.5 h-3.5 mr-1" />
             {{ deployButtonLabel }}
           </Button>
@@ -1614,12 +1783,20 @@ const targetConnectionInfo = computed(() => {
                 <li v-for="(item, index) in destructiveStatements" :key="`${item.objectType}-${index}`" class="truncate" :title="item.statement">{{ item.action.toUpperCase() }} {{ item.objectType }}: {{ item.statement }}</li>
               </ul>
             </div>
+
+            <label v-if="!isOracleRoutineDeploy" class="flex items-start gap-2 rounded border border-yellow-300 bg-yellow-50 p-3 text-xs text-yellow-800 dark:border-yellow-700 dark:bg-yellow-950/30 dark:text-yellow-200" :class="executing ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'">
+              <input v-model="continueOnError" type="checkbox" class="mt-0.5 accent-primary" :disabled="executing" />
+              <span>
+                <span class="font-medium">{{ t("diff.continueOnError") }}</span>
+                <span class="mt-1 block">{{ t("diff.continueOnErrorHint") }}</span>
+              </span>
+            </label>
           </div>
 
           <DialogFooter>
             <Button variant="outline" @click="showConfirmDialog = false">{{ t("diff.cancel") }}</Button>
-            <Button variant="destructive" :disabled="executing" @click="onConfirmDeploy">
-              <Loader2 v-if="executing" class="w-3.5 h-3.5 mr-1 animate-spin" />
+            <Button variant="destructive" :disabled="deployIsBusy || (isOracleRoutineDeploy && !canExecuteDeploy)" @click="onConfirmDeploy">
+              <Loader2 v-if="deployIsBusy" class="w-3.5 h-3.5 mr-1 animate-spin" />
               {{ t("diff.confirmDeploy") }}
             </Button>
           </DialogFooter>
@@ -1633,14 +1810,24 @@ const targetConnectionInfo = computed(() => {
             <DialogTitle class="flex items-center gap-2" :class="deployResult?.success ? 'text-green-500' : 'text-destructive'">
               <AlertTriangle v-if="!deployResult?.success" class="h-5 w-5" />
               <CircleCheck v-else class="h-5 w-5" />
-              <template v-if="deployResult?.status === 'mixed'">{{ t("diff.deployMixedTitle") }}</template>
+              <template v-if="deployResult?.status === 'completed_with_errors'">{{ t("diff.deployCompletedWithErrorsTitle") }}</template>
+              <template v-else-if="deployResult?.status === 'mixed'">{{ t("diff.deployMixedTitle") }}</template>
               <template v-else-if="deployResult?.status === 'rolled_back'">{{ t("diff.deployRolledBackTitle") }}</template>
               <template v-else>{{ deployResult?.success ? t("diff.deploySuccess") : t("diff.deployFailed") }}</template>
             </DialogTitle>
           </DialogHeader>
 
           <div class="py-2">
-            <div v-if="deployResult?.status === 'mixed'" class="space-y-2">
+            <div v-if="deployResult?.status === 'completed_with_errors'" class="space-y-2">
+              <p class="text-sm text-destructive-foreground">{{ deployResult.message }}</p>
+              <div v-if="deployResult.failures?.length" class="max-h-56 space-y-2 overflow-auto rounded border border-destructive/30 bg-destructive/5 p-2 text-xs">
+                <div v-for="failure in deployResult.failures" :key="failure.index" class="space-y-1">
+                  <div class="font-medium text-destructive">{{ t("diff.statementNumber", { index: failure.index + 1 }) }}</div>
+                  <pre class="whitespace-pre-wrap font-mono">{{ failure.error }}</pre>
+                </div>
+              </div>
+            </div>
+            <div v-else-if="deployResult?.status === 'mixed'" class="space-y-2">
               <p class="text-sm text-destructive-foreground">{{ deployResult.message }}</p>
               <div class="bg-yellow-50 border border-yellow-300 p-3 rounded text-xs text-yellow-800">
                 {{ t("diff.deployMixedWarning") }}

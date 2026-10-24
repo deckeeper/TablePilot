@@ -12,13 +12,25 @@ const node = (overrides: Record<string, unknown> = {}) => ({
 describe("database dependency providers", () => {
   it("resolves only providers registered for the requested database", () => {
     expect(databaseDependencyProviderFor("xugu")?.databaseType).toBe("xugu");
+    expect(databaseDependencyProviderFor("oracle")?.databaseType).toBe("oracle");
+    expect(databaseDependencyProviderFor("oceanbase-oracle")?.databaseType).toBe("oracle");
     expect(databaseDependencyProviderFor("postgres")).toBeNull();
     expect(databaseDependencyProviderFor(undefined)).toBeNull();
   });
 
   it("keeps the UI capability check database-agnostic", () => {
     expect(canViewDatabaseObjectDependencies("xugu", node())).toBe(true);
+    expect(canViewDatabaseObjectDependencies("oracle", node({ type: "procedure" }))).toBe(true);
+    expect(canViewDatabaseObjectDependencies("oceanbase-oracle", node({ type: "package" }))).toBe(true);
     expect(canViewDatabaseObjectDependencies("postgres", node())).toBe(false);
+  });
+
+  it.each(["oracle", "oceanbase-oracle"] as const)("exposes table and view relations through the existing provider in %s", (databaseType) => {
+    for (const type of ["table", "view", "materialized_view"] as const) {
+      const target = node({ type });
+      expect(canViewDatabaseObjectDependencies(databaseType, target)).toBe(true);
+      expect(databaseDependencyProviderFor(databaseType)?.buildQuery(target)).toContain("ALL_DEPENDENCIES");
+    }
   });
 
   it("does not expose package members or incomplete nodes", () => {
