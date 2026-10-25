@@ -1,5 +1,5 @@
 import type { DatabaseType, ObjectInfo, TableInfo, TreeNode, TreeNodeType } from "@/types/database";
-import { normalizeSidebarObjectKind, type SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
+import { normalizeSidebarObjectKind, supportsSchemaIndexManagement, type SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 
 const databaseObjectNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
@@ -367,6 +367,19 @@ export function tablePartitionGroups(node: TreeNode): TreeNode[] {
   return partitionGroupChildren(node);
 }
 
+// Saved-SQL decoration and persisted-tree decoding can clone visible children
+// independently of hiddenChildren. Before mutating or releasing a table, retain
+// its visible partition groups as the authoritative loaded state (including the
+// load-more cursor), rather than resurrecting an older hidden snapshot.
+export function syncTablePartitionGroups(node: TreeNode): void {
+  if (node.type !== "table") return;
+  const groups = node.children?.filter((child) => child.type === "group-partitions") ?? [];
+  if (!groups.length) return;
+  const hiddenGroups = node.hiddenChildren?.filter((child) => child.type === "group-partitions") ?? [];
+  if (groups.length === hiddenGroups.length && groups.every((group, index) => group === hiddenGroups[index])) return;
+  node.hiddenChildren = [...(node.hiddenChildren?.filter((child) => child.type !== "group-partitions") ?? []), ...groups];
+}
+
 export function hasTablePartitionGroups(node: TreeNode): boolean {
   return partitionGroupChildren(node).length > 0;
 }
@@ -411,15 +424,16 @@ export function appendTableTreeLoadMoreNode(children: TreeNode[], loadMoreNode: 
   // paginates the whole schema, so nesting its global cursor under whichever
   // partition happens to end the page can hide all remaining schema objects.
   const childGroup = parentNode && isSuperTable(parentNode) ? tablePartitionGroups(parentNode)[0] : undefined;
-  if (!childGroup) return [...children, loadMoreNode];
+  if (!childGroup || !parentNode) return [...children, loadMoreNode];
 
+  syncTablePartitionGroups(parentNode);
   childGroup.children = [...(childGroup.children ?? []), loadMoreNode];
   return children;
 }
 
 export function withoutTableTreeLoadMoreNodes(nodes: TreeNode[] | undefined): TreeNode[] {
   return (nodes ?? [])
-    .filter((node) => node.type !== "load-more")
+    .filter((node) => node.type !== "load-more" || node.loadMore?.objectType === "INDEX")
     .map((node) => {
       if (node.children) node.children = withoutTableTreeLoadMoreNodes(node.children);
       if (node.hiddenChildren) node.hiddenChildren = withoutTableTreeLoadMoreNodes(node.hiddenChildren);
@@ -439,6 +453,9 @@ export function mergeTableTreePageChildren(currentChildren: TreeNode[], pageChil
   const nodeKey = (node: TreeNode) => exactObjectIdentityKey("TABLE", node.schema, node.label);
   const collect = (nodes: readonly TreeNode[]) => {
     for (const node of nodes) {
+      // Do not let a cloned hidden parent overwrite its visible counterpart in
+      // the index when a later page adds another level of partitions.
+      syncTablePartitionGroups(node);
       if (node.type === "table") {
         nodesByKey.set(nodeKey(node), node);
       }
@@ -498,12 +515,21 @@ export function mergeTableTreePageChildren(currentChildren: TreeNode[], pageChil
     return group;
   };
 
+  // Accumulate a page per parent: scanning/copying/sorting the growing group
+  // for every child makes large STABLEs quadratic, especially through Vue proxies.
+  const pendingGroups = new Map<TreeNode, { children: TreeNode[]; keys: Set<string> }>();
   const addToParent = (parent: TreeNode, child: TreeNode) => {
     const group = ensurePartitionGroup(parent);
-    const children = group.children ?? [];
-    if (!children.some((node) => nodeKey(node) === nodeKey(child))) {
-      group.children = sortDatabaseObjectsByName([...children, child], (node) => node.label);
-      group.objectCount = group.children.length;
+    let pending = pendingGroups.get(group);
+    if (!pending) {
+      const children = [...(group.children ?? [])];
+      pending = { children, keys: new Set(children.map(nodeKey)) };
+      pendingGroups.set(group, pending);
+    }
+    const key = nodeKey(child);
+    if (!pending.keys.has(key)) {
+      pending.keys.add(key);
+      pending.children.push(child);
     }
   };
 
@@ -540,6 +566,10 @@ export function mergeTableTreePageChildren(currentChildren: TreeNode[], pageChil
 
   for (const node of incomingNodes) {
     addNode(node);
+  }
+  for (const [group, pending] of pendingGroups) {
+    group.children = sortDatabaseObjectsByName(pending.children, (node) => node.label);
+    group.objectCount = group.children.length;
   }
 
   return sortDatabaseObjectsByName(roots, (node) => node.label);
@@ -656,17 +686,18 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
 
   for (const obj of coalesceXuguPackageObjects(objects, databaseType)) {
     const objectType = normalizeObjectType(obj.object_type);
-    if (!["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"].includes(objectType)) {
+    const schemaIndex = objectType === "INDEX" && supportsSchemaIndexManagement(databaseType);
+    if (!schemaIndex && !["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"].includes(objectType)) {
       continue;
     }
 
-    const name = normalizeDatabaseObjectName(obj.name);
+    const name = schemaIndex ? obj.name : normalizeDatabaseObjectName(obj.name);
     if (!name) continue;
 
-    const childSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
+    const childSchema = schemaIndex ? (obj.schema ?? schema) : obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
     const signature = obj.signature?.trim() || "";
-    const triggerParentName = objectType === "TRIGGER" && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : undefined;
-    const triggerParentSchema = objectType === "TRIGGER" && obj.parent_schema ? normalizeDatabaseObjectName(obj.parent_schema) : undefined;
+    const triggerParentName = schemaIndex ? (obj.parent_name ?? undefined) : objectType === "TRIGGER" && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : undefined;
+    const triggerParentSchema = schemaIndex ? (obj.parent_schema ?? undefined) : objectType === "TRIGGER" && obj.parent_schema ? normalizeDatabaseObjectName(obj.parent_schema) : undefined;
     const dedupeKey = `${exactObjectIdentityKey(objectType, childSchema, name, signature)}\0${triggerParentName || ""}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
@@ -689,11 +720,16 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
     } else {
       const simpleNodeType = simpleObjectNodeType(objectType);
       objectNodes.push({
-        id: objectType === "VIEW" || objectType === "MATERIALIZED_VIEW" ? entry.node.id : `${nodeId}:${childSchema ? `${childSchema}:` : ""}${name}:${signature}:${triggerParentName || ""}:${objectType}`,
+        id: schemaIndex
+          ? `${nodeId}:index:${JSON.stringify([childSchema, name, triggerParentSchema, triggerParentName])}`
+          : objectType === "VIEW" || objectType === "MATERIALIZED_VIEW"
+            ? entry.node.id
+            : `${nodeId}:${childSchema ? `${childSchema}:` : ""}${name}:${signature}:${triggerParentName || ""}:${objectType}`,
         label: signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `${name}(${signature})` : triggerParentName ? `${name} (${triggerParentName})` : name,
         type: simpleNodeType,
         objectName: name,
-        signature: signature || undefined,
+        objectScope: schemaIndex ? "schema" : undefined,
+        signature: objectType === "FUNCTION" || objectType === "PROCEDURE" ? (obj.signature == null ? undefined : signature) : signature || undefined,
         customTypeKind: obj.custom_type_kind ?? undefined,
         hasMembers: obj.has_members ?? undefined,
         comment: obj.comment,
@@ -897,6 +933,7 @@ export function buildObjectGroupPlaceholderNodes({
 }
 
 export function objectGroupRefreshParentId(node: TreeNode): string | null {
+  if (node.tableName) return null;
   if (!objectGroupNodeTypes.has(node.type)) return null;
   const suffixStart = node.id.lastIndexOf(":__");
   if (suffixStart < 0) return null;
@@ -911,17 +948,18 @@ export function buildGroupedObjectTreeNodes({ nodeId, connectionId, database, sc
   const buckets = new Map<string, ObjectInfo[]>();
   const seen = new Set<string>();
   for (const obj of coalesceXuguPackageObjects(objects, databaseType)) {
-    const name = normalizeDatabaseObjectName(obj.name);
-    if (!name) continue;
     const t = normalizeObjectType(obj.object_type);
-    const objectSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema || "";
+    const schemaIndex = t === "INDEX" && supportsSchemaIndexManagement(databaseType);
+    const name = schemaIndex ? obj.name : normalizeDatabaseObjectName(obj.name);
+    if (!name) continue;
+    const objectSchema = schemaIndex ? (obj.schema ?? schema ?? "") : obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema || "";
     const signature = (obj.signature ?? "").trim();
     const triggerParentName = t === "TRIGGER" && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : "";
     const key = `${exactObjectIdentityKey(t, objectSchema, name, signature)}\0${triggerParentName}`;
     if (seen.has(key)) continue;
     seen.add(key);
     const arr = buckets.get(t) ?? [];
-    arr.push({ ...obj, name, schema: obj.schema ? normalizeDatabaseObjectName(obj.schema) : obj.schema });
+    arr.push({ ...obj, name, schema: schemaIndex ? obj.schema : obj.schema ? normalizeDatabaseObjectName(obj.schema) : obj.schema });
     buckets.set(t, arr);
   }
 
@@ -941,20 +979,22 @@ export function buildGroupedObjectTreeNodes({ nodeId, connectionId, database, sc
           objectType: def.objectTypes[0] as "TABLE" | "VIEW" | "MATERIALIZED_VIEW",
         })
       : sortDatabaseObjectsByName(items, (obj) => obj.name).map((obj) => {
-          const childSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
           const objectType = normalizeObjectType(obj.object_type);
+          const schemaIndex = objectType === "INDEX" && supportsSchemaIndexManagement(databaseType);
+          const childSchema = schemaIndex ? (obj.schema ?? schema) : obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
           const childType = typeof def.childType === "function" ? def.childType(objectType) : def.childType;
           const objectTypeSuffix = objectType === "PACKAGE" || objectType === "PACKAGE_BODY" || objectType === "TYPE" || objectType === "TYPE_BODY" ? `:${objectType}` : "";
           const signature = obj.signature?.trim() || "";
           const signatureIdPart = signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `:${signature}` : "";
-          const triggerParentName = (objectType === "TRIGGER" || objectType === "INDEX") && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : undefined;
-          const triggerParentSchema = objectType === "TRIGGER" && obj.parent_schema ? normalizeDatabaseObjectName(obj.parent_schema) : undefined;
+          const triggerParentName = schemaIndex ? (obj.parent_name ?? undefined) : (objectType === "TRIGGER" || objectType === "INDEX") && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : undefined;
+          const triggerParentSchema = schemaIndex ? (obj.parent_schema ?? undefined) : objectType === "TRIGGER" && obj.parent_schema ? normalizeDatabaseObjectName(obj.parent_schema) : undefined;
           return {
-            id: `${nodeId}:${def.key}:${childSchema ? `${childSchema}:` : ""}${obj.name}${signatureIdPart}${triggerParentName ? `:${triggerParentName}` : ""}${objectTypeSuffix}`,
+            id: schemaIndex ? `${nodeId}:${def.key}:${JSON.stringify([childSchema, obj.name, triggerParentSchema, triggerParentName])}` : `${nodeId}:${def.key}:${childSchema ? `${childSchema}:` : ""}${obj.name}${signatureIdPart}${triggerParentName ? `:${triggerParentName}` : ""}${objectTypeSuffix}`,
             label: signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `${obj.name}(${signature})` : triggerParentName ? `${obj.name} (${triggerParentName})` : obj.name,
             type: childType,
             objectName: obj.name,
-            signature: signature || undefined,
+            objectScope: schemaIndex ? ("schema" as const) : undefined,
+            signature: objectType === "FUNCTION" || objectType === "PROCEDURE" ? (obj.signature == null ? undefined : signature) : signature || undefined,
             customTypeKind: obj.custom_type_kind ?? undefined,
             hasMembers: obj.has_members ?? undefined,
             comment: obj.comment,

@@ -24,6 +24,7 @@ import {
   addDriverInstallQueue,
   driverInstallProgressChannel,
   driverInstallProgressPercent,
+  formatDriverInstallProgressText,
   isDriverInstallCanceledError,
   isDriverInstallCancellationTarget,
   isDriverInstallProgressForOperation,
@@ -182,8 +183,7 @@ async function applyDriverStoreDir(kind: DriverStoreDirKind, newDir: string | nu
     };
     toast(t("driverStore.driverStoreDirSuccess", { target }));
     // Restart the app to use the new paths
-    const { relaunch } = await import("@tauri-apps/plugin-process");
-    relaunch();
+    await api.relaunchApp();
   } catch (e: any) {
     toast(t("driverStore.driverStoreDirMigrationFailed", { error: backendError(e) }), 5000);
   } finally {
@@ -244,15 +244,7 @@ const installedJres = computed(() => {
 });
 
 function formatProgressText(p: DriverInstallProgress | null | undefined): string {
-  if (!p) return "";
-  if (p.step === "jre-extract") return t("driverStore.progressJreExtract");
-  if (p.step === "jdbc-plugin-extract") return t("driverStore.progressJdbcPluginExtract");
-  const label = p.step === "jre" ? t("driverStore.progressDownloadJre") : p.step === "jdbc-plugin" ? t("driverStore.progressDownloadJdbcPlugin") : t("driverStore.progressDownloadDriver");
-  if (!p.total) return `${label}...`;
-  const pct = Math.round(((p.downloaded ?? 0) / p.total) * 100);
-  const dl = formatSize(p.downloaded ?? 0);
-  const total = formatSize(p.total);
-  return `${label}  ${dl} / ${total}  (${pct}%)`;
+  return formatDriverInstallProgressText(p, t);
 }
 
 function getAgentProgressText(dbType: string): string {

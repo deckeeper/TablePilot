@@ -50,8 +50,7 @@ pub const METADATA_POOL_BUSY_ERROR: &str = "DBX metadata pool is busy; please re
 pub const MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR: &str =
     "Transaction session not found or expired; it may have been auto-rolled back due to inactivity";
-pub const MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR: &str =
-    "Transaction was auto-rolled back due to 5 minutes of inactivity";
+pub const MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR: &str = "Transaction was auto-rolled back due to inactivity";
 
 pub fn is_manual_transaction_session_expired_error(error: &str) -> bool {
     error.starts_with(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR) || error == MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR
@@ -376,10 +375,11 @@ impl ExecuteMultiResult {
         }
     }
 
-    fn success_with_index(result: db::QueryResult, statement_index: usize) -> Self {
+    fn success_with_index(mut result: db::QueryResult, statement_index: usize) -> Self {
+        let large_value_cells = std::mem::take(&mut result.deferred_large_value_cells);
         Self {
             result,
-            large_value_cells: Vec::new(),
+            large_value_cells,
             execution_error: false,
             statement_index: Some(statement_index),
             error: None,
@@ -398,6 +398,8 @@ impl ExecuteMultiResult {
         mut large_value_cells: Vec<db::LargeValueCell>,
         table_data_preview: bool,
     ) -> Self {
+        large_value_cells =
+            merge_large_value_cells(large_value_cells, std::mem::take(&mut result.deferred_large_value_cells));
         let server_cells = if table_data_preview {
             remap_large_value_cells_around_server_markers(&result, &mut large_value_cells);
             extract_server_large_value_markers(&mut result)
@@ -428,8 +430,14 @@ impl ExecuteMultiResult {
     }
 
     fn success_with_optional_server_large_values(mut result: db::QueryResult, table_data_preview: bool) -> Self {
-        let large_value_cells =
-            if table_data_preview { extract_server_large_value_markers(&mut result) } else { Vec::new() };
+        let mut deferred_cells = std::mem::take(&mut result.deferred_large_value_cells);
+        let large_value_cells = if table_data_preview {
+            remap_large_value_cells_around_server_markers(&result, &mut deferred_cells);
+            extract_server_large_value_markers(&mut result)
+        } else {
+            Vec::new()
+        };
+        let large_value_cells = merge_large_value_cells(large_value_cells, deferred_cells);
         Self {
             result,
             large_value_cells,
@@ -752,10 +760,11 @@ fn merge_large_value_cells(
 }
 
 impl From<db::QueryResult> for ExecuteMultiResult {
-    fn from(result: db::QueryResult) -> Self {
+    fn from(mut result: db::QueryResult) -> Self {
+        let large_value_cells = std::mem::take(&mut result.deferred_large_value_cells);
         Self {
             result,
-            large_value_cells: Vec::new(),
+            large_value_cells,
             execution_error: false,
             statement_index: None,
             error: None,
@@ -856,6 +865,13 @@ async fn connection_is_mongodb(state: &AppState, connection_id: &str) -> bool {
     configs.get(connection_id).is_some_and(|config| config.db_type == DatabaseType::MongoDb)
 }
 
+/// Idle window for a new manual transaction on `connection_id`.
+pub(crate) async fn manual_transaction_idle_timeout(state: &AppState, connection_id: &str) -> std::time::Duration {
+    let configs = state.configs.read().await;
+    let secs = configs.get(connection_id).map(ConnectionConfig::effective_manual_transaction_timeout_secs);
+    std::time::Duration::from_secs(secs.unwrap_or(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS))
+}
+
 async fn connection_database_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
     let configs = state.configs.read().await;
     configs.get(connection_id).map(|config| config.db_type)
@@ -877,11 +893,15 @@ fn statement_split_database_type(config: &ConnectionConfig) -> DatabaseType {
     }
 }
 
-async fn connection_sql_compatibility_mode(
+pub(crate) async fn connection_sql_compatibility_mode(
     state: &AppState,
     pool_key: &str,
     db_type: Option<DatabaseType>,
 ) -> Option<String> {
+    if db_type == Some(DatabaseType::Kingbase) {
+        let Some(PoolKind::Agent(client)) = state.pool_handle(pool_key).await else { return None };
+        return client.compatibility_mode().map(str::to_owned);
+    }
     if db_type != Some(DatabaseType::OpenGauss) {
         return None;
     }
@@ -1199,6 +1219,7 @@ pub enum QueryExecutionMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryExecutionOptions {
+    pub defer_lobs: bool,
     pub max_rows: Option<usize>,
     pub fetch_size: Option<usize>,
     pub page_size: Option<usize>,
@@ -1829,10 +1850,16 @@ async fn do_execute_typed(
             let connection_id = conn.id();
             if let Some(ref execution_id) = options.execution_id {
                 let kill_opts = conn.opts().clone();
+                // The interrupt runs after the user asked to cancel; give the
+                // dedicated kill connection the same infrastructure budget as
+                // the query path instead of the old compile-time 5 s.
+                let kill_timeout = operation_budget.checkout_timeout;
                 state.running_queries.register_interrupt(execution_id, move || {
                     let kill_opts = kill_opts.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = db::mysql::kill_query_with_opts(kill_opts, connection_id).await {
+                        if let Err(error) =
+                            db::mysql::kill_query_with_opts(kill_opts, connection_id, kill_timeout).await
+                        {
                             log::warn!("Failed to cancel MySQL query {connection_id}: {error}");
                         }
                     });
@@ -2026,11 +2053,20 @@ async fn do_execute_typed(
                     Ok(value) => value,
                     Err(err) => return Err(err.into()),
                 };
+            // A display-bound execution must not pay for the rows the caller
+            // discards: the driver stops the TDS stream at `max_rows` and marks
+            // the connection as abandoned, which then gets dropped instead of
+            // returned to the pool. Session-pinned executions keep the old
+            // draining path because the connection carries user state.
+            let stop_at_row_limit =
+                max_rows.is_some() && options.client_session_id.is_none() && !options.use_transaction.unwrap_or(false);
             let execution = async {
                 if execution_mode == QueryExecutionMode::Simple {
                     let mut results =
                         db::sqlserver::execute_simple_batch_with_max_rows(&mut client, &sql, max_rows).await?;
                     Ok(results.remove(0))
+                } else if stop_at_row_limit {
+                    db::sqlserver::execute_query_with_max_rows_stopping(&mut client, &sql, max_rows).await
                 } else {
                     db::sqlserver::execute_query_with_max_rows(&mut client, &sql, max_rows).await
                 }
@@ -2042,7 +2078,11 @@ async fn do_execute_typed(
                     result.execution_time_ms += lock_wait_ms;
                     result
                 });
+            let abandoned = client.take_abandoned_after_row_limit();
             drop(client);
+            if abandoned {
+                state.remove_pool_by_key(pool_key).await;
+            }
             if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -2477,6 +2517,27 @@ fn postgres_preview_fallback_retry_sql(options: &QueryExecutionOptions, error: &
     external_driver_preview_fallback_sql(sql)
 }
 
+/// MySQL-compatible servers that are not actually MySQL (for example HighGo's
+/// MySQL protocol) do not have a `left(json, integer)` overload. The generated
+/// table-data preview wraps JSON columns in `LEFT(...)`, so the preview fails
+/// even though the table itself is readable. Retry once without the generated
+/// wrappers and let the existing large-value markers truncate client-side.
+fn preview_missing_left_function_fallback_sql(
+    options: &QueryExecutionOptions,
+    error: &str,
+    sql: &str,
+) -> Option<String> {
+    if !options.table_data_preview || !is_preview_missing_left_function_error(error) {
+        return None;
+    }
+    external_driver_preview_fallback_sql(sql)
+}
+
+fn is_preview_missing_left_function_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("function left(") && normalized.contains("does not exist")
+}
+
 /// Dispatches one statement on a native PostgreSQL pool according to the
 /// connection's execution mode and schema context.
 #[allow(clippy::too_many_arguments)]
@@ -2724,6 +2785,9 @@ pub(crate) fn external_driver_query_params(
         "schema": schema,
         "maxRows": options.max_rows.unwrap_or(MAX_ROWS),
     });
+    if options.defer_lobs {
+        params["deferLobs"] = serde_json::json!(true);
+    }
     if let Some(fetch_size) = options.fetch_size {
         params["fetchSize"] = serde_json::json!(fetch_size);
     }
@@ -2992,6 +3056,28 @@ async fn execute_sql_statement_with_options_typed_inner(
         result.map_err(|error| error.with_omitted_sql_context(sql))
     };
 
+    if let Err(error) = &result {
+        if let Some(fallback_sql) = preview_missing_left_function_fallback_sql(&options, &error.to_string(), sql) {
+            log::warn!(
+                "[query] table data preview failed because the server has no left() overload; retrying without generated left() wrappers"
+            );
+            return with_sql_context(
+                do_execute_typed(
+                    state,
+                    &pool_key,
+                    mysql_dialect,
+                    Some(database),
+                    &fallback_sql,
+                    schema,
+                    cancel_token.clone(),
+                    options.clone(),
+                    &mut None,
+                )
+                .await,
+            );
+        }
+    }
+
     let action = result.as_ref().err().map(|error| query_execution_error_action(db_type, sql, error));
     if let Some(initial_error) = result.as_ref().err() {
         if let Some(recovered) = recover_postgres_create_table_after_connection_error(
@@ -3193,7 +3279,7 @@ async fn request_large_value_with_cancel(
             let session = sessions.get_mut(txn_id).ok_or(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR)?;
             if session.connection_id != request.connection_id
                 || session.busy
-                || session.last_activity.elapsed().as_secs() >= MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS
+                || session.last_activity.elapsed() >= session.idle_timeout
             {
                 return Err("LOB transaction context expired or busy".to_string());
             }
@@ -3201,13 +3287,25 @@ async fn request_large_value_with_cancel(
             Arc::clone(&session.connection)
         };
         let connection = wait_for_value_opt(cancel_token.clone(), timeout, connection.lock()).await?;
-        let TxnConnection::Agent { client, .. } = &*connection else {
-            return Err("LOB snapshot chunks require an agent transaction".to_string());
+        let result = match &*connection {
+            TxnConnection::Agent { client, .. } => {
+                wait_for_value_opt(cancel_token.clone(), timeout, client.lock())
+                    .await?
+                    .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
+                    .await
+            }
+            TxnConnection::ExternalDriver { session, config, .. } => {
+                let mut params = params;
+                params["connection"] = serde_json::json!(config.as_ref());
+                wait_for_value_opt(
+                    cancel_token.clone(),
+                    timeout,
+                    session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
+                )
+                .await?
+            }
+            _ => return Err("LOB snapshot chunks require a supported transaction".to_string()),
         };
-        let result = wait_for_value_opt(cancel_token.clone(), timeout, client.lock())
-            .await?
-            .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
-            .await;
         if !wait_for_value_opt(cancel_token, timeout, state.transaction_sessions.read()).await?.contains_key(txn_id) {
             return Err("LOB transaction context expired".to_string());
         }
@@ -3226,11 +3324,23 @@ async fn request_large_value_with_cancel(
     .await?
     .ok_or_else(|| "LOB context has expired; rerun the query".to_string())?;
     let _activity = state.pool_activity_touch(pool_key.as_str());
-    let PoolKind::Agent(client) = handle else {
-        return Err("LOB snapshot chunks require an agent connection".to_string());
-    };
-    let mut client = wait_for_value_opt(cancel_token.clone(), timeout, client.lock()).await?;
-    client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await
+    match handle {
+        PoolKind::Agent(client) => {
+            let mut client = wait_for_value_opt(cancel_token.clone(), timeout, client.lock()).await?;
+            client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await
+        }
+        PoolKind::ExternalDriver { session, config, .. } => {
+            let mut params = params;
+            params["connection"] = serde_json::json!(config.as_ref());
+            wait_for_value_opt(
+                cancel_token,
+                timeout,
+                session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
+            )
+            .await?
+        }
+        _ => Err("LOB snapshot chunks require a supported connection".to_string()),
+    }
 }
 
 pub async fn write_large_value_snapshot(
@@ -3386,6 +3496,31 @@ pub async fn close_query_session(
             db::couchdb_driver::close_cursor(&client, session_id).await?;
             Ok(true)
         }
+        _ => Ok(false),
+    }
+}
+
+/// Close only the result cursor held by this transaction; never open a normal
+/// pool or commit/roll back the transaction as part of result cleanup.
+pub async fn close_manual_transaction_query_session(
+    state: &AppState,
+    connection_id: &str,
+    txn_session_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let connection = {
+        let sessions = state.transaction_sessions.read().await;
+        let Some(session) = sessions.get(txn_session_id) else {
+            return Ok(false);
+        };
+        if session.connection_id != connection_id {
+            return Err("Transaction session belongs to a different connection".to_string());
+        }
+        Arc::clone(&session.connection)
+    };
+    let connection = connection.lock().await;
+    match &*connection {
+        TxnConnection::Agent { client, .. } => client.lock().await.close_query_session(session_id).await,
         _ => Ok(false),
     }
 }
@@ -4510,6 +4645,7 @@ fn error_query_result(message: String) -> db::QueryResult {
     db::QueryResult {
         columns: vec!["Error".to_string()],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -4530,6 +4666,7 @@ fn empty_query_result(execution_time_ms: u128) -> db::QueryResult {
     db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -4610,16 +4747,35 @@ async fn execute_multi_sqlserver(
 
         let execution_sql =
             sql_for_execution_context_with_identifier_quote(Some(DatabaseType::SqlServer), batch, schema, Some("["));
+        // Only a single-statement batch can abandon its stream early: a real
+        // multi-statement script must keep draining so the later statements
+        // still produce their own results. Session-pinned tabs keep draining
+        // because the pooled connection carries their temporary objects.
+        let stop_at_row_limit = batches.len() == 1
+            && max_rows.is_some()
+            && options.client_session_id.is_none()
+            && !options.use_transaction.unwrap_or(false);
         let execution = async {
             if execution_mode == QueryExecutionMode::Simple {
                 db::sqlserver::execute_simple_batch_with_max_rows_metadata(&mut client_guard, &execution_sql, max_rows)
                     .await
+            } else if stop_at_row_limit {
+                db::sqlserver::execute_batch_with_max_rows_metadata_stopping(
+                    &mut client_guard,
+                    &execution_sql,
+                    max_rows,
+                )
+                .await
             } else {
                 db::sqlserver::execute_batch_with_max_rows_metadata(&mut client_guard, &execution_sql, max_rows).await
             }
         };
         let result = wait_for_result_opt(cancel_token.clone(), query_timeout, execution).await;
+        let abandoned = client_guard.take_abandoned_after_row_limit();
         drop(client_guard);
+        if abandoned {
+            state.remove_pool_by_key(pool_key).await;
+        }
 
         match result {
             Ok(results) => all_results.extend(sqlserver_batch_results(results).into_iter().map(|mut item| {
@@ -4925,6 +5081,7 @@ async fn execute_statements_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -5113,23 +5270,11 @@ pub async fn execute_schema_diff_deploy(
     let now = chrono::Utc::now().to_rfc3339();
     let db_type = connection_database_type(state, connection_id).await;
 
-    // openGauss A-mode deploy scripts may contain CREATE PACKAGE … / blocks
-    // that must stay intact. Probe the database compatibility mode when a pool
-    // is available; on failure fall back to the plain openGauss splitter.
-    let compatibility_mode = if db_type == Some(DatabaseType::OpenGauss) {
-        let pool = match state
-            .get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) })
-            .await
-        {
-            Ok(pool_key) => match state.pool_handle(&pool_key).await {
-                Some(PoolKind::Postgres(pool)) => Some(pool),
-                _ => None,
-            },
+    // Resolve the live session mode, not the potentially stale saved UI metadata.
+    let compatibility_mode = if matches!(db_type, Some(DatabaseType::OpenGauss | DatabaseType::Kingbase)) {
+        match state.get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) }).await {
+            Ok(pool_key) => connection_sql_compatibility_mode(state, &pool_key, db_type).await,
             Err(_) => None,
-        };
-        match pool {
-            Some(pool) => db::postgres::opengauss_compatibility_mode(&pool).await.ok().flatten(),
-            None => None,
         }
     } else {
         None
@@ -5542,6 +5687,7 @@ async fn exec_tx_pg_inner(
         (Ok(total_affected), Ok(_)) => Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -5639,6 +5785,7 @@ async fn exec_tx_mysql_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -5836,6 +5983,7 @@ async fn exec_tx_sqlite_inner(
                     conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e)).map(|_| db::QueryResult {
                         columns: vec![],
                         column_types: Vec::new(),
+                        deferred_large_value_cells: Vec::new(),
                         column_sortables: vec![],
                         spatial_columns: vec![],
                         spatial_values: vec![],
@@ -5970,6 +6118,7 @@ async fn exec_tx_explicit_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -6299,6 +6448,7 @@ async fn begin_transaction_session(
         connection: Arc::new(tokio::sync::Mutex::new(txn_conn)),
         pool_key: pool_key.clone(),
         last_activity: std::time::Instant::now(),
+        idle_timeout: manual_transaction_idle_timeout(state, connection_id).await,
         busy: false,
         snapshot_rotation_safe: !consistent_snapshot,
         connection_id: connection_id.to_string(),
@@ -6397,6 +6547,7 @@ pub async fn execute_in_manual_transaction(
 
 #[derive(Clone, Debug, Default)]
 pub struct ManualTransactionExecutionOptions {
+    pub defer_lobs: bool,
     pub bound_statements: Option<Vec<dbx_types::types::BlobBoundStatement>>,
     pub max_rows: Option<usize>,
     pub table_data_preview: bool,
@@ -6426,8 +6577,6 @@ pub async fn execute_in_manual_transaction_with_options(
         }
         return sqlserver_manual_transaction::execute(state, txn_session_id, sql, database, schema, options).await;
     }
-    const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
-
     // Resolve statements and validate before taking the per-session connection
     // lock. The session stays visible in the map so close/disconnect cleanup can
     // remove it and roll back once the current DB operation releases the lock.
@@ -6533,7 +6682,7 @@ pub async fn execute_in_manual_transaction_with_options(
         if session.busy {
             return Err("Transaction session is already executing".to_string());
         }
-        if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
+        if session.last_activity.elapsed() > session.idle_timeout {
             let session = sessions.remove(txn_session_id).expect("session exists");
             Some(session)
         } else {
@@ -6620,8 +6769,16 @@ pub async fn execute_in_manual_transaction_with_options(
                 }
             }
             TxnConnection::ExternalDriver { session, config, .. } => {
-                execute_manual_txn_external_driver_statement(session, config, statement, database, schema, row_limit)
-                    .await
+                execute_manual_txn_external_driver_statement(
+                    session,
+                    config,
+                    statement,
+                    database,
+                    schema,
+                    row_limit,
+                    options.defer_lobs,
+                )
+                .await
             }
         };
         match result {
@@ -6730,8 +6887,6 @@ pub(crate) async fn stream_rows_in_manual_transaction_with_cancel<F>(
 where
     F: FnMut(Vec<Vec<serde_json::Value>>) -> Result<(), String> + Send,
 {
-    const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
-
     let expired_connection = {
         let mut sessions = state.transaction_sessions.write().await;
         let Some(session) = sessions.get_mut(txn_session_id) else {
@@ -6740,7 +6895,7 @@ where
         if session.busy {
             return Err("Transaction session is already executing".to_string());
         }
-        if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
+        if session.last_activity.elapsed() > session.idle_timeout {
             Some(sessions.remove(txn_session_id).expect("session exists").connection)
         } else {
             session.busy = true;
@@ -7143,9 +7298,11 @@ async fn execute_manual_txn_external_driver_statement(
     database: &str,
     schema: Option<&str>,
     row_limit: usize,
+    defer_lobs: bool,
 ) -> Result<db::QueryResult, String> {
     let timeout_secs = config.effective_query_timeout_secs();
     let options = QueryExecutionOptions {
+        defer_lobs,
         max_rows: Some(row_limit.max(1)),
         timeout_secs: Some(timeout_secs),
         ..QueryExecutionOptions::default()
@@ -7162,7 +7319,7 @@ async fn execute_manual_txn_external_driver_statement(
 }
 
 /// Spawn a background task that removes and rolls back a transaction session
-/// after 5 minutes of inactivity. The task does not hold the global lock across
+/// after its idle timeout. The task does not hold the global lock across
 /// I/O: it briefly checks the map, and if the session exists and is expired,
 /// removes it, drops the lock, then rolls back the held connection.
 ///
@@ -7180,14 +7337,16 @@ fn spawn_txn_idle_watcher_for_sessions(
     txn_session_id: String,
 ) {
     tokio::spawn(async move {
-        const TXN_IDLE_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
-        tokio::time::sleep(TXN_IDLE_TIMEOUT).await;
+        // The window is fixed per session at BEGIN; a vanished session needs no watcher.
+        let Some(idle_timeout) = sessions.read().await.get(&txn_session_id).map(|session| session.idle_timeout) else {
+            return;
+        };
+        tokio::time::sleep(idle_timeout).await;
 
         let removed: Option<TransactionSession> = {
             let mut guard = sessions.write().await;
             match guard.get(&txn_session_id) {
-                Some(session) if !session.busy && session.last_activity.elapsed() >= TXN_IDLE_TIMEOUT => {
+                Some(session) if !session.busy && session.last_activity.elapsed() >= session.idle_timeout => {
                     guard.remove(&txn_session_id)
                 }
                 _ => None,
@@ -7198,8 +7357,9 @@ fn spawn_txn_idle_watcher_for_sessions(
             let mut conn = session.connection.lock().await;
             let _ = rollback_manual_txn_connection(&mut conn).await;
             log::info!(
-                "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after 5 minutes of inactivity",
-                txn_session_id
+                "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after {}s of inactivity",
+                txn_session_id,
+                session.idle_timeout.as_secs()
             );
         }
     });
@@ -7232,6 +7392,7 @@ async fn execute_manual_txn_mysql_statement(
             return Ok(db::QueryResult {
                 columns: Vec::new(),
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -7265,6 +7426,7 @@ async fn execute_manual_txn_mysql_statement(
         Ok(db::QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -7286,6 +7448,7 @@ async fn execute_manual_txn_mysql_statement(
         Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -7348,6 +7511,7 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -7382,6 +7546,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -7404,6 +7569,54 @@ mod tests {
     use crate::query_cancel::RunningTaskMetadata;
     use std::sync::atomic::Ordering;
     use tokio::time::timeout;
+
+    #[test]
+    fn deferred_cells_reach_all_multi_result_success_constructors_once() {
+        let sample = || {
+            serde_json::from_value::<db::QueryResult>(serde_json::json!({
+                "columns": ["__DBX_LARGE_VALUE_BYTES_user_column"], "rows": [["preview"]],
+                "affected_rows": 0, "execution_time_ms": 0,
+                "large_value_cells": [{ "row_index": 0, "column_index": 0,
+                    "original_bytes": 67108864, "value_ref": "original-reference" }]
+            }))
+            .unwrap()
+        };
+        for result in [
+            ExecuteMultiResult::from(sample()),
+            ExecuteMultiResult::success_with_index(sample(), 0),
+            ExecuteMultiResult::success_with_index_and_large_values(sample(), 0, Vec::new(), false),
+            ExecuteMultiResult::success_with_optional_server_large_values(sample(), false),
+        ] {
+            assert!(result.result.deferred_large_value_cells.is_empty());
+            assert_eq!(result.large_value_cells.len(), 1);
+            assert_eq!(result.result.columns, vec!["__DBX_LARGE_VALUE_BYTES_user_column"]);
+            let wire = serde_json::to_string(&result).unwrap();
+            assert_eq!(wire.matches("\"large_value_cells\":").count(), 1);
+            assert!(wire.contains("original-reference"));
+        }
+    }
+
+    #[test]
+    fn deferred_cells_follow_columns_when_nclob_markers_are_removed() {
+        let sample = || {
+            serde_json::from_value::<db::QueryResult>(serde_json::json!({
+            "columns": ["ID", "N", "__DBX_LARGE_VALUE_BYTES_T_1", "C"],
+            "rows": [[1, "national preview", "T:3", "clob preview"]],
+            "affected_rows": 0, "execution_time_ms": 0,
+            "large_value_cells": [{"row_index":0,"column_index":3,"original_bytes":67108864,"value_ref":"clob-original"}]
+        })).unwrap()
+        };
+        for result in [
+            ExecuteMultiResult::success_with_optional_server_large_values(sample(), true),
+            ExecuteMultiResult::success_with_index_and_large_values(sample(), 0, Vec::new(), true),
+        ] {
+            assert_eq!(result.result.columns, vec!["ID", "N", "C"]);
+            let deferred = result.large_value_cells.iter().find(|cell| cell.value_ref.is_some()).unwrap();
+            assert_eq!(deferred.column_index, 2);
+            assert_eq!(deferred.value_ref.as_deref(), Some("clob-original"));
+            assert!(result.large_value_cells.iter().any(|cell| cell.column_index == 1 && cell.value_ref.is_none()));
+        }
+    }
 
     mod manual_transaction_snapshot_tests {
         use super::*;
@@ -7520,6 +7733,7 @@ mod tests {
                     connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::Postgres(Box::new(connection)))),
                     pool_key: "conn-1".to_string(),
                     last_activity: std::time::Instant::now(),
+                    idle_timeout: std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS),
                     busy: false,
                     snapshot_rotation_safe: true,
                     connection_id: "conn-1".to_string(),
@@ -8514,6 +8728,55 @@ for line in sys.stdin:
         assert!(validate_query_execution_mode(Some(DatabaseType::Postgres), "SELECT 1; SELECT 2", &options).is_err());
     }
 
+    fn idle_test_session(idle_timeout: Duration) -> TransactionSession {
+        TransactionSession {
+            sqlserver: None,
+            connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::Mysql(None))),
+            pool_key: "conn-1".to_string(),
+            last_activity: std::time::Instant::now(),
+            idle_timeout,
+            busy: false,
+            snapshot_rotation_safe: false,
+            connection_id: "conn-1".to_string(),
+            database: "test".to_string(),
+            schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_rolls_back_after_the_session_own_timeout() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut guard = sessions.write().await;
+            guard.insert("short".to_string(), idle_test_session(Duration::from_millis(50)));
+            guard.insert("long".to_string(), idle_test_session(Duration::from_secs(3600)));
+        }
+        spawn_txn_idle_watcher_for_sessions(Arc::clone(&sessions), "short".to_string());
+        spawn_txn_idle_watcher_for_sessions(Arc::clone(&sessions), "long".to_string());
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let guard = sessions.read().await;
+        assert!(!guard.contains_key("short"), "a 50ms session must be reaped long before the 300s default");
+        assert!(guard.contains_key("long"), "a session with a longer window must survive the same wait");
+    }
+
+    #[tokio::test]
+    async fn manual_transaction_idle_timeout_follows_connection_config() {
+        let dir = std::env::temp_dir().join(format!("dbx-txn-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = test_connection_config(DatabaseType::Postgres);
+        config.manual_transaction_timeout_secs = 1_800;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        assert_eq!(manual_transaction_idle_timeout(&state, "conn-1").await, Duration::from_secs(1_800));
+        // An unknown connection keeps the historical five-minute window.
+        assert_eq!(manual_transaction_idle_timeout(&state, "missing").await, Duration::from_secs(300));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
             oracle_oci_nls_lang: None,
@@ -8546,6 +8809,8 @@ for line in sys.stdin:
             connect_timeout_secs: 10,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 30,
             ssl: false,
             ca_cert_path: String::new(),
@@ -9808,6 +10073,7 @@ for line in sys.stdin:
                 mysql_batch_result(db::QueryResult {
                     columns: vec!["COUNT(*)".to_string()],
                     column_types: vec!["BIGINT".to_string()],
+                    deferred_large_value_cells: Vec::new(),
                     column_sortables: vec![],
                     spatial_columns: vec![],
                     spatial_values: vec![],
@@ -10084,6 +10350,7 @@ for line in sys.stdin:
         let result_set = |value| db::QueryResult {
             columns: vec!["value".to_string()],
             column_types: vec!["INT".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -10833,6 +11100,31 @@ for line in sys.stdin:
         assert!(postgres_preview_fallback_retry_sql(&QueryExecutionOptions::default(), error, sql).is_none());
     }
 
+    #[test]
+    fn preview_missing_left_function_retry_rewrites_generated_mysql_previews() {
+        let options = QueryExecutionOptions { table_data_preview: true, ..Default::default() };
+        let sql = concat!(
+            "SELECT `id`, LEFT(`Words`, 101) AS `Words`, ",
+            "CONCAT('T:100:', LENGTH(`Words`)) AS `__DBX_LARGE_VALUE_BYTES_T_1` FROM `vocab` LIMIT 100"
+        );
+        let error = "Server error: `ERROR 32900 (HY000): function left(json, integer) does not exist'";
+
+        assert_eq!(
+            preview_missing_left_function_fallback_sql(&options, error, sql).as_deref(),
+            Some(
+                "SELECT `id`, `Words` AS `Words`, CONCAT('T:100:', LENGTH(`Words`)) AS `__DBX_LARGE_VALUE_BYTES_T_1` FROM `vocab` LIMIT 100"
+            )
+        );
+
+        // User SQL without the generated marker is never rewritten, unrelated
+        // errors never trigger a retry, and the data-grid flag is required.
+        assert!(
+            preview_missing_left_function_fallback_sql(&options, error, "SELECT LEFT(Words, 100) FROM vocab").is_none()
+        );
+        assert!(preview_missing_left_function_fallback_sql(&options, "ERROR: syntax error", sql).is_none());
+        assert!(preview_missing_left_function_fallback_sql(&QueryExecutionOptions::default(), error, sql).is_none());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn external_driver_preview_retry_preserves_marker_truncation() {
@@ -10952,7 +11244,30 @@ for line in sys.stdin:
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  case \"$line\" in\n    *'\"method\":\"executeInManualTransaction\"'*)\n      echo executeInManualTransaction >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"columns\":[\"value\"],\"column_types\":[],\"column_sortables\":[],\"rows\":[[42]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false,\"session_id\":null,\"has_more\":false}}}}\\n' \"$id\"\n      ;;\n    *'\"method\":\"beginManualTransaction\"'*)\n      echo beginManualTransaction >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"ok\":true}}}}\\n' \"$id\"\n      ;;\n    *'\"method\":\"commitManualTransaction\"'*)\n      echo commitManualTransaction >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"ok\":true}}}}\\n' \"$id\"\n      ;;\n  esac\ndone\n",
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"executeInManualTransaction"'*)
+      echo executeInManualTransaction >> '{}'
+      printf '{{"id":%s,"result":{{"columns":["value"],"column_types":[],"column_sortables":[],"rows":[[42]],"affected_rows":0,"execution_time_ms":1,"truncated":false,"session_id":null,"has_more":false}}}}\n' "$id"
+      ;;
+    *'"method":"beginManualTransaction"'*)
+      echo beginManualTransaction >> '{}'
+      printf '{{"id":%s,"result":{{"ok":true}}}}\n' "$id"
+      ;;
+    *'"method":"read_large_value_chunk"'*|*'"method":"release_large_value"'*)
+      echo lob >> '{}'
+      printf '{{"id":%s,"result":{{"status":"ok","data":"original","next_offset":8,"eof":true,"value_kind":"text"}}}}\n' "$id"
+      ;;
+    *'"method":"commitManualTransaction"'*)
+      echo commitManualTransaction >> '{}'
+      printf '{{"id":%s,"result":{{"ok":true}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                calls.display(),
                 calls.display(),
                 calls.display(),
                 calls.display()
@@ -11038,6 +11353,7 @@ for line in sys.stdin:
                 })),
                 pool_key: pool_key.to_string(),
                 last_activity: std::time::Instant::now(),
+                idle_timeout: std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS),
                 busy: false,
                 snapshot_rotation_safe: true,
                 connection_id: "jdbc-conn".to_string(),
@@ -11049,11 +11365,45 @@ for line in sys.stdin:
         let results =
             execute_in_manual_transaction(&state, "txn-test", "SELECT 42", "dbx_test", None, Some(10)).await.unwrap();
         assert_eq!(results[0].rows, vec![vec![serde_json::json!(42)]]);
+        let request: LargeValueRequest = serde_json::from_value(serde_json::json!({
+            "connectionId":"jdbc-conn", "database":"dbx_test", "txnSessionId":"txn-test",
+            "valueRef":"original-ref", "offset":0, "limit":4096
+        }))
+        .unwrap();
+        for release in [false, true] {
+            let mut other_connection = request.clone();
+            other_connection.connection_id = "other-connection".into();
+            assert_eq!(
+                request_large_value(&state, other_connection, release).await.unwrap_err(),
+                "LOB transaction context expired or busy"
+            );
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().busy = true;
+            assert_eq!(
+                request_large_value(&state, request.clone(), release).await.unwrap_err(),
+                "LOB transaction context expired or busy"
+            );
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().busy = false;
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().last_activity =
+                std::time::Instant::now() - Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS + 1);
+            assert_eq!(
+                request_large_value(&state, request.clone(), release).await.unwrap_err(),
+                "LOB transaction context expired or busy"
+            );
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().last_activity =
+                std::time::Instant::now();
+            assert_eq!(request_large_value(&state, request.clone(), release).await.unwrap()["data"], "original");
+        }
         commit_manual_transaction(&state, "txn-test").await.unwrap();
         assert!(state.pool_handle(pool_key).await.is_none());
+        for release in [false, true] {
+            assert_eq!(
+                request_large_value(&state, request.clone(), release).await.unwrap_err(),
+                MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
-            "beginManualTransaction\nexecuteInManualTransaction\ncommitManualTransaction\n"
+            "beginManualTransaction\nexecuteInManualTransaction\nlob\nlob\ncommitManualTransaction\n"
         );
 
         state.shutdown(Duration::from_secs(1)).await;
@@ -11231,6 +11581,7 @@ for line in sys.stdin:
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -11258,6 +11609,7 @@ for line in sys.stdin:
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -11670,6 +12022,8 @@ for line in sys.stdin:
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),
@@ -12209,9 +12563,16 @@ for line in sys.stdin:
 import sys
 
 print(json.dumps({{"ready": True}}), flush=True)
+cursor_ids = {{"cursor-1"}}
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
+    if method == "close_query_session":
+        cursor_id = request.get("params", {{}}).get("sessionId")
+        closed = cursor_id in cursor_ids
+        cursor_ids.discard(cursor_id)
+        print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": closed}}), flush=True)
+        continue
     if method == "execute_query":
         params = request.get("params", {{}})
         sql = params.get("sql", "")
@@ -12278,6 +12639,7 @@ for line in sys.stdin:
                 })),
                 pool_key: "agent-conn".to_string(),
                 last_activity: std::time::Instant::now(),
+                idle_timeout: std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS),
                 busy: false,
                 snapshot_rotation_safe: true,
                 connection_id: "agent-conn".to_string(),
@@ -12286,6 +12648,35 @@ for line in sys.stdin:
             },
         );
         (state, txn_session_id, dir)
+    }
+
+    #[tokio::test]
+    async fn manual_transaction_cursor_cleanup_uses_its_owner_without_ending_transaction() {
+        let (state, txn_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+        assert!(close_manual_transaction_query_session(&state, "other-connection", &txn_id, "cursor-1").await.is_err());
+        assert!(!close_manual_transaction_query_session(&state, "agent-conn", "missing-txn", "cursor-1")
+            .await
+            .unwrap());
+        // Only the held transaction has an Agent. A lookup through the normal
+        // connection pool cannot close this cursor.
+        assert!(close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        assert!(!close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        let result = execute_in_manual_transaction_with_options(
+            &state,
+            &txn_id,
+            "SELECT 1 FROM DUAL",
+            "ORCL",
+            Some("APP"),
+            ManualTransactionExecutionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0].result.rows[0][0], "SELECT 1 FROM DUAL");
+        assert!(state.transaction_sessions.read().await.contains_key(&txn_id));
+        rollback_manual_transaction(&state, &txn_id).await.unwrap();
+        assert!(!close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn manual_sql_file_request(session_id: &str) -> crate::sql::SqlFileRequest {
@@ -12704,6 +13095,7 @@ for line in sys.stdin:
         let result = db::QueryResult {
             columns: vec!["id".to_string(), "nested".to_string()],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -12738,6 +13130,7 @@ for line in sys.stdin:
                 "note".to_string(),
             ],
             column_types: vec!["integer".to_string(), "text".to_string(), "bigint".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true, true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -12782,6 +13175,64 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn extracts_oracle_rowid_preview_markers_indexed_by_result_position() {
+        // 无主键 Oracle 基表的截断投影以 __DBX_ROWID 开头，marker 下标是结果集
+        // 位置（源列在结果中的下标），不是表列下标——位置校验失败会整组拒识。
+        let mut result = db::QueryResult {
+            columns: vec![
+                "__DBX_ROWID".to_string(),
+                "ID".to_string(),
+                "PAYLOAD".to_string(),
+                format!("{}T_2", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
+            ],
+            column_types: vec![
+                "varchar2".to_string(),
+                "number".to_string(),
+                "varchar2".to_string(),
+                "varchar2".to_string(),
+            ],
+            deferred_large_value_cells: Vec::new(),
+            column_sortables: vec![true, true, true, true],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![
+                vec![
+                    serde_json::json!("AAAR1yAAHAAAAFjAAA"),
+                    serde_json::json!(1),
+                    serde_json::json!("x".repeat(1000)),
+                    serde_json::json!("T:999:5231"),
+                ],
+                vec![
+                    serde_json::json!("AAAR1yAAHAAAAFjAAB"),
+                    serde_json::json!(2),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                ],
+            ],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            server_execute_time_us: None,
+            query_timings_ms: None,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        };
+
+        let cells = extract_server_large_value_markers(&mut result);
+
+        assert_eq!(result.columns, vec!["__DBX_ROWID", "ID", "PAYLOAD"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][2], serde_json::json!(format!("{}...", "x".repeat(999))));
+        assert_eq!(result.rows[1][2], serde_json::Value::Null);
+        assert_eq!(
+            cells,
+            vec![db::LargeValueCell { row_index: 0, column_index: 2, original_bytes: 5231, value_ref: None }]
+        );
+    }
+
+    #[test]
     fn extracts_lowercased_server_large_value_markers_from_case_folding_servers() {
         // KingbaseES instances with case-insensitive identifiers return even
         // quoted marker aliases folded to lowercase; the markers must still be
@@ -12801,6 +13252,7 @@ for line in sys.stdin:
                 "text".to_string(),
                 "text".to_string(),
             ],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true; 5],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -12867,6 +13319,7 @@ for line in sys.stdin:
                 format!("{}B_0", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
             ],
             column_types: vec!["bytea".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13029,6 +13482,7 @@ for line in sys.stdin:
                 format!("{}C_1", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
             ],
             column_types: vec!["number".to_string(), "varchar2".to_string(), "varchar2".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true; 3],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13070,6 +13524,7 @@ for line in sys.stdin:
         let mut result = db::QueryResult {
             columns: vec!["embedding".to_string(), marker],
             column_types: vec!["text".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13107,6 +13562,7 @@ for line in sys.stdin:
                 format!("{}K_1", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
             ],
             column_types: vec!["text".to_string(), "text".to_string(), "text".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true; 4],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),

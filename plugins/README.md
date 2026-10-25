@@ -263,10 +263,7 @@ A field may declare `visible_when` and `required_when`. A leaf clause matches wh
     ]
   },
   "required_when": {
-    "all_of": [
-      { "field": "sudo_source", "one_of": ["custom"] },
-      { "not": { "field": "read_only", "one_of": [true] } }
-    ]
+    "all_of": [{ "field": "sudo_source", "one_of": ["custom"] }, { "not": { "field": "read_only", "one_of": [true] } }]
   }
 }
 ```
@@ -369,6 +366,7 @@ A workbench opens in a normal persistent DBX tab. The iframe is loaded with `san
 - `sendBinary(channel, data)` — requires `host.binary`
 - `readAsset(path)` / `readAssetUrl(path)`
 - `openWorkbench(contributionId, context)` — requires `host.workbench`
+- `setTitle(title)` / `getTitle()` — updates (pass `null` to reset) or reads the calling tab title; requires `host.workbench`
 - `executeCommand(commandId, context?)` — executes one of this plugin's own declared commands through the same path a menu placement takes: `enablement` is re-checked, `presentation: "panel"` commands dock in the bottom panel and `presentation: "tab"` (default) commands open a workbench tab, with §4.1 singleton reuse. `context` merges over the command-declared context (reserved identity fields stay host-owned) and scopes `instance_key` `{{path}}` placeholders — declare `instance_key: "logs:{{connectionId}}"` to get one panel instance per connection; a template that cannot resolve falls back to its literal. Resolves `{ error }` for expected outcomes (unknown command, enablement-blocked); requires `host.workbench`
 - `openFilesystem(providerId, context)` — requires `host.filesystem`
 - `getPlanCapabilities(connectionId)` / `explainPlan(request)` — reads an estimated execution plan for one connection; requires `host.plans:read`, see [Estimated execution plans](#estimated-execution-plans)
@@ -380,7 +378,7 @@ A workbench opens in a normal persistent DBX tab. The iframe is loaded with `san
 - `ai.listModels()` — requires `host.ai` and `capabilities.aiCompletion`. Returns only `{ configId, name, model, isDefault }` for configured API models. No endpoints, keys, headers, or CLI environment are exposed. CLI agents are excluded from text completion.
 - `ai.generateText({ configId, model, prompt })` — requires `host.ai` and `capabilities.aiCompletion`; prompts are nonempty and limited to 100000 characters. The desktop host asks for confirmation naming the plugin and selected model before each send, resolves credentials itself, and returns plain text (up to 16000 characters). No tools or file writes are enabled. One generation per workbench may run at a time. Provider failures return a generic error to avoid leaking secrets. Old hosts may omit these methods/capability.
 - `ai.setRecommendations({ context, items })` / `ai.clearRecommendations()` — updates the context-aware quick-question chips shown by the global DBX AI panel; requires `host.ai`. Each item is `{ id, label, prompt, order? }`, supports `{{path.to.value}}` placeholders resolved against the supplied context, and is capped at five visible items. Recommendations belong to the current workbench instance and are not persisted into conversation history. Use `ai.openConversation()` when a user clicks a recommendation; DBX sends the selected prompt through the same snapshot safety boundary.
-- `capabilities` — `{ downloadFile, planApi, schemaMetadataApi, dataApi, storage, ai, aiModelDiscovery, aiCompletion, aiRecommendations }` advertised in the init message; a missing or `false` entry means that Host API group is unavailable on this host, so gate the matching call on it instead of probing with a request
+- `capabilities` — `{ downloadFile, planApi, schemaMetadataApi, dataApi, connectionsApi, storage, ai, aiModelDiscovery, aiCompletion, aiRecommendations }` advertised in the init message; a missing or `false` entry means that Host API group is unavailable on this host, so gate the matching call on it instead of probing with a request
 - `onEvent(listener)` — events are forwarded only with `host.events`
 - `onBinary(listener)` — binary frames are forwarded only with `host.binary`; listeners receive `{ channel, data: Uint8Array }`
 
@@ -600,7 +598,7 @@ if (window.dbxPlugin.capabilities.schemaMetadataApi) {
     connectionId,
     database,
     schema,
-    table: "users"
+    table: "users",
   });
   renderColumns(metadata.columns);
 }
@@ -659,7 +657,7 @@ if (window.dbxPlugin.capabilities.dataApi) {
     connectionId,
     database,
     sql: "SELECT status, count(*) AS total FROM orders GROUP BY status",
-    maxRows: 200
+    maxRows: 200,
   });
 }
 ```
@@ -683,10 +681,10 @@ A plugin can read the **estimated** execution plan of a query without touching a
 }
 ```
 
-| Request | Purpose |
-| --- | --- |
-| `host.getPlanCapabilities({ connectionId })` | Reports what the host and this connection can plan. It only reads the stored connection config; it never connects or probes the server. The connection must already be open. |
-| `host.explainPlan({ connectionId, database?, schema?, sql, mode, timeoutMs? })` | Returns the estimated plan for `sql`. The connection must already be open. |
+| Request                                                                         | Purpose                                                                                                                                                                      |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host.getPlanCapabilities({ connectionId })`                                    | Reports what the host and this connection can plan. It only reads the stored connection config; it never connects or probes the server. The connection must already be open. |
+| `host.explainPlan({ connectionId, database?, schema?, sql, mode, timeoutMs? })` | Returns the estimated plan for `sql`. The connection must already be open.                                                                                                   |
 
 `host.getPlanCapabilities` returns:
 
@@ -802,6 +800,55 @@ Host rules (`crates/dbx-core/src/ai/plugin_tools.rs`):
 - Names are exposed as `<prefix>__<tool>` (`io.dbx.ssh` → `ssh__…`). Schemas are reduced to a provider-portable subset (`type`, `description`, `properties`, `required`, `items`, string `enum`, numeric/length/item bounds); argument names must match `[A-Za-z_][A-Za-z0-9_]{0,63}`.
 - Discovery times out after 8 s per connection, calls after 120 s, and results are compacted before reaching the model.
 
+## Redis value codec capability
+
+Native plugins can expose decoders in Redis String/bitmap and collection-member
+details using Manifest v1 capability metadata:
+
+```json
+{ "capabilities": [{ "id": "my-codec", "label": "My format", "kind": "redis-value-codec-v1" }] }
+```
+
+The user opens **Plugin** in the Decode row and explicitly selects a codec.
+Listing the plugins sends no value. The selection stays local to that view,
+and later visible-payload changes re-run that decoder; stale responses are
+discarded. Compatible plugins must have a native backend entrypoint.
+
+The host invokes the chosen sidecar's `redis/codec/decode` method:
+
+```json
+{
+  "codecId": "my-codec",
+  "rawBase64": "AP+A",
+  "context": { "db": 0, "keyRaw": "opaque-key-identity", "redisType": "string" }
+}
+```
+
+`rawBase64` is canonical standard Base64 of the original bytes, including NUL
+and non-UTF-8 data. `keyRaw` is the existing Redis API's opaque Key identity;
+do not reinterpret its encoding. For collection members, the bytes belong to
+the selected member/field value and `redisType` names the containing Redis
+type; no field or index identity is supplied. The plugin receives no database
+credentials, connection configuration, connection string or host driver.
+
+Return `{ "format": "json", "value": <JSON value> }` or
+`{ "format": "text", "value": "UTF-8 text" }`. The host uses its JSON tree or
+escaped text renderer, never HTML. JSON primitives, including `null`, are valid.
+JSON numbers follow JavaScript semantics; use strings for precise large integers.
+
+Calls time out after 10 seconds. Raw input and the UTF-8 serialized result
+value are each limited to 2 MiB. Truncated previews are not passed to plugins.
+Errors clear the previous decoded result; choose a built-in codec to return
+to the raw view. This surface is read-only: it never calls an encoder or
+writes data back to Redis. Plugins may expose encode and round-trip tests in
+their own workbench. External-program plugins should use binary stdin/stdout,
+bounded execution/output, and stderr for diagnostics.
+
+This requires a DBX build with the Redis plugin codec view; older hosts may
+install a plugin but do not offer it in Redis details. Package with the current
+source CLI if an older published CLI rejects `capabilities`: the current
+Manifest schema and runtime accept that field.
+
 ## Backend protocol
 
 The backend is a persistent child process with stdin/stdout reserved for the DBX protocol. Diagnostics must go to stderr.
@@ -884,7 +931,7 @@ Sidecars are shared per plugin process, not spawned per tab. Plugins own their i
 - **UI isolation:** sandboxed iframe, restrictive CSP, bounded bridge payloads, safe asset paths, plugin identity binding.
 - **Secret persistence:** plugin secrets are removed from connection JSON and stored through DBX's secret-store path. Ordinary cloud-sync snapshots always contain redacted placeholders. Secrets enter sync data only inside the encrypted payload when the user has configured a sync passphrase; without one, plugin secrets remain local and are not synchronized.
 - **Native backend trust:** a native sidecar runs with the current OS user's privileges. A signature identifies the repository that approved and published the package; it is not an OS sandbox or proof that the author is harmless. Install only plugins whose backend code you trust.
-- **Permission declarations:** privileged host bridge operations require declared permissions. Plugin UI network egress is fully blocked except for explicitly declared `host.network:` origins. Native process filesystem/network access cannot currently be completely mediated by DBX. `host.plans:read` grants reading host-generated estimated execution plans only; it never grants SQL execution, writes, DDL, or actual plans. `host.schema:read` grants only narrow metadata for a table on an already-open host connection; it never grants arbitrary SQL, writes, or reconnects. `host.storage` confines the workbench UI to a small JSON store inside its own `plugin-data/<id>` directory; it grants no other filesystem reach. `host.ai` lets a workbench open a built-in AI conversation seeded with a snapshot the plugin supplies and publish context-aware recommendation chips; the conversation API returns no model output or configuration. The optional text completion API returns sanitized model choices and generated text only after host confirmation; it never exposes credentials or SQL execution. `host.data:read` grants single read-only statements only on connections the user consented to, per plugin and connection, revocable in Plugin Center; it never grants writes, DDL, locking reads, database switches, or reconnects.
+- **Permission declarations:** privileged host bridge operations require declared permissions. Plugin UI network egress is fully blocked except for explicitly declared `host.network:` origins. Native process filesystem/network access cannot currently be completely mediated by DBX. `host.plans:read` grants reading host-generated estimated execution plans only; it never grants SQL execution, writes, DDL, or actual plans. `host.schema:read` grants only narrow metadata for a table on an already-open host connection; it never grants arbitrary SQL, writes, or reconnects. `host.storage` confines the workbench UI to a small JSON store inside its own `plugin-data/<id>` directory; it grants no other filesystem reach. `host.ai` lets a workbench open a built-in AI conversation seeded with a snapshot the plugin supplies and publish context-aware recommendation chips; the conversation API returns no model output or configuration. The optional text completion API returns sanitized model choices and generated text only after host confirmation; it never exposes credentials or SQL execution. `host.data:read` grants single read-only statements only on connections the user consented to, per plugin and connection, revocable in Plugin Center; it never grants writes, DDL, locking reads, database switches, or reconnects. `host.connections:read` grants read-only, secret-free summary metadata for all configured connections; it never grants passwords, credentials, or connection strings.
 - **AI tool exposure:** plugin MCP tools reach the built-in AI agent only after the user enabled the plugin in Plugin Center, only on open connections and — unless declared read-only — only after a per-call approval; visibility is revocable per plugin (a manifest `ai_tools: false` also opts out). The external `dbx` MCP server exposes a plugin's tools only when its manifest declares `external_tools: true`, and additionally applies the global MCP connection allowlist.
 
 Custom repository public keys can be added or removed in Plugin Center. Obtain them through a channel independent from the downloaded package.
