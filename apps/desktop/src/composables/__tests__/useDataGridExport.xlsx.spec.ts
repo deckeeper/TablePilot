@@ -4,6 +4,7 @@ import { computed, ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useDataGridExport, type UseDataGridExportOptions } from "@/composables/useDataGridExport";
 import type { QueryResult } from "@/types/database";
+import { useExportTracker } from "@/composables/useExportTracker";
 
 const mocks = vi.hoisted(() => ({
   exportQueryResultsXlsx: vi.fn(),
@@ -42,16 +43,6 @@ vi.mock("@/composables/useDataGridExtractor", () => ({
     previewWithExtractor: vi.fn(),
     previewWithPreference: vi.fn(),
     canCopyWithExtractor: vi.fn(),
-  }),
-}));
-
-vi.mock("@/composables/useExportTracker", () => ({
-  useExportTracker: () => ({
-    addTask: vi.fn(),
-    updateTableExportTask: vi.fn(),
-    registerTaskCancelHandler: vi.fn(),
-    unregisterTaskCancelHandler: vi.fn(),
-    removeTask: vi.fn(),
   }),
 }));
 
@@ -121,6 +112,8 @@ function createOptions(): UseDataGridExportOptions {
 describe("useDataGridExport XLSX headers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    const tracker = useExportTracker();
+    for (const task of tracker.tasks.value) tracker.removeTask(task.exportId);
   });
 
   it("maps combined headers independently for every result sheet", async () => {
@@ -171,6 +164,34 @@ describe("useDataGridExport XLSX headers", () => {
       expect.objectContaining({
         format: "xlsx",
         exportColumnTypes: ["int", "decimal(18, 3)"],
+      }),
+      expect.any(Function),
+    );
+  });
+
+  it("passes DuckDB computed column types for backend full xlsx query result export (#12364)", async () => {
+    const options = createOptions();
+    options.allColumns = computed(() => ["金额"]);
+    options.allColumnTypes = computed(() => ["DECIMAL(18, 2)"]);
+    options.queryResultExportRequest = vi.fn(async (request) => ({
+      ...request,
+      connectionId: "conn",
+      database: "dbx",
+      databaseType: "duckdb",
+      sql: "SELECT (val + 1.10) AS 金额 FROM tab",
+      queryBaseSql: "SELECT (val + 1.10) AS 金额 FROM tab",
+      useAgentCursor: false,
+      pageSize: 1000,
+      keysetOptimizationEnabled: true,
+    }));
+    const state = useDataGridExport(options);
+
+    await state.exportXlsx();
+
+    expect(mocks.startQueryResultExport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        format: "xlsx",
+        exportColumnTypes: ["DECIMAL(18, 2)"],
       }),
       expect.any(Function),
     );
