@@ -49,6 +49,8 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         connect_timeout_secs: 10,
         query_timeout_secs: 30,
         idle_timeout_secs: 60,
+        manual_transaction_timeout_secs: 300,
+        idle_disconnect_secs: 0,
         keepalive_interval_secs: 0,
         ssl: false,
         ca_cert_path: String::new(),
@@ -90,6 +92,8 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         database_info: None,
         sidebar_auto_load_all_tables: false,
         show_database_links: None,
+        show_native_jobs: None,
+        show_user_admin: None,
     }
 }
 
@@ -228,6 +232,7 @@ async fn manual_e2e_sqlserver_default_split_zip_export_then_import_skip_relation
         // before the import and `WITH NOCHECK CHECK CONSTRAINT ALL` after.
         skip_relational_constraints: true,
         failure_log_enabled: true,
+        resolve_includes: false,
         encoding: Default::default(),
     };
 
