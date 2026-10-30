@@ -1,6 +1,134 @@
 use super::*;
 use crate::models::connection::DatabaseType;
+use crate::table_structure_sql::dialect::StructureDialect;
 use crate::types::PgPartitionKind;
+
+fn foreign_create_options(server: &str) -> CreateTableDialectOptions {
+    CreateTableDialectOptions {
+        postgres_foreign_table: Some(PostgresForeignTableCreateOptions {
+            server: server.into(),
+            options: vec![
+                PostgresForeignTableOption { name: "schema_name".into(), value: "remote's schema".into() },
+                PostgresForeignTableOption { name: "table_name".into(), value: "source table".into() },
+            ],
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn postgres_foreign_table_create_quotes_server_options_and_comments() {
+    let mut options = structure_change_options(
+        DatabaseType::Postgres,
+        Some("local\"schema"),
+        "foreign table",
+        vec![column("remote\"column")],
+    );
+    options.table_comment = Some("foreign's comment".into());
+    options.columns[0].comment = "column's comment".into();
+    options.columns[0].is_nullable = false;
+    options.columns[0].default_value = "'fallback'".into();
+    let result = build_create_table_sql_with_dialect_options(options, None, foreign_create_options("server\"name"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements.len(), 3);
+    assert!(result.statements[0].starts_with("CREATE FOREIGN TABLE \"local\"\"schema\".\"foreign table\" ("));
+    assert!(result.statements[0].contains("\"remote\"\"column\""));
+    assert!(result.statements[0].contains("NOT NULL"));
+    assert!(result.statements[0].contains("DEFAULT 'fallback'"));
+    assert!(result.statements[0].ends_with(
+        "SERVER \"server\"\"name\" OPTIONS (\"schema_name\" 'remote''s schema', \"table_name\" 'source table');"
+    ));
+    assert_eq!(
+        result.statements[1],
+        "COMMENT ON FOREIGN TABLE \"local\"\"schema\".\"foreign table\" IS 'foreign''s comment';"
+    );
+    assert!(result.statements[2].contains("COMMENT ON COLUMN"));
+}
+
+#[test]
+fn postgres_foreign_table_create_validates_required_server_and_options() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    for server in ["", " ", "invalid\0server"] {
+        let result = build_create_table_sql_with_dialect_options(options.clone(), None, foreign_create_options(server));
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+    for option in [
+        PostgresForeignTableOption { name: "schema_name".into(), value: "duplicate".into() },
+        PostgresForeignTableOption { name: "".into(), value: "orphan".into() },
+        PostgresForeignTableOption { name: "bad\0name".into(), value: "value".into() },
+        PostgresForeignTableOption { name: "filename".into(), value: "bad\0value".into() },
+    ] {
+        let mut settings = foreign_create_options("server");
+        settings.postgres_foreign_table.as_mut().unwrap().options.push(option);
+        let result = build_create_table_sql_with_dialect_options(options.clone(), None, settings);
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn postgres_foreign_table_create_rejects_unsupported_dialects_and_constraints() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    for database_type in [DatabaseType::Mysql, DatabaseType::Sqlite, DatabaseType::OpenGauss, DatabaseType::Gaussdb] {
+        let mut request = options.clone();
+        request.database_type = Some(database_type);
+        assert!(build_create_table_sql_with_dialect_options(request, None, foreign_create_options("server"))
+            .statements
+            .is_empty());
+    }
+    let mut primary = options.clone();
+    primary.columns[0].is_primary_key = true;
+    let mut identity = options.clone();
+    identity.columns[0].extra =
+        Some(serde_json::from_value(serde_json::json!({"identity":{"generation":"ALWAYS"}})).unwrap());
+    let mut partition = options.clone();
+    partition.partitioned = true;
+    let mut redshift = options;
+    redshift.driver_profile = Some("redshift".into());
+    for request in [primary, identity, partition, redshift] {
+        let result = build_create_table_sql_with_dialect_options(request, None, foreign_create_options("server"));
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn postgres_foreign_table_options_are_optional_and_allow_empty_values() {
+    let mut options =
+        structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    options.foreign_table = true;
+    options.table_comment = Some("table comment".into());
+    let regular =
+        build_create_table_sql_with_dialect_options(options.clone(), None, CreateTableDialectOptions::default());
+    assert!(regular.statements[0].starts_with("CREATE TABLE "));
+    assert!(regular.statements[1].starts_with("COMMENT ON TABLE "));
+    let mut settings = foreign_create_options("server");
+    settings.postgres_foreign_table.as_mut().unwrap().options.clear();
+    let result = build_create_table_sql_with_dialect_options(options.clone(), None, settings.clone());
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("SERVER \"server\";"));
+    settings
+        .postgres_foreign_table
+        .as_mut()
+        .unwrap()
+        .options
+        .push(PostgresForeignTableOption { name: "custom_option".into(), value: "".into() });
+    let result = build_create_table_sql_with_dialect_options(options, None, settings);
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("OPTIONS (\"custom_option\" '');"));
+}
+
+#[test]
+fn postgres_foreign_table_create_allows_serial_types() {
+    let mut options =
+        structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    options.columns[0].data_type = "serial".into();
+    let result = build_create_table_sql_with_dialect_options(options, None, foreign_create_options("server"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].starts_with("CREATE FOREIGN TABLE"));
+    assert!(result.statements[0].to_ascii_lowercase().contains("serial"));
+}
 
 fn column(name: &str) -> EditableStructureColumn {
     EditableStructureColumn {
@@ -693,6 +821,7 @@ fn trigger(name: &str, timing: &str, event: &str, statement: &str) -> EditableSt
     EditableStructureTrigger {
         id: name.to_string(),
         name: name.to_string(),
+        oracle_exact: None,
         timing: timing.to_string(),
         event: event.to_string(),
         statement: statement.to_string(),
@@ -776,6 +905,141 @@ fn builds_mysql_column_and_index_changes() {
             "CREATE UNIQUE INDEX `uniq_users_email` ON `users` (`email`);",
         ]
     );
+}
+
+#[test]
+fn mysql_rebuild_index_uses_one_alter_table() {
+    let mut changed = existing_index("userId", &["userId", "cylId", "isClose"], false);
+    changed.columns.push("isEmpty".to_string());
+    changed.index_type = "BTREE".to_string();
+    changed.original.as_mut().unwrap().index_type = Some("BTREE".to_string());
+    let mut options = index_change_options(DatabaseType::Mysql, Some("dbx12441_native"), changed);
+    options.table_name = "ls_station_delivery_staff_stock_log".to_string();
+
+    let result = build_table_structure_change_sql(options);
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE `ls_station_delivery_staff_stock_log` DROP INDEX `userId`, ADD INDEX `userId` USING BTREE (`userId`, `cylId`, `isClose`, `isEmpty`);"
+    ]);
+}
+
+#[test]
+fn mysql_rebuild_index_preserves_definition_types() {
+    for (index_type, unique, definition) in [
+        ("", false, "INDEX `idx`"),
+        ("btree", false, "INDEX `idx` USING BTREE"),
+        ("HASH", false, "INDEX `idx` USING HASH"),
+        ("BTREE", true, "UNIQUE INDEX `idx` USING BTREE"),
+        ("", true, "UNIQUE INDEX `idx`"),
+        ("FULLTEXT", false, "FULLTEXT INDEX `idx`"),
+        ("SPATIAL", false, "SPATIAL INDEX `idx`"),
+        ("RTREE", false, "SPATIAL INDEX `idx`"),
+    ] {
+        let mut changed = existing_index("idx", &["old_key"], false);
+        changed.columns = vec!["second".to_string(), "first".to_string()];
+        changed.index_type = index_type.to_string();
+        changed.is_unique = unique;
+        changed.comment = "owner's index".to_string();
+        let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.statements,
+            vec![format!(
+                "ALTER TABLE `USERS` DROP INDEX `idx`, ADD {definition} (`second`, `first`) COMMENT 'owner''s index';"
+            )]
+        );
+    }
+}
+
+#[test]
+fn mysql_rebuild_index_preserves_quoted_names_and_functional_keys() {
+    let expression = "((lower(`email`)))";
+    let mut changed = existing_index("old`idx", &["email"], false);
+    changed.name = "new`idx".to_string();
+    // Parenthesized plain identifiers keep their existing quoting behavior;
+    // only wrapped functional key parts are treated as SQL expressions.
+    changed.columns = vec!["a`b".to_string(), "name(10)".to_string(), expression.to_string()];
+    let mut options = index_change_options(DatabaseType::Mysql, Some("db`name"), changed);
+    options.table_name = "table`name".to_string();
+    let result = build_table_structure_change_sql(options);
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec![format!(
+            "ALTER TABLE `table``name` DROP INDEX `old``idx`, ADD INDEX `new``idx` (`a``b`, `name(10)`, {expression});"
+        )]
+    );
+}
+
+#[test]
+fn mysql_rebuild_index_rejects_empty_replacement_without_drop() {
+    for (name, columns) in [(" ", vec!["email"]), ("idx", vec![]), ("idx", vec![" ", ""])] {
+        let mut changed = existing_index("idx", &["email"], false);
+        changed.name = name.to_string();
+        changed.columns = columns.into_iter().map(str::to_string).collect();
+        let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+        assert!(result.statements.is_empty(), "{:?}", result.statements);
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn mysql_rebuild_index_keeps_noop_primary_and_capability_guards() {
+    let unchanged = existing_index("idx", &["email"], false);
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, unchanged));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.is_empty());
+
+    let mut primary = existing_primary_index("PRIMARY", &["id"]);
+    primary.columns.push("email".to_string());
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, primary));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("cannot be edited")));
+
+    let mut changed = existing_index("idx", &["email"], false);
+    changed.columns.push("id".to_string());
+    let mut options = index_change_options(DatabaseType::Mysql, None, changed);
+    options.driver_profile = Some("starrocks".to_string());
+    let mut warnings = Vec::new();
+    assert!(super::indexes::build_index_sql(&options, &mut warnings).is_empty());
+    assert!(warnings.iter().any(|warning| warning.contains("Editing existing indexes is not supported")));
+    let result = build_table_structure_change_sql(options);
+    assert!(result.statements.is_empty());
+    assert!(!result.warnings.is_empty());
+}
+
+#[test]
+fn mysql_rebuild_index_ignores_stale_concurrently_flag_with_real_change() {
+    let mut changed = existing_index("idx", &["email"], false);
+    changed.concurrently = true;
+    changed.comment = "new comment".to_string();
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `USERS` DROP INDEX `idx`, ADD INDEX `idx` (`email`) COMMENT 'new comment';"]
+    );
+}
+
+#[test]
+fn mysql_dialect_other_engines_keep_standalone_rebuilds() {
+    for database_type in [DatabaseType::Goldendb, DatabaseType::Sundb, DatabaseType::Databend] {
+        let mut changed = existing_index("idx", &["email"], false);
+        changed.is_unique = true;
+        let result = build_table_structure_change_sql(index_change_options(database_type, None, changed));
+
+        assert!(result.warnings.is_empty(), "{database_type:?}: {:?}", result.warnings);
+        assert_eq!(
+            result.statements,
+            vec!["DROP INDEX `idx` ON `USERS`;", "CREATE UNIQUE INDEX `idx` ON `USERS` (`email`);",],
+            "{database_type:?}"
+        );
+    }
 }
 
 #[test]
@@ -1048,7 +1312,6 @@ fn dameng_new_and_dropped_indexes_do_not_use_or_replace() {
 #[test]
 fn non_dameng_index_rebuilds_do_not_use_or_replace() {
     for database_type in [
-        DatabaseType::Mysql,
         DatabaseType::Postgres,
         DatabaseType::Sqlite,
         DatabaseType::SqlServer,
@@ -2809,8 +3072,8 @@ fn gbase8a_allows_mysql_style_column_reorder() {
 #[test]
 fn gbase8s_uses_informix_ddl_not_mysql() {
     let result = build_create_table_sql(TableStructureSqlOptions {
-        database_type: Some(DatabaseType::Gbase),
-        driver_profile: Some("gbase8s".to_string()),
+        database_type: Some(DatabaseType::Gbase8s),
+        driver_profile: None,
         schema: Some("gbasedbt".to_string()),
         table_name: "issue8003_repro".to_string(),
         columns: vec![
@@ -4635,9 +4898,11 @@ fn sqlserver_rejects_identity_on_incompatible_type() {
 }
 
 #[test]
-fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
+fn sqlserver_foreign_key_edits_generate_alter_statements() {
     let mut user_fk = foreign_key("fk_orders_user_id", "user_id", "accounts", "id");
     user_fk.ref_schema = "dbo".to_string();
+    user_fk.on_delete = "CASCADE".to_string();
+    user_fk.on_update = "RESTRICT".to_string();
     user_fk.original = Some(ForeignKeyInfo {
         name: "fk_orders_user_id".to_string(),
         column: "user_id".to_string(),
@@ -4672,8 +4937,14 @@ fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
         oracle_foreign_key_changes: None,
     });
 
-    assert_eq!(result.statements, Vec::<String>::new());
-    assert_eq!(result.warnings, vec!["Editing foreign keys is not supported for sqlserver from this editor."]);
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec![
+            "ALTER TABLE [dbo].[orders] DROP CONSTRAINT [fk_orders_user_id];",
+            "ALTER TABLE [dbo].[orders] ADD CONSTRAINT [fk_orders_user_id] FOREIGN KEY ([user_id]) REFERENCES [dbo].[accounts] ([id]) ON DELETE CASCADE ON UPDATE NO ACTION;"
+        ]
+    );
 }
 
 #[test]
@@ -6262,8 +6533,7 @@ fn mysql_clears_auto_increment_when_the_only_covering_index_is_rebuilt_by_the_sa
         result.statements,
         vec![
             "ALTER TABLE `users` DROP PRIMARY KEY, MODIFY COLUMN `id` bigint NOT NULL, ADD PRIMARY KEY (`external_id`);",
-            "DROP INDEX `idx_users_id` ON `users`;",
-            "CREATE UNIQUE INDEX `idx_users_id` ON `users` (`id`);",
+            "ALTER TABLE `users` DROP INDEX `idx_users_id`, ADD UNIQUE INDEX `idx_users_id` (`id`);",
         ]
     );
 }
@@ -7116,6 +7386,53 @@ fn dameng_alter_column_preserves_character_length_unit() {
 
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements, vec!["ALTER TABLE \"SYSDBA\".\"USERS\" MODIFY (\"NAME\" VARCHAR2(64 BYTE));"]);
+}
+
+#[test]
+fn dameng_rename_column_uses_alter_column_rename_to() {
+    let mut renamed = column("NAME");
+    renamed.name = "NEW_NAME".to_string();
+    renamed.data_type = "VARCHAR2(64)".to_string();
+    renamed.original = Some(ColumnInfo {
+        name: "NAME".to_string(),
+        data_type: "VARCHAR2(64)".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Dameng),
+        driver_profile: None,
+        schema: Some("SYSDBA".to_string()),
+        table_name: "USERS".to_string(),
+        columns: vec![renamed],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+        mysql_engine: None,
+        mysql_auto_increment_value: None,
+        transwarp_create: None,
+        partitioned: false,
+        foreign_table: false,
+        is_gaussdb_m_mode: false,
+        table_collation: None,
+        primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE \"SYSDBA\".\"USERS\" ALTER COLUMN \"NAME\" RENAME TO \"NEW_NAME\";"]
+    );
 }
 
 #[test]
@@ -10741,6 +11058,19 @@ fn pg_family_concurrent_flag_is_ignored() {
 }
 
 #[test]
+fn firebird_column_default_precedes_not_null() {
+    let mut col = column("raiz");
+    col.data_type = "varchar(20)".to_string();
+    col.is_nullable = false;
+    col.default_value = "'ECF'".to_string();
+
+    assert_eq!(
+        super::column_format::column_definition(StructureDialect::Postgres, &col, Some(DatabaseType::Firebird)),
+        "\"raiz\" varchar(20) DEFAULT 'ECF' NOT NULL"
+    );
+}
+
+#[test]
 fn non_postgres_concurrent_flag_is_ignored() {
     for database_type in [DatabaseType::Mysql, DatabaseType::Sqlite, DatabaseType::SqlServer] {
         let mut idx = index("idx_users_email", &["email"]);
@@ -11899,6 +12229,7 @@ fn starrocks_places_primary_keys_before_value_columns() {
 
 fn starrocks_layout_options(granularity: StarRocksTimeGranularity) -> CreateTableDialectOptions {
     CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: None,
             time_partition: Some(StarRocksTimePartition {
@@ -11998,6 +12329,7 @@ fn starrocks_validates_hash_keys_and_bucket_count() {
 #[test]
 fn starrocks_random_distribution_requires_duplicate_table_and_supported_version() {
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions { distribution: StarRocksDistribution::Random, ..Default::default() }),
     };
     let mut options = starrocks_partitioned_table_options();
@@ -12033,6 +12365,7 @@ fn starrocks_builds_multicolumn_value_and_list_partitions() {
     let options =
         structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city"), column("channel")]);
     let values = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Values { column_ids: vec!["city".into(), "channel".into()] }),
             ..Default::default()
@@ -12042,6 +12375,7 @@ fn starrocks_builds_multicolumn_value_and_list_partitions() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert!(result.statements[0].contains("PARTITION BY (`city`, `channel`) DISTRIBUTED BY RANDOM"));
     let list = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::List {
                 column_ids: vec!["city".into(), "channel".into()],
@@ -12064,6 +12398,7 @@ fn starrocks_builds_range_bounds_and_validates_arity() {
     // Intentionally interleaved primary and value columns: SQL reorders without changing membership.
     options.columns.insert(1, column("payload"));
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Range {
                 column_ids: vec!["ts".into(), "id".into()],
@@ -12115,6 +12450,7 @@ fn starrocks_time_slice_and_mixed_partitions_are_version_and_type_checked() {
 fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
     let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city")]);
     let list = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::List {
                 column_ids: vec!["city".into()],
@@ -12128,6 +12464,7 @@ fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
     };
     assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), list).statements.is_empty());
     let range = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Range {
                 column_ids: vec!["city".into()],
@@ -12149,6 +12486,7 @@ fn starrocks_sort_columns_preserve_priority_and_allow_non_primary_columns() {
     options.columns[1].is_primary_key = false;
     options.columns[1].name = "event`time".into();
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions {
             sort_column_ids: vec!["ts".into(), "id".into()],
             ..Default::default()
@@ -12180,6 +12518,7 @@ fn starrocks_sort_validates_version_identity_and_primary_table_types() {
             _ => {}
         }
         let settings = CreateTableDialectOptions {
+            postgres_foreign_table: None,
             starrocks: Some(StarRocksCreateOptions { sort_column_ids: ids, ..Default::default() }),
         };
         let result = build_create_table_sql_with_dialect_options(options, version, settings);
@@ -12196,6 +12535,7 @@ fn starrocks_duplicate_sort_requires_33_and_allows_decimal() {
     }
     options.columns[1].data_type = "decimal(10,2)".into();
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
         starrocks: Some(StarRocksCreateOptions { sort_column_ids: vec!["ts".into()], ..Default::default() }),
     };
     let old = build_create_table_sql_with_dialect_options(options.clone(), Some("3.2.0"), settings.clone());
