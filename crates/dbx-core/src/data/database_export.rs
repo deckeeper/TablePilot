@@ -76,6 +76,8 @@ pub enum DatabaseExportOutputCompression {
     #[default]
     None,
     Gzip,
+    /// Navicat `.nb3` backup archive (MySQL and PostgreSQL only).
+    Nb3,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +138,13 @@ pub struct DatabaseExportRequest {
     pub include_create_database: bool,
     #[serde(default)]
     pub drop_table_if_exists: bool,
+    /// Omit the database qualifier from MySQL-family table references in the
+    /// exported SQL (INSERT targets keep plain `table` names; the `USE`
+    /// preamble stays the authority for the database). Defaults to `false`
+    /// (preserve `db`.`table`) for callers that import into a different
+    /// database than the one named by the dump (issue #13509).
+    #[serde(default)]
+    pub omit_database_qualifier: bool,
     /// Drop the table-level `AUTO_INCREMENT=N` clause from exported MySQL DDL,
     /// so the script can initialize a fresh database without pinning a sequence
     /// position. No-op for non-MySQL databases. Defaults to `false` (preserve).
@@ -177,6 +186,7 @@ enum DatabaseExportWriter {
     Plain(BufWriter<std::fs::File>),
     Gzip(Box<GzEncoder<BufWriter<std::fs::File>>>),
     SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
+    Nb3(Box<crate::navicat_nb3::Nb3ExportWriter>),
 }
 
 impl DatabaseExportWriter {
@@ -185,6 +195,7 @@ impl DatabaseExportWriter {
             Self::Plain(writer) => writer.write_all(unit),
             Self::Gzip(writer) => writer.write_all(unit),
             Self::SplitZip(writer) => writer.write_sql_unit(unit),
+            Self::Nb3(writer) => writer.write_all(unit),
         }
     }
 }
@@ -195,6 +206,7 @@ impl Write for DatabaseExportWriter {
             Self::Plain(writer) => writer.write(buffer),
             Self::Gzip(writer) => writer.write(buffer),
             Self::SplitZip(writer) => writer.write(buffer),
+            Self::Nb3(writer) => writer.write(buffer),
         }
     }
 
@@ -209,6 +221,7 @@ impl Write for DatabaseExportWriter {
             Self::Plain(writer) => writer.flush(),
             Self::Gzip(writer) => writer.flush(),
             Self::SplitZip(writer) => writer.flush(),
+            Self::Nb3(writer) => writer.flush(),
         }
     }
 }
@@ -224,6 +237,7 @@ impl DatabaseExportWriter {
                 .and_then(|mut output| output.flush())
                 .map_err(|error| format!("Failed to finalize export file: {error}")),
             Self::SplitZip(writer) => writer.finish(source_file_name),
+            Self::Nb3(writer) => writer.finish(),
         }
     }
 }
@@ -265,10 +279,18 @@ fn exports_mysql_trigger_objects(db_type: DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Mysql)
 }
 
-/// Oracle writes each table's triggers into its table DDL (see `loadTableTriggerDDLs` in
-/// `agents/drivers/oracle-go`), so a trigger that reads `seq.NEXTVAL` reaches the script
-/// whenever structure is exported. The standalone sequences it depends on are written
-/// before the tables of a whole-schema structure export so the script replays (#11673).
+/// Standalone sequences (Oracle, Kingbase, Vastbase) are exported before tables so the DDL
+/// and default expressions replay properly.
+fn exports_standalone_sequence_objects(request: &DatabaseExportRequest, db_type: DatabaseType) -> bool {
+    if !matches!(db_type, DatabaseType::Oracle | DatabaseType::Kingbase | DatabaseType::Vastbase) {
+        return false;
+    }
+    if request.include_objects {
+        return true;
+    }
+    exports_oracle_sequence_objects(request, db_type)
+}
+
 fn exports_oracle_sequence_objects(request: &DatabaseExportRequest, db_type: DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Oracle) && request.include_structure && request.selected_tables.is_empty()
 }
@@ -457,6 +479,7 @@ impl LenientExportErrors {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExportStatus {
+    PreparingSnapshot,
     Running,
     Writing,
     Done,
@@ -617,6 +640,9 @@ pub struct BuildDatabaseSqlExportOptions {
     /// Defaults to `false` (preserve). See `DatabaseExportRequest::omit_auto_increment`.
     #[serde(default)]
     pub omit_auto_increment: bool,
+    /// See `DatabaseExportRequest::omit_database_qualifier`.
+    #[serde(default)]
+    pub omit_database_qualifier: bool,
     /// See `DatabaseExportRequest::preserve_original_language`.
     #[serde(default)]
     pub preserve_original_language: bool,
@@ -2044,13 +2070,21 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
             lines.push(format!("-- Exported rows: {}", table.rows.len()));
         }
 
+        // #13509: with the `USE` preamble as the database authority, MySQL-family
+        // dumps can drop the `db`. qualifier so the script replays against any
+        // database the USE targets.
+        let mysql_omit = options.omit_database_qualifier
+            && table.database_type.as_ref().is_some_and(supports_database_qualifier_omission);
+        // Both dialects must honor the flag: Source dialect prefers the passed
+        // pre-qualified name over the schema, so it has to be cleared too
+        // (#13601 review point 3).
         let inserts = build_export_insert_statements_excluding_with_dialect(
             BuildExportInsertStatementsOptions {
                 database_type: table.database_type,
                 identifier_quote: table.identifier_quote.clone(),
-                schema: table.schema,
+                schema: if mysql_omit { None } else { table.schema.clone() },
                 table_name: table.table_name,
-                qualified_table_name: table.qualified_table_name,
+                qualified_table_name: if mysql_omit { None } else { table.qualified_table_name },
                 columns: table.columns,
                 column_types: table.column_types,
                 column_extras: table.column_extras,
@@ -2151,6 +2185,81 @@ fn format_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>, opts:
     };
     let ddl = ddl.trim().trim_end_matches(';').trim_end();
     format!("{ddl};")
+}
+
+pub(crate) fn is_dameng_auto_increment_ddl(ddl: &str) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut chars = ddl.chars().peekable();
+    let mut current_word = String::new();
+
+    while let Some(ch) = chars.next() {
+        if in_single_quote {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+        if in_double_quote {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_double_quote = false;
+                }
+            }
+            continue;
+        }
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            in_line_comment = true;
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            in_block_comment = true;
+            continue;
+        }
+        if ch == '\'' {
+            in_single_quote = true;
+            continue;
+        }
+        if ch == '"' {
+            in_double_quote = true;
+            continue;
+        }
+
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current_word.push(ch);
+        } else {
+            if current_word.eq_ignore_ascii_case("auto_increment") || current_word.eq_ignore_ascii_case("autoincrement")
+            {
+                return true;
+            }
+            current_word.clear();
+        }
+    }
+    current_word.eq_ignore_ascii_case("auto_increment") || current_word.eq_ignore_ascii_case("autoincrement")
 }
 
 /// PostgreSQL database export: split the statements that may depend on
@@ -2791,6 +2900,12 @@ pub async fn begin_database_backup_snapshot_core_for_export(
     database: &str,
     export_id: Option<&str>,
 ) -> Result<DatabaseBackupSnapshot, String> {
+    crate::query::mysql_data_charset_policy::reject_operation(
+        state,
+        connection_id,
+        crate::query::mysql_data_charset_policy::EXPORT_UNSUPPORTED,
+    )
+    .await?;
     let db_type = state
         .configs
         .read()
@@ -2798,8 +2913,10 @@ pub async fn begin_database_backup_snapshot_core_for_export(
         .get(connection_id)
         .map(|config| config.db_type)
         .ok_or_else(|| format!("Connection config not found: {connection_id}"))?;
-    if !matches!(db_type, DatabaseType::Mysql | DatabaseType::Postgres) {
-        return Err("Consistent database backup snapshots are only supported for MySQL and PostgreSQL".to_string());
+    if !matches!(db_type, DatabaseType::Mysql | DatabaseType::Postgres | DatabaseType::OpenGauss) {
+        return Err(
+            "Consistent database backup snapshots are only supported for MySQL, PostgreSQL, and openGauss".to_string()
+        );
     }
 
     let session_id = if let Some(export_id) = export_id {
@@ -2829,7 +2946,7 @@ pub async fn begin_database_backup_snapshot_core_for_export(
         crate::query::begin_database_backup_snapshot(state, connection_id, database).await?
     };
 
-    let schemas_result = if matches!(db_type, DatabaseType::Postgres) {
+    let schemas_result = if matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss) {
         const POSTGRES_BACKUP_SCHEMAS_SQL: &str = "SELECT n.nspname FROM pg_catalog.pg_namespace n \
              WHERE n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast') \
              AND n.nspname NOT LIKE 'pg_toast_temp_%' \
@@ -2916,7 +3033,7 @@ fn database_export_metadata_prefetch_concurrency(db_type: DatabaseType) -> usize
     // PostgreSQL exports can hold a snapshot connection while metadata and UI
     // requests share the base pool. Keep enough capacity available for normal
     // browsing instead of filling nearly the entire ten-connection pool.
-    if db_type == DatabaseType::Postgres {
+    if matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss) {
         4
     } else {
         8
@@ -3034,7 +3151,16 @@ fn write_database_export_rows<W: Write>(
         insert_dialect,
         SqlInsertMode::default(),
         false,
+        None,
+        false,
     )
+}
+
+/// MySQL-family engines are the ones whose whole-database dump pairs a `USE`
+/// preamble with `db`.`table` targets; other engines ignore the flag so a
+/// persisted option can never strip a PostgreSQL/Oracle schema (#13601).
+fn supports_database_qualifier_omission(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb | DatabaseType::Doris | DatabaseType::StarRocks)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3050,7 +3176,25 @@ fn write_database_export_rows_with_mode<W: Write>(
     insert_dialect: SqlInsertDialect,
     insert_mode: SqlInsertMode,
     preserve_original_language: bool,
+    table_ddl: Option<&str>,
+    omit_database_qualifier: bool,
 ) -> Result<(), String> {
+    let normalized_column_extras;
+    let column_extras = if *db_type == DatabaseType::Dameng && table_ddl.is_some_and(is_dameng_auto_increment_ddl) {
+        normalized_column_extras = column_extras
+            .iter()
+            .map(|extra| {
+                if extra.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("identity")) {
+                    Some("auto_increment".to_string())
+                } else {
+                    extra.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        normalized_column_extras.as_slice()
+    } else {
+        column_extras
+    };
     let insert_indices = columns
         .iter()
         .enumerate()
@@ -3095,7 +3239,17 @@ fn write_database_export_rows_with_mode<W: Write>(
     // Database exports use the same table qualification as the SELECT/DDL
     // path and the legacy typed INSERT writer. In particular, MySQL uses the
     // selected database rather than a schema-qualified table name.
-    let qualified_table_name = crate::transfer::qualified_table(table, schema, db_type, None);
+    // `omit_database_qualifier` drops the schema qualifier for the MySQL
+    // family: the export's `USE` preamble already sets the database, and a
+    // `db`.`table` INSERT target pins the dump to one database (#13509).
+    // Rebuild with an empty schema instead of stripping the rendered name:
+    // MySQL-family targets never carry a schema prefix, so a table whose own
+    // name contains a dot must not be split at that dot (#13601).
+    let qualified_table_name = if omit_database_qualifier && supports_database_qualifier_omission(db_type) {
+        crate::transfer::qualified_table(table, "", db_type, None)
+    } else {
+        crate::transfer::qualified_table(table, schema, db_type, None)
+    };
     // Batch database exports do not currently thread a per-connection identifier
     // quote through BuildDatabaseSqlExportOptions; Kingbase MySQL-compat users
     // should fall back to the single-table export path which carries the quote.
@@ -3103,7 +3257,15 @@ fn write_database_export_rows_with_mode<W: Write>(
         BuildExportInsertStatementsOptions {
             database_type: Some(*db_type),
             identifier_quote: None,
-            schema: (!schema.is_empty()).then(|| schema.to_string()),
+            // Standard dialect re-derives `db`.`table` from the schema, so the
+            // flag also has to blank it there — but only for engines that own
+            // the flag; a persisted `true` must not strip a PostgreSQL schema
+            // (#13601).
+            schema: if omit_database_qualifier && supports_database_qualifier_omission(db_type) {
+                None
+            } else {
+                (!schema.is_empty()).then(|| schema.to_string())
+            },
             table_name: Some(table.to_string()),
             qualified_table_name: Some(qualified_table_name),
             columns: insert_columns.to_vec(),
@@ -3399,13 +3561,32 @@ async fn ensure_export_destination_dir(
         save_export_destination_identity(state, dir, current_identity.as_ref()).await?;
         return Ok(current_identity);
     } else {
+        // The recorded state is `Option<Option<_>>`: an outer `Some` means the
+        // directory was previously used by dbx (or recorded when the schedule
+        // was configured); the inner value carries its filesystem identity.
         if recorded_identity.is_some() {
-            return Err(format!(
-                "Backup directory {} is missing. It was configured or previously used for exports to \
-                 this location, so dbx will not recreate it automatically -- if this is on a removable \
-                 or network drive, reconnect it and try again.",
-                dir.display()
-            ));
+            // Recreating the directory is only safe when it would land on the
+            // same filesystem it was recorded on, so compare the recorded
+            // identity against the destination's parent. A missing or
+            // differently-resolving parent keeps the fail-closed behavior for
+            // vanished removable/network mounts (#6327). A matching parent
+            // means dbx removed the empty leaf itself -- backup deletion
+            // cleans up the per-run directory once its files are gone -- and
+            // the next run must be able to recreate it (#13610). A record
+            // without a usable identity cannot prove the filesystem and also
+            // keeps failing closed.
+            let parent_identity = dir.parent().and_then(export_destination_identity_for_path);
+            let same_filesystem = recorded_identity.flatten().is_some_and(|recorded| {
+                !recorded_export_destination_identity_mismatch(&recorded, parent_identity.as_ref())
+            });
+            if !same_filesystem {
+                return Err(format!(
+                    "Backup directory {} is missing. It was configured or previously used for exports to \
+                     this location, so dbx will not recreate it automatically -- if this is on a removable \
+                     or network drive, reconnect it and try again.",
+                    dir.display()
+                ));
+            }
         }
         // A run-specific child directory is intentionally new on every
         // scheduled backup. Before creating it, still honor a recorded parent
@@ -3587,6 +3768,12 @@ pub async fn export_database_sql_core(
     request: &DatabaseExportRequest,
     on_progress: impl Fn(ExportProgress) + Sync,
 ) -> Result<(), String> {
+    crate::query::mysql_data_charset_policy::reject_operation(
+        state,
+        &request.connection_id,
+        crate::query::mysql_data_charset_policy::EXPORT_UNSUPPORTED,
+    )
+    .await?;
     let db_type = state
         .configs
         .read()
@@ -3597,11 +3784,12 @@ pub async fn export_database_sql_core(
     // Keep the large export state machine on the heap. Besides making the
     // caller future small, this prevents the metadata-prefetch locals from
     // exhausting the bounded stack used by test and runtime worker threads.
-    let result = if matches!(db_type, DatabaseType::Postgres) && request.schema.trim().is_empty() {
-        Box::pin(export_postgres_all_schemas_sql_core(state, request, &on_progress)).await
-    } else {
-        Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await
-    };
+    let result =
+        if matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss) && request.schema.trim().is_empty() {
+            Box::pin(export_postgres_all_schemas_sql_core(state, request, &on_progress)).await
+        } else {
+            Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await
+        };
     let metadata_session_id = database_export_client_session_id(&request.export_id);
     if let Err(error) =
         state.close_metadata_session_pool(&request.connection_id, Some(&request.database), &metadata_session_id).await
@@ -3690,6 +3878,20 @@ async fn create_database_export_writer(
         }
         return Ok(DatabaseExportWriter::SplitZip(Box::new(writer)));
     }
+    // Reject unsupported connections before the destination is created or truncated.
+    let nb3_database_type = if request.output_compression == DatabaseExportOutputCompression::Nb3 {
+        let db_type = state
+            .configs
+            .read()
+            .await
+            .get(&request.connection_id)
+            .map(|config| config.db_type)
+            .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
+        crate::navicat_nb3::ensure_supported_database_type(db_type)?;
+        Some(db_type)
+    } else {
+        None
+    };
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -3733,6 +3935,20 @@ async fn create_database_export_writer(
         DatabaseExportOutputCompression::None => DatabaseExportWriter::Plain(BufWriter::new(file)),
         DatabaseExportOutputCompression::Gzip => {
             DatabaseExportWriter::Gzip(Box::new(GzEncoder::new(BufWriter::new(file), Compression::default())))
+        }
+        DatabaseExportOutputCompression::Nb3 => {
+            let db_type = nb3_database_type.expect("Navicat backup database type is validated before opening");
+            let writer = crate::navicat_nb3::Nb3ExportWriter::new(
+                file,
+                export_destination_parent_dir(&request.file_path),
+                db_type,
+                &request.database,
+                &request.schema,
+            )
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&request.file_path);
+            })?;
+            DatabaseExportWriter::Nb3(Box::new(writer))
         }
     })
 }
@@ -4038,12 +4254,25 @@ async fn export_database_sql_core_inner(
     } else {
         Vec::new()
     };
-    let all_tables = filter_export_table_infos(all_tables, &request.selected_tables, &request.excluded_tables)
+    let all_tables = filter_export_table_infos(all_tables, &[], &request.excluded_tables)
         .into_iter()
         .filter(|table| !postgres_extension_members.relation_names.contains(&table.name))
         .collect::<Vec<_>>();
-    let mut tables: Vec<_> = all_tables.iter().filter(|t| !t.table_type.contains("VIEW")).collect();
-    let mut views: Vec<_> = all_tables.iter().filter(|t| t.table_type.contains("VIEW")).collect();
+    let mut tables: Vec<_> = all_tables
+        .iter()
+        .filter(|t| !t.table_type.contains("VIEW"))
+        .filter(|t| request.selected_tables.is_empty() || request.selected_tables.contains(&t.name))
+        .collect();
+    let mut views: Vec<_> = all_tables
+        .iter()
+        .filter(|t| t.table_type.contains("VIEW"))
+        .filter(|t| {
+            if !request.include_objects {
+                return false;
+            }
+            request.selected_tables.is_empty() || request.selected_tables.contains(&t.name)
+        })
+        .collect();
     if request.include_objects && db_type == DatabaseType::Mysql && views.len() > 1 {
         match list_mysql_export_view_dependencies(state, &request.connection_id, &request.database, &client_session_id)
             .await
@@ -4121,11 +4350,11 @@ async fn export_database_sql_core_inner(
     let mut functions: Vec<crate::types::ObjectInfo> = Vec::new();
     let mut triggers: Vec<crate::types::ObjectInfo> = Vec::new();
     let mut events: Vec<crate::types::ObjectInfo> = Vec::new();
-    let mut oracle_sequences: Vec<crate::types::ObjectInfo> = Vec::new();
+    let mut standalone_sequences: Vec<crate::types::ObjectInfo> = Vec::new();
     let collects_schema_wide_objects = exports_schema_wide_objects(request);
-    let collects_oracle_sequences = exports_oracle_sequence_objects(request, db_type);
+    let collects_standalone_sequences = exports_standalone_sequence_objects(request, db_type);
 
-    if collects_schema_wide_objects || collects_oracle_sequences {
+    if collects_schema_wide_objects || collects_standalone_sequences {
         match crate::schema::list_objects_core(
             state,
             &request.connection_id,
@@ -4146,8 +4375,8 @@ async fn export_database_sql_core_inner(
                         continue;
                     }
                     if ot == "SEQUENCE" {
-                        if collects_oracle_sequences && !is_oracle_identity_sequence(&obj.name) {
-                            oracle_sequences.push(obj.clone());
+                        if collects_standalone_sequences && !is_oracle_identity_sequence(&obj.name) {
+                            standalone_sequences.push(obj.clone());
                         }
                         continue;
                     }
@@ -4170,6 +4399,12 @@ async fn export_database_sql_core_inner(
         }
     }
 
+    if !request.selected_tables.is_empty() {
+        standalone_sequences.retain(|s| request.selected_tables.contains(&s.name));
+        procedures.retain(|p| request.selected_tables.contains(&p.name));
+        functions.retain(|f| request.selected_tables.contains(&f.name));
+    }
+
     // A determinate total must describe the same object categories guarded by
     // the execution branches below, not every object discovered in the schema.
     let total_objects = database_export_total_objects(
@@ -4178,7 +4413,7 @@ async fn export_database_sql_core_inner(
             tables: tables.len(),
             views: views.len(),
             sequences: postgres_sequences.iter().filter(|sequence| !sequence.created_by_table).count()
-                + oracle_sequences.len(),
+                + standalone_sequences.len(),
             extensions: postgres_extensions.len(),
             enums: postgres_enums.len(),
             procedures: procedures.len(),
@@ -4384,7 +4619,7 @@ async fn export_database_sql_core_inner(
         object_index += 1;
     }
 
-    for sequence in &oracle_sequences {
+    for sequence in &standalone_sequences {
         if is_export_cancelled(&request.export_id).await {
             return Err("Export cancelled".to_string());
         }
@@ -4417,6 +4652,7 @@ async fn export_database_sql_core_inner(
                     &ObjectSourceKind::Sequence,
                     &sequence.name,
                     &obj_source.source,
+                    &request.schema,
                     request.drop_table_if_exists,
                 );
                 if !source.is_empty() {
@@ -4465,6 +4701,8 @@ async fn export_database_sql_core_inner(
             error_count: 0,
             error_summary: None,
         });
+
+        let mut table_ddl_text: Option<String> = None;
 
         // Export structure
         if request.include_structure {
@@ -4519,6 +4757,7 @@ async fn export_database_sql_core_inner(
             }
             match ddl_result {
                 Ok(ddl) => {
+                    table_ddl_text = Some(ddl.clone());
                     let (ddl, indexes, triggers) = split_postgres_export_table_ddl(&ddl, db_type);
                     deferred_postgres_indexes.extend(indexes);
                     deferred_postgres_triggers.extend(triggers);
@@ -4594,6 +4833,29 @@ async fn export_database_sql_core_inner(
             let col_types = columns.iter().map(|c| Some(c.data_type.clone())).collect::<Vec<_>>();
             let col_extras = columns.iter().map(|c| c.extra.clone()).collect::<Vec<_>>();
 
+            if table_ddl_text.is_none()
+                && db_type == DatabaseType::Dameng
+                && col_extras
+                    .iter()
+                    .any(|extra| extra.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("identity")))
+            {
+                if let Ok(ddl) = await_export_operation(
+                    &request.export_id,
+                    Box::pin(get_export_table_ddl_isolated(
+                        state.clone(),
+                        request.connection_id.clone(),
+                        request.database.clone(),
+                        request.schema.clone(),
+                        table_name.clone(),
+                        client_session_id.clone(),
+                    )),
+                )
+                .await
+                {
+                    table_ddl_text = Some(ddl);
+                }
+            }
+
             if !col_names.is_empty() {
                 if let Some(snapshot_session_id) = request.snapshot_session_id.as_deref() {
                     let sql = database_export_select_sql(&col_names, &col_types, table_name, &request.schema, &db_type);
@@ -4625,6 +4887,8 @@ async fn export_database_sql_core_inner(
                                     request.insert_dialect,
                                     request.insert_mode,
                                     request.preserve_original_language,
+                                    table_ddl_text.as_deref(),
+                                    request.omit_database_qualifier,
                                 )?;
                                 total_rows_exported += rows.len() as u64;
                                 on_progress(ExportProgress {
@@ -4744,6 +5008,8 @@ async fn export_database_sql_core_inner(
                             request.insert_dialect,
                             request.insert_mode,
                             request.preserve_original_language,
+                            table_ddl_text.as_deref(),
+                            request.omit_database_qualifier,
                         )?;
                         total_rows_exported += row_count as u64;
                         if use_keyset {
@@ -4832,6 +5098,7 @@ async fn export_database_sql_core_inner(
                         &ObjectSourceKind::View,
                         view_name,
                         &obj_source.source,
+                        &request.schema,
                         request.drop_table_if_exists,
                     );
                     if !source.is_empty() {
@@ -4891,6 +5158,7 @@ async fn export_database_sql_core_inner(
                         &ObjectSourceKind::Procedure,
                         proc_name,
                         &obj_source.source,
+                        &request.schema,
                         request.drop_table_if_exists,
                     );
                     if !source.is_empty() {
@@ -4950,6 +5218,7 @@ async fn export_database_sql_core_inner(
                         &ObjectSourceKind::Function,
                         func_name,
                         &obj_source.source,
+                        &request.schema,
                         request.drop_table_if_exists,
                     );
                     if !source.is_empty() {
@@ -5015,6 +5284,7 @@ async fn export_database_sql_core_inner(
                         &object_type,
                         object_name,
                         &obj_source.source,
+                        &request.schema,
                         request.drop_table_if_exists,
                     );
                     if !source.is_empty() {
@@ -5110,8 +5380,35 @@ fn build_database_export_object_source_sql(
     object_type: &ObjectSourceKind,
     object_name: &str,
     source: &str,
+    schema: &str,
     drop_if_exists: bool,
 ) -> String {
+    let wrapped_source;
+    let source = if matches!(object_type, ObjectSourceKind::View | ObjectSourceKind::MaterializedView)
+        && !source.trim().to_ascii_uppercase().starts_with("CREATE")
+    {
+        wrapped_source = crate::object_source_sql::build_view_ddl_sql(crate::object_source_sql::BuildViewDdlInput {
+            database_type: Some(database_type),
+            schema: Some(schema.to_string()),
+            name: object_name.to_string(),
+            source: source.to_string(),
+            identifier_quote: None,
+        });
+        &wrapped_source
+    } else {
+        source
+    };
+    // 独立序列在表之前导出，而 agent 序列源内嵌的 `alter sequence ... owned by`
+    // 引用所属表，重放时表还不存在；导出侧直接去掉该语句（DBeaver 同样不导出 OWNED BY）。
+    let stripped_source;
+    let source = if matches!(object_type, ObjectSourceKind::Sequence)
+        && matches!(database_type, DatabaseType::Kingbase | DatabaseType::Vastbase)
+    {
+        stripped_source = strip_agent_sequence_owned_by(source);
+        &stripped_source
+    } else {
+        source
+    };
     let source = build_export_object_source_sql(database_type, object_type.clone(), source);
     // 非 MySQL 系没有这种 definer 语法；且 strip_mysql_definer 对不含该片段的 DDL 是空操作，
     // 所以放宽到整个 MySQL 系是安全的，能顺带覆盖 Doris/StarRocks 等同族方言。
@@ -5136,6 +5433,20 @@ fn build_database_export_object_source_sql(
     format!("DROP {object_type} IF EXISTS {object_name};\n{source}")
 }
 
+/// agent 序列源以空行分块（create sequence / alter ... owner to / alter ... owned by），
+/// 导出时整块剔除 `owned by` 语句，其余内容原样保留。
+fn strip_agent_sequence_owned_by(source: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for block in source.split("\n\n") {
+        let lower = block.trim().to_ascii_lowercase();
+        if lower.starts_with("alter sequence ") && lower.contains(" owned by ") {
+            continue;
+        }
+        kept.push(block);
+    }
+    kept.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5155,15 +5466,16 @@ mod tests {
         format_mysql_spatial_export_literal, format_postgres_spatial_export_literal_with_srid,
         format_xugu_spatial_export_literal, generate_postgres_enum_ddl, generate_postgres_extension_ddl,
         generate_postgres_sequence_create_ddl, generate_postgres_sequence_post_table_ddl,
-        generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, mysql_database_export_preamble,
-        mysql_view_dependencies_from_rows, mysql_view_dependencies_sql, normalize_export_table_ddl,
-        record_export_destination_identity, record_export_error, replace_database_export_select_list,
-        sort_export_views_by_dependencies, split_postgres_export_table_ddl, write_database_export_rows,
-        write_database_export_rows_with_mode, BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions,
-        BuildExportSqlInsertOptions, DatabaseExportObjectCounts, DatabaseExportRequest, DatabaseExportWriter,
-        DdlNormalizeOptions, ExportedTableSql, PostgresExportEnum, PostgresExportExtension, PostgresExportSequence,
-        PostgresExtensionMembers, SqlInsertDialect, SqlInsertMode, DATABASE_EXPORT_INSERT_BATCH_SIZE,
-        DATABASE_EXPORT_ROW_LIMIT, POSTGRES_EXPORT_SEQUENCES_COMPAT_SQL, POSTGRES_EXPORT_SEQUENCES_SQL,
+        generate_postgres_sequence_setval_sql, is_dameng_auto_increment_ddl, is_postgres_extension_member_routine,
+        mysql_database_export_preamble, mysql_view_dependencies_from_rows, mysql_view_dependencies_sql,
+        normalize_export_table_ddl, record_export_destination_identity, record_export_error,
+        replace_database_export_select_list, sort_export_views_by_dependencies, split_postgres_export_table_ddl,
+        write_database_export_rows, write_database_export_rows_with_mode, BuildDatabaseSqlExportOptions,
+        BuildExportInsertStatementsOptions, BuildExportSqlInsertOptions, DatabaseExportObjectCounts,
+        DatabaseExportRequest, DatabaseExportWriter, DdlNormalizeOptions, ExportedTableSql, PostgresExportEnum,
+        PostgresExportExtension, PostgresExportSequence, PostgresExtensionMembers, SqlInsertDialect, SqlInsertMode,
+        DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT, POSTGRES_EXPORT_SEQUENCES_COMPAT_SQL,
+        POSTGRES_EXPORT_SEQUENCES_SQL,
     };
     use super::{ExportProgress, LenientExportErrors};
     use crate::connection::AppState;
@@ -5361,6 +5673,7 @@ mod tests {
             include_create_database: false,
             drop_table_if_exists: false,
             omit_auto_increment: false,
+            omit_database_qualifier: false,
             fail_on_error: false,
             prevent_overwrite: false,
             output_compression: Default::default(),
@@ -5551,6 +5864,71 @@ mod tests {
     }
 
     #[test]
+    fn standalone_sequences_are_exported_for_oracle_kingbase_vastbase() {
+        use super::exports_standalone_sequence_objects;
+
+        let cases = [
+            ("kingbase include objects", DatabaseType::Kingbase, export_request(false, false, true, Vec::new()), true),
+            ("kingbase structure only", DatabaseType::Kingbase, export_request(true, false, false, Vec::new()), false),
+            ("vastbase include objects", DatabaseType::Vastbase, export_request(false, false, true, Vec::new()), true),
+            ("oracle include objects", DatabaseType::Oracle, export_request(false, false, true, Vec::new()), true),
+            ("oracle structure only", DatabaseType::Oracle, export_request(true, false, false, Vec::new()), true),
+            ("postgres include objects", DatabaseType::Postgres, export_request(false, false, true, Vec::new()), false),
+            ("mysql include objects", DatabaseType::Mysql, export_request(false, false, true, Vec::new()), false),
+        ];
+        for (name, db_type, request, expected) in cases {
+            assert_eq!(exports_standalone_sequence_objects(&request, db_type), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn kingbase_view_definition_without_create_is_wrapped() {
+        let view_def = "SELECT id, name FROM public.users WHERE active = true";
+        let ddl = build_database_export_object_source_sql(
+            DatabaseType::Kingbase,
+            &ObjectSourceKind::View,
+            "v_active_users",
+            view_def,
+            "public",
+            false,
+        );
+        assert!(ddl.starts_with(
+            "CREATE OR REPLACE VIEW \"public\".\"v_active_users\" AS\nSELECT id, name FROM public.users WHERE active = true;"
+        ));
+    }
+
+    #[test]
+    fn agent_sequence_owned_by_is_stripped_from_kingbase_export() {
+        let source = "-- auto-generated definition\ncreate sequence permissions_id_seq\n    increment by 1\n    minvalue 1\n    maxvalue 9223372036854775807\n    start with 1\n    no cycle;\n\nalter sequence permissions_id_seq owner to app_user;\n\nalter sequence permissions_id_seq owned by permissions.id;";
+        let ddl = build_database_export_object_source_sql(
+            DatabaseType::Kingbase,
+            &ObjectSourceKind::Sequence,
+            "permissions_id_seq",
+            source,
+            "public",
+            false,
+        );
+        // 独立序列在表之前写入导出文件，owned by 引用的表此时还不存在。
+        assert!(!ddl.to_ascii_lowercase().contains("owned by"));
+        assert!(ddl.contains("alter sequence permissions_id_seq owner to app_user;"));
+        assert!(ddl.contains("create sequence permissions_id_seq"));
+    }
+
+    #[test]
+    fn kingbase_view_definition_with_create_is_not_double_wrapped() {
+        let view_def = "CREATE VIEW \"v_users\" AS SELECT id FROM public.users;";
+        let ddl = build_database_export_object_source_sql(
+            DatabaseType::Kingbase,
+            &ObjectSourceKind::View,
+            "v_users",
+            view_def,
+            "public",
+            false,
+        );
+        assert_eq!(ddl, "CREATE VIEW \"v_users\" AS SELECT id FROM public.users;");
+    }
+
+    #[test]
     fn mysql_database_export_drops_triggers_and_events_before_create() {
         let trigger = "CREATE DEFINER=`root`@`%` TRIGGER `trg_orders_ai` AFTER INSERT ON `orders` FOR EACH ROW INSERT INTO audit_log(msg) VALUES ('x')";
         let event =
@@ -5565,6 +5943,7 @@ mod tests {
                 &ObjectSourceKind::Trigger,
                 "trg_orders_ai",
                 trigger,
+                "public",
                 true
             ),
             format!(
@@ -5578,6 +5957,7 @@ mod tests {
                 &ObjectSourceKind::Event,
                 "ev_purge",
                 event,
+                "public",
                 true
             ),
             format!(
@@ -5592,6 +5972,7 @@ mod tests {
                 &ObjectSourceKind::Trigger,
                 "trg_orders_ai",
                 trigger,
+                "public",
                 false
             ),
             build_export_object_source_sql(DatabaseType::Mysql, ObjectSourceKind::Trigger, &stripped_trigger)
@@ -5610,6 +5991,7 @@ mod tests {
                 &ObjectSourceKind::View,
                 "mysql_table",
                 view,
+                "public",
                 true
             ),
             "DROP VIEW IF EXISTS `mysql_table`;\nCREATE ALGORITHM=UNDEFINED SQL SECURITY DEFINER VIEW `mysql_table` AS select 1;"
@@ -5622,7 +6004,14 @@ mod tests {
         let view = "CREATE DEFINER=`root`@`%` VIEW `v` AS select 1";
 
         assert_eq!(
-            build_database_export_object_source_sql(DatabaseType::Doris, &ObjectSourceKind::View, "v", view, true),
+            build_database_export_object_source_sql(
+                DatabaseType::Doris,
+                &ObjectSourceKind::View,
+                "v",
+                view,
+                "public",
+                true
+            ),
             "CREATE VIEW `v` AS select 1;"
         );
     }
@@ -5634,7 +6023,14 @@ mod tests {
         let view = "CREATE DEFINER=`root`@`%` VIEW public.v AS SELECT 1";
 
         assert_eq!(
-            build_database_export_object_source_sql(DatabaseType::Postgres, &ObjectSourceKind::View, "v", view, true),
+            build_database_export_object_source_sql(
+                DatabaseType::Postgres,
+                &ObjectSourceKind::View,
+                "v",
+                view,
+                "public",
+                true
+            ),
             "CREATE DEFINER=`root`@`%` VIEW public.v AS SELECT 1;"
         );
     }
@@ -5844,6 +6240,7 @@ mod tests {
     #[test]
     fn postgres_metadata_prefetch_reserves_pool_capacity() {
         assert_eq!(database_export_metadata_prefetch_concurrency(DatabaseType::Postgres), 4);
+        assert_eq!(database_export_metadata_prefetch_concurrency(DatabaseType::OpenGauss), 4);
         assert_eq!(database_export_metadata_prefetch_concurrency(DatabaseType::Mysql), 8);
     }
 
@@ -5990,6 +6387,7 @@ mod tests {
             &ObjectSourceKind::View,
             "active`rows",
             "CREATE VIEW `active``rows` AS SELECT 1",
+            "public",
             true,
         );
 
@@ -6003,6 +6401,7 @@ mod tests {
             &ObjectSourceKind::Procedure,
             "refresh_cache",
             "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END",
+            "public",
             true,
         );
         let function = build_database_export_object_source_sql(
@@ -6010,6 +6409,7 @@ mod tests {
             &ObjectSourceKind::Function,
             "active_count",
             "CREATE FUNCTION `active_count`() RETURNS INT RETURN 1",
+            "public",
             true,
         );
 
@@ -6030,6 +6430,7 @@ mod tests {
             &ObjectSourceKind::View,
             "active_rows",
             "CREATE VIEW `active_rows` AS SELECT 1",
+            "public",
             false,
         );
         let postgres_with_drop = build_database_export_object_source_sql(
@@ -6037,6 +6438,7 @@ mod tests {
             &ObjectSourceKind::View,
             "active_rows",
             "CREATE VIEW active_rows AS SELECT 1",
+            "public",
             true,
         );
 
@@ -6639,6 +7041,7 @@ mod tests {
             database: None,
             schema: None,
             omit_auto_increment: false,
+            omit_database_qualifier: false,
             preserve_original_language: false,
         })
         .expect("build SQL Server database export");
@@ -8031,6 +8434,7 @@ mod tests {
             database: None,
             schema: None,
             omit_auto_increment: false,
+            omit_database_qualifier: false,
             preserve_original_language: false,
         })
         .unwrap();
@@ -8105,6 +8509,139 @@ mod tests {
     }
 
     #[test]
+    fn qualifier_omission_strips_only_the_database_even_for_dotted_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orders.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        // A table whose own name contains a dot renders as `app`.`order.items`;
+        // the strip removes the leading database, never the table (#13601).
+        write_database_export_rows_with_mode(
+            &mut file,
+            &[vec![json!(1)]],
+            &["id".to_string()],
+            &[Some("int".to_string())],
+            &[None],
+            "order.items",
+            "app",
+            &DatabaseType::Mysql,
+            SqlInsertDialect::Standard,
+            SqlInsertMode::default(),
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "INSERT INTO `order.items` (`id`) VALUES (1);
+
+"
+        );
+    }
+
+    #[test]
+    fn source_dialect_keeps_dotted_mysql_table_when_omitting_qualifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orders.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        // Source dialect reuses the qualified target verbatim; with the
+        // qualifier omitted the dotted table name must survive intact
+        // instead of being split at its own dot (#13601).
+        write_database_export_rows_with_mode(
+            &mut file,
+            &[vec![json!(1)]],
+            &["id".to_string()],
+            &[Some("int".to_string())],
+            &[None],
+            "order.items",
+            "app",
+            &DatabaseType::Mysql,
+            SqlInsertDialect::Source,
+            SqlInsertMode::default(),
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        drop(file);
+
+        let sql = std::fs::read_to_string(path).unwrap();
+        assert!(sql.contains("INSERT INTO `order.items`"), "unexpected export: {sql}");
+    }
+
+    #[test]
+    fn qualifier_omission_is_ignored_for_non_mysql_engines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("users.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        // A persisted `true` must not strip a PostgreSQL schema when the
+        // exported engine is not the MySQL family (#13601 review point 1).
+        write_database_export_rows_with_mode(
+            &mut file,
+            &[vec![json!(1)]],
+            &["id".to_string()],
+            &[Some("int".to_string())],
+            &[None],
+            "users",
+            "app",
+            &DatabaseType::Postgres,
+            SqlInsertDialect::Standard,
+            SqlInsertMode::default(),
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "INSERT INTO \"app\".\"users\" (\"id\") VALUES (1);
+
+"
+        );
+    }
+
+    #[test]
+    fn mysql_export_can_omit_the_database_qualifier_from_insert_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("users.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        // The USE preamble owns the database context, so the flag drops the
+        // `db`. prefix in both Standard and Source dialects (#13509).
+        write_database_export_rows_with_mode(
+            &mut file,
+            &[vec![json!(1), json!("Ada")]],
+            &["id".to_string(), "name".to_string()],
+            &[Some("int".to_string()), Some("varchar(32)".to_string())],
+            &[None, None],
+            "users",
+            "app",
+            &DatabaseType::Mysql,
+            SqlInsertDialect::Standard,
+            SqlInsertMode::default(),
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "INSERT INTO `users` (`id`, `name`) VALUES (1, 'Ada');
+
+"
+        );
+    }
+
+    #[test]
     fn database_row_writer_standard_dialect_uses_mysql_backticks() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("users.sql");
@@ -8147,6 +8684,8 @@ mod tests {
             &DatabaseType::Mysql,
             SqlInsertDialect::Source,
             SqlInsertMode::Single,
+            false,
+            None,
             false,
         )
         .unwrap();
@@ -8462,6 +9001,71 @@ mod tests {
     }
 
     #[test]
+    fn dameng_auto_increment_export_inserts_omit_identity_insert() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Dameng),
+            identifier_quote: None,
+            schema: Some("SYSDBA".to_string()),
+            table_name: Some("USERS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            column_types: vec![Some("INT".to_string()), Some("VARCHAR(20)".to_string())],
+            column_extras: vec![Some("auto_increment".to_string()), None],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![vec![json!(1), json!("Ada")]],
+            batch_size: Some(10),
+            preserve_original_language: false,
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO \"SYSDBA\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');"]);
+    }
+
+    #[test]
+    fn dameng_database_row_writer_omits_identity_insert_when_table_ddl_has_auto_increment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("users.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        let ddl = "CREATE TABLE \"SYSDBA\".\"USERS\" (\"ID\" INT AUTO_INCREMENT PRIMARY KEY, \"NAME\" VARCHAR(20));";
+        write_database_export_rows_with_mode(
+            &mut file,
+            &[vec![json!(1), json!("Ada")]],
+            &["ID".to_string(), "NAME".to_string()],
+            &[Some("INT".to_string()), Some("VARCHAR(20)".to_string())],
+            // Catalog reports "identity" because DM c.INFO2 & 0x01 = 1 for auto_increment
+            &[Some("identity".to_string()), None],
+            "USERS",
+            "SYSDBA",
+            &DatabaseType::Dameng,
+            SqlInsertDialect::Source,
+            SqlInsertMode::Single,
+            false,
+            Some(ddl),
+            false,
+        )
+        .unwrap();
+        drop(file);
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(!content.contains("IDENTITY_INSERT"));
+        assert_eq!(content, "INSERT INTO \"SYSDBA\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');\n\n");
+    }
+
+    #[test]
+    fn dameng_is_auto_increment_ddl_detection() {
+        assert!(is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"ID\" INT AUTO_INCREMENT, \"NAME\" VARCHAR(20))"));
+        assert!(is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"ID\" INT autoincrement PRIMARY KEY)"));
+        assert!(is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"ID\" INT AUTO_INCREMENT=100)"));
+        assert!(!is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"ID\" INT IDENTITY(1, 1), \"NAME\" VARCHAR(20))"));
+        assert!(!is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"AUTO_INCREMENT\" INT)"));
+        assert!(!is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"VAL\" VARCHAR(50) DEFAULT 'AUTO_INCREMENT')"));
+        assert!(!is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\"ID\" INT /* AUTO_INCREMENT */)"));
+        assert!(!is_dameng_auto_increment_ddl("CREATE TABLE \"T\" (\n-- AUTO_INCREMENT\n\"ID\" INT)"));
+    }
+
+    #[test]
     fn sqlserver_identity_export_inserts_enable_identity_insert() {
         // The SQL Server column metadata reports `identity(seed,increment)`;
         // explicit values for such columns are rejected with error 544 unless
@@ -8519,6 +9123,7 @@ mod tests {
             database: None,
             schema: None,
             omit_auto_increment: false,
+            omit_database_qualifier: false,
             preserve_original_language: false,
         })
         .unwrap();
@@ -8884,6 +9489,37 @@ mod tests {
 
         assert!(result.is_err(), "a destination that existed before should not be silently recreated");
         assert!(!destination.exists(), "the backup directory must not be resurrected on the wrong filesystem");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // Regression test for #13610: deleting the last backup of a run removes the
+    // emptied per-run directory (`remove_empty_directories`), while its recorded
+    // destination identity survives in state. The next run into the same dated
+    // directory refused to recreate it even though dbx itself had removed the
+    // directory and the parent still resolved to the same filesystem. The
+    // vanished-mount refusals above stay intact: there the parent is missing,
+    // so the identity comparison fails closed.
+    #[tokio::test]
+    async fn ensure_export_destination_dir_recreates_a_recorded_destination_whose_parent_kept_the_same_filesystem() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-cleaned-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = test_app_state(&scratch).await;
+
+        let destination = scratch.join("backups").join("mydb");
+        ensure_export_destination_dir(&state, &destination).await.expect("initial export should create the directory");
+        assert!(destination.is_dir());
+
+        // Simulates dbx's own cleanup after the last backup file in the
+        // directory is deleted: the empty run directory is removed, its parent
+        // stays.
+        std::fs::remove_dir(&destination).unwrap();
+        assert!(!destination.exists());
+
+        ensure_export_destination_dir(&state, &destination)
+            .await
+            .expect("a leaf directory dbx itself removed must be recreated when the parent still matches");
+        assert!(destination.is_dir());
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
