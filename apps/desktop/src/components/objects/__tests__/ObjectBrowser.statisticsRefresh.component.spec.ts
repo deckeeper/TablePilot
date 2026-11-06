@@ -3,7 +3,7 @@
 import { createApp, defineComponent, h, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ObjectBrowser from "@/components/objects/ObjectBrowser.vue";
-import { cacheObjectBrowserRows, createObjectBrowserRowsCacheWriteToken, invalidateObjectBrowserRowsCache } from "@/lib/table/objectBrowserRowsCache";
+import { cacheObjectBrowserRows, createObjectBrowserRowsCacheWriteToken, getCachedObjectBrowserRows, invalidateObjectBrowserRowsCache } from "@/lib/table/objectBrowserRowsCache";
 import type { ObjectBrowserRow } from "@/lib/table/objectBrowserRows";
 import type { ConnectionConfig } from "@/types/database";
 
@@ -23,6 +23,7 @@ vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     getConfig: () => connection,
     ensureConnected: mocks.ensureConnected,
+    tableNameFilterForScope: () => undefined,
     orderByPinnedTreeNodes: (rows: unknown[]) => rows,
   }),
 }));
@@ -80,6 +81,7 @@ const connection = {
 } as unknown as ConnectionConfig;
 
 const scope = { connectionId: connection.id, database: "pgdemo", schema: "public" };
+const mysqlScope = { connectionId: connection.id, database: "pgdemo", schema: "pgdemo" };
 const cachedRows: ObjectBrowserRow[] = [
   {
     id: "table:orders",
@@ -111,20 +113,50 @@ afterEach(() => {
   invalidateObjectBrowserRowsCache({});
 });
 
-async function mountBrowser() {
+async function mountBrowser(schema = ref("public")) {
   const host = document.createElement("div");
   document.body.append(host);
-  const app = createApp({ setup: () => () => h(ObjectBrowser, { connection, database: "pgdemo", schema: "public" }) });
+  const app = createApp({ setup: () => () => h(ObjectBrowser, { connection, database: "pgdemo", schema: schema.value }) });
   mountedApps.push({ app, host });
   app.mount(host);
   return host;
 }
 
-function primeRowsCache(cachedAt: number) {
-  cacheObjectBrowserRows(createObjectBrowserRowsCacheWriteToken(scope), cachedRows, { cachedAt });
+function primeRowsCache(cachedAt: number, target = scope) {
+  cacheObjectBrowserRows(createObjectBrowserRowsCacheWriteToken(target), cachedRows, { cachedAt });
 }
 
 describe("ObjectBrowser table statistics on a cached scaffold (#10461)", () => {
+  it("ignores late statistics from the previous schema", async () => {
+    let resolveOld!: (value: unknown[]) => void;
+    const oldStatistics = new Promise<unknown[]>((resolve) => {
+      resolveOld = resolve;
+    });
+    mocks.listSchemas.mockResolvedValue(["public", "other"]);
+    mocks.listObjectStatistics.mockImplementation((_id, _database, schema) => (schema === "public" ? oldStatistics : Promise.resolve([{ name: "orders", schema: "other", estimated_rows: 22, total_bytes: 2048 }])));
+    primeRowsCache(Date.now() - 31_000);
+    const schema = ref("public");
+    const host = await mountBrowser(schema);
+    await vi.waitFor(() => expect(mocks.listObjectStatistics).toHaveBeenCalledWith(connection.id, "pgdemo", "public"));
+    schema.value = "other";
+    await vi.waitFor(() => expect(getCachedObjectBrowserRows({ ...scope, schema: "other" })?.[0]).toMatchObject({ estimatedRows: 22, totalBytes: 2048 }));
+    resolveOld([{ name: "orders", schema: "public", estimated_rows: 999999, total_bytes: 999999 }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(getCachedObjectBrowserRows({ ...scope, schema: "other" })?.[0]).toMatchObject({ estimatedRows: 22, totalBytes: 2048 });
+    expect(host.textContent).not.toContain("999,999");
+  });
+
+  it.each([null, 0])("replaces stale statistics with %s without confusing unknown and zero", async (value) => {
+    mocks.listObjectStatistics.mockResolvedValue([{ name: "orders", schema: "public", estimated_rows: value, total_bytes: value }]);
+    primeRowsCache(Date.now() - 31_000);
+    const host = await mountBrowser();
+    await vi.waitFor(() => {
+      expect(getCachedObjectBrowserRows(scope)?.[0]).toMatchObject({ estimatedRows: value, totalBytes: value });
+    });
+    expect(host.textContent).not.toContain("24 KB");
+    if (value === 0) expect(host.textContent).toContain("0 B");
+  });
+
   it("backfills row/size statistics when the restored scaffold is stale", async () => {
     primeRowsCache(Date.now() - 31_000);
 
@@ -147,5 +179,73 @@ describe("ObjectBrowser table statistics on a cached scaffold (#10461)", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(mocks.listObjectStatistics).not.toHaveBeenCalled();
     expect(mocks.listObjects).not.toHaveBeenCalled();
+  });
+});
+
+describe("MySQL lightweight enumeration", () => {
+  it("shares one pending enumeration across equivalent browsers", async () => {
+    const originalType = connection.db_type;
+    connection.db_type = "mysql";
+    let resolve!: (value: unknown[]) => void;
+    mocks.listObjects.mockReturnValue(
+      new Promise<unknown[]>((done) => {
+        resolve = done;
+      }),
+    );
+    try {
+      const first = await mountBrowser();
+      const second = await mountBrowser();
+      await vi.waitFor(() => expect(mocks.listObjects).toHaveBeenCalledTimes(1));
+      resolve([{ name: "orders", object_type: "TABLE", schema: "pgdemo" }]);
+      await vi.waitFor(() => {
+        expect(first.textContent).toContain("orders");
+        expect(second.textContent).toContain("orders");
+      });
+      // The cheap name read is shared; the automatic details pass still runs.
+      expect(mocks.listObjects.mock.calls.filter((call) => (call[10] as { lightweight?: boolean } | undefined)?.lightweight === true)).toHaveLength(1);
+    } finally {
+      connection.db_type = originalType;
+    }
+  });
+
+  it("runs the details pass automatically and patches comments in place", async () => {
+    const originalType = connection.db_type;
+    connection.db_type = "mysql";
+    mocks.listObjects.mockImplementation((_id, _database, _schema, _types, _filter, _limit, _offset, _catalog, _tableNameFilter, _executionId, options) =>
+      Promise.resolve([{ name: "orders", object_type: "TABLE", schema: "pgdemo", comment: (options as { lightweight?: boolean } | undefined)?.lightweight === false ? "order details" : null }]),
+    );
+    try {
+      const host = await mountBrowser();
+      await vi.waitFor(() => expect(mocks.listObjects.mock.calls.map((call) => JSON.stringify(call[10] ?? null))).toContain('{"lightweight":false}'));
+      await vi.waitFor(() => expect(getCachedObjectBrowserRows(mysqlScope)?.[0].comment).toBe("order details"));
+      expect(host.textContent).toContain("orders");
+      // Comments arrive without a manual click; the row/size statistics read may
+      // still be running against the same metadata pool, so do not gate on it.
+      const manual = [...host.querySelectorAll("button")].find((item) => item.textContent?.includes("objects.loadDetails"));
+      expect(manual).toBeUndefined();
+    } finally {
+      connection.db_type = originalType;
+    }
+  });
+
+  it("keeps names visible when the automatic details pass fails", async () => {
+    const originalType = connection.db_type;
+    connection.db_type = "mysql";
+    mocks.listObjects.mockImplementation((_id, _database, _schema, _types, _filter, _limit, _offset, _catalog, _tableNameFilter, _executionId, options) => {
+      if ((options as { lightweight?: boolean } | undefined)?.lightweight === false) return Promise.reject(new Error("details unavailable"));
+      return Promise.resolve([{ name: "orders", object_type: "TABLE", schema: "pgdemo" }]);
+    });
+    mocks.listObjectStatistics.mockRejectedValueOnce(new Error("statistics unavailable"));
+    try {
+      const host = await mountBrowser();
+      await vi.waitFor(() => expect(mocks.listObjects.mock.calls.map((call) => JSON.stringify(call[10] ?? null))).toContain('{"lightweight":false}'));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(host.textContent).toContain("orders");
+      // Background failures stay silent: no blocking error, no banner.
+      expect(host.textContent).not.toContain("details unavailable");
+      expect(host.textContent).not.toContain("statistics unavailable");
+    } finally {
+      connection.db_type = originalType;
+    }
   });
 });

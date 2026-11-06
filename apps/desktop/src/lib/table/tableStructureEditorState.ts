@@ -1,6 +1,7 @@
 import type { ColumnInfo, DatabaseConnectionInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database.ts";
 import type { ColumnExtra, EditableStructureColumn, EditableStructureForeignKey, EditableStructureIndex, EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql.ts";
 import { getStarRocksCapabilities, STARROCKS_DATA_TYPES } from "@/lib/table/starrocksCapabilities";
+import { exactOracleTriggerMetadata, oracleTriggerIdentityKey } from "@/lib/database/oracleTriggerIdentity";
 
 export interface CopySourceColumnDetails {
   /** Column default as shown in the copy-fields dialog, or null when there is none. */
@@ -1105,6 +1106,13 @@ function columnDataTypeForEditor(column: ColumnInfo, databaseType?: DatabaseType
     const minimum = normalized === "bit" || normalized === "varbit" ? 1 : 0;
     if (precision >= minimum) return combineDataTypeForDatabase(databaseType, baseType, String(precision));
   }
+  // Dameng reports TIMESTAMP(6)/TIME(6) precision in DATA_SCALE while keeping
+  // DATA_PRECISION null. Without this the structure editor opens a column
+  // declared as TIMESTAMP(6) as a bare TIMESTAMP and a later save loses the
+  // fractional-second precision (#12444).
+  if (databaseType === "dameng" && (normalized === "timestamp" || normalized === "time") && Number.isInteger(column.numeric_scale)) {
+    return combineDataTypeForDatabase(databaseType, baseType, String(column.numeric_scale));
+  }
   if (NUMERIC_PRECISION_METADATA_TYPES.has(normalized) && Number.isInteger(column.numeric_precision) && Number(column.numeric_precision) > 0) {
     const scale = Number.isInteger(column.numeric_scale) && Number(column.numeric_scale) >= 0 ? `,${column.numeric_scale}` : "";
     return combineDataTypeForDatabase(databaseType, baseType, `${column.numeric_precision}${scale}`);
@@ -1290,7 +1298,7 @@ export function sortStructureIndexColumnOptions<T extends { name: string }>(opti
 
 export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[] {
   return indexes.map((index) => ({
-    id: `existing:${index.name}`,
+    id: index.owner == null ? `existing:${index.name}` : `existing-owned-index:${JSON.stringify([index.owner, index.name])}`,
     name: index.name,
     columns: [...index.columns],
     nameEdited: true,
@@ -1350,7 +1358,7 @@ export function createForeignKeyDrafts(foreignKeys: ForeignKeyInfo[], databaseTy
 
 export function createTriggerDrafts(triggers: TriggerInfo[]): EditableStructureTrigger[] {
   return triggers.map((trigger) => ({
-    id: `existing:${trigger.name}`,
+    id: exactOracleTriggerMetadata(trigger) ? `existing:exact:${oracleTriggerIdentityKey(exactOracleTriggerMetadata(trigger)!)}` : `existing:${trigger.name}`,
     name: trigger.name,
     timing: trigger.timing,
     event: trigger.event,
@@ -1368,7 +1376,8 @@ export function canEditStructuredTriggerDraft(databaseType: DatabaseType | undef
   // REFERENCING, FOLLOWS, ...) that the timing/event/body form would drop on CREATE OR REPLACE.
   // Dameng reports a plain body plus a separate `WHEN` clause, so the same guard applies: the
   // structured form can only rebuild triggers that have neither of those extra clauses.
-  if (databaseType !== "oracle" && databaseType !== "dameng") return true;
+  if (databaseType !== "oracle" && databaseType !== "oceanbase-oracle" && databaseType !== "dameng") return true;
+  if (exactOracleTriggerMetadata(trigger.original) && trigger.loadedOracleStructured !== true) return false;
   return isStructuredOracleTriggerSource(trigger.original.statement) && !trigger.original.condition?.trim();
 }
 
