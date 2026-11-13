@@ -520,6 +520,7 @@ fn wrap_conditional_check(sql: &str, db_type: DatabaseType) -> String {
             | DatabaseType::Highgo
             | DatabaseType::Vastbase
             | DatabaseType::Uxdb
+            | DatabaseType::Gbase8c
             | DatabaseType::Redshift => {
                 let (schema_name, table_name) = postgres_table_identity(table_identifier);
                 let schema_predicate = schema_name.map_or_else(
@@ -1867,6 +1868,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
 
@@ -1900,6 +1902,7 @@ mod tests {
                     target_ddl: Some("CREATE TABLE users (id INT);".to_string()),
                     source_table_comment: None,
                     target_table_comment: None,
+                    table_charset: None,
                     sync_sql: None,
                 },
                 direction: crate::schema_diff::DiffDirection::Rollback,
@@ -2023,6 +2026,7 @@ mod tests {
                 target_ddl: Some("CREATE TABLE users (id INT);".to_string()),
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             }],
             sync_sql: "ALTER TABLE users ADD COLUMN name VARCHAR(100);".to_string(),
@@ -2071,6 +2075,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: Some("CREATE TABLE test_table (id INT PRIMARY KEY);".to_string()),
             }],
             sync_sql: "CREATE TABLE test_table (id INT PRIMARY KEY);".to_string(),
@@ -2254,6 +2259,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
 
@@ -2280,6 +2286,7 @@ mod tests {
                     target_ddl: Some("CREATE TABLE users (id INT);".to_string()),
                     source_table_comment: None,
                     target_table_comment: None,
+                    table_charset: None,
                     sync_sql: None,
                 },
                 direction: crate::schema_diff::DiffDirection::Rollback,
