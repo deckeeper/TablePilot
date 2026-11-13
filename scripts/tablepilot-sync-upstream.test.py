@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('sync', Path(__file__).with_name('tablepilot-sync-upstream.py'))
 sync = importlib.util.module_from_spec(spec)
@@ -62,6 +63,62 @@ class ProposalTest(unittest.TestCase):
         for path in ['.git/config', '../outside', '/tmp/outside', 'package.json', 'src-tauri/src/main.rs', 'scripts/run.sh', 'crates/new/Cargo.toml', 'src/mcp/server.ts']:
             self.assertTrue(sync.protected(path, set()), path)
         self.assertFalse(sync.protected('apps/desktop/src/lib/sql/formatter.ts', set()))
+
+
+
+class PullRequestTest(unittest.TestCase):
+    def test_large_report_uses_bounded_summary_and_full_report_link(self):
+        report = '## Applied upstream files (1938)\n' + ('- file\n' * 40000) + '## Manual review required (1182)\n'
+        body = sync.compact_pr_body('deckeeper/TablePilot', 'upstream/tablepilot-v0.6.70', 'v0.6.70', report)
+        self.assertLess(len(body), 4000)
+        self.assertIn('**1938**', body)
+        self.assertIn('**1182**', body)
+        self.assertIn('/blob/upstream/tablepilot-v0.6.70/.tablepilot/proposals/v0.6.70.md', body)
+        self.assertIn('Do not merge this draft as-is', body)
+
+    def test_creates_draft_with_compact_body_file(self):
+        def command(*args, **kwargs):
+            if args[1:3] == ('pr', 'list'):
+                self.assertIn('all', args)
+                return subprocess.CompletedProcess(args, 0, '[]', '')
+            self.assertEqual(args[1:3], ('pr', 'create'))
+            self.assertIn('--draft', args)
+            body = Path(args[args.index('--body-file') + 1]).read_text()
+            self.assertLess(len(body), 4000)
+            self.assertIn('Full file-by-file report', body)
+            return subprocess.CompletedProcess(args, 0, 'https://github.com/deckeeper/TablePilot/pull/3', '')
+        with patch.object(sync, 'run', side_effect=command) as run, patch.object(sync, 'summary'):
+            sync.ensure_draft_pr('deckeeper/TablePilot', 'upstream/tablepilot-v0.6.70', 'v0.6.70', 'x' * 255027)
+        self.assertEqual(run.call_count, 2)
+
+    def test_existing_open_closed_or_merged_pr_is_preserved(self):
+        for state in ('OPEN', 'CLOSED', 'MERGED'):
+            result = subprocess.CompletedProcess([], 0, '[{"number":3,"state":"' + state + '","url":"https://github.com/deckeeper/TablePilot/pull/3"}]', '')
+            with patch.object(sync, 'run', return_value=result) as run, patch.object(sync, 'summary'):
+                sync.ensure_draft_pr('deckeeper/TablePilot', 'upstream/tablepilot-v0.6.70', 'v0.6.70', '')
+            self.assertEqual(run.call_count, 1)
+
+    def test_pr_creation_failure_is_reported_as_job_failure(self):
+        results = [subprocess.CompletedProcess([], 0, '[]', ''),
+                   subprocess.CompletedProcess([], 1, '', 'permission denied')]
+        with patch.object(sync, 'run', side_effect=results), patch.object(sync, 'summary') as summary:
+            with self.assertRaisesRegex(SystemExit, 'preserved for retry'):
+                sync.ensure_draft_pr('deckeeper/TablePilot', 'upstream/tablepilot-v0.6.70', 'v0.6.70', '')
+            self.assertIn('permission denied', summary.call_args[0][0])
+
+    def test_existing_branch_retries_pr_without_modifying_branch(self):
+        config = '{"repository":"t8y2/dbx","baseline_tag":"v0.6.45","baseline_commit":"' + 'a' * 40 + '"}'
+        def git(*args, **kwargs):
+            value = 'abc refs/heads/upstream/tablepilot-v0.6.70' if args[0] == 'ls-remote' else 'report' if args[0] == 'show' else ''
+            return subprocess.CompletedProcess(args, 0, value, '')
+        with patch.dict(os.environ, {'GITHUB_REPOSITORY':'deckeeper/TablePilot'}), \
+             patch.object(Path, 'read_text', return_value=config), \
+             patch.object(sync, 'run', return_value=subprocess.CompletedProcess([], 0, '{"tag_name":"v0.6.70"}', '')), \
+             patch.object(sync, 'git', side_effect=git) as commands, \
+             patch.object(sync, 'ensure_draft_pr') as ensure:
+            sync.main()
+        ensure.assert_called_once_with('deckeeper/TablePilot', 'upstream/tablepilot-v0.6.70', 'v0.6.70', 'report')
+        self.assertEqual([call.args[0] for call in commands.call_args_list], ['status', 'ls-remote', 'fetch', 'show'])
 
 
 if __name__ == '__main__':
