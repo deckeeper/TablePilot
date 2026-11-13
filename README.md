@@ -23,6 +23,7 @@ Run the newer installer to update an existing installation. The app's update che
 
 ## Recent changes
 
+- **0.4.3:** Restore build compatibility after an incomplete update proposal, preserve SQL comments when removing Oracle storage clauses, and refresh schema metadata after more routine DDL forms. The larger upstream update is deferred.
 - **0.4.2:** Import several files or Excel worksheets into selected existing tables in one batch, with individual field mappings, destination review, and adjustable import order.
 
 - **0.4.1:** Remove three vulnerable JavaScript development dependency chains while preserving the UI styles. The root JavaScript audit reports zero findings; other dependency ecosystems are not covered by that result.

@@ -9,8 +9,6 @@ import type { ContentAreaSurfaceEmits } from "@/components/layout/querySurfaces"
 export const contentSurfaceEventNames = [
   "closeTab",
   "locate-tab",
-  "locate-sql-file",
-  "locate-sql-library-file",
   "update:activeOutputView",
   "fixWithAi",
   "sendSelectionToAi",
@@ -36,7 +34,6 @@ export const contentSurfaceEventNames = [
   "viewTableDdl",
   "editTableStructure",
   "openObjectSource",
-  "openDependencyObject",
   "openObjectTable",
   "openDatabaseSearchTarget",
   "objectSchemaChange",

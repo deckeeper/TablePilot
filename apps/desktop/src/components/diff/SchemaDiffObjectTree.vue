@@ -137,15 +137,11 @@ function displayObjectName(object: SchemaDiffObject): string {
 }
 
 function sourceObjectName(object: SchemaDiffObject): string {
-  const name = object.sourceName ?? displayObjectName(object);
-  if (object.routineType === "PACKAGE" || object.routineType === "PACKAGE_BODY") return `${object.routineType.replaceAll("_", " ")} ${name}`;
-  return name;
+  return object.sourceName ?? displayObjectName(object);
 }
 
 function targetObjectName(object: SchemaDiffObject): string {
-  const name = object.targetName ?? displayObjectName(object);
-  if (object.routineType === "PACKAGE" || object.routineType === "PACKAGE_BODY") return `${object.routineType.replaceAll("_", " ")} ${name}`;
-  return name;
+  return object.targetName ?? displayObjectName(object);
 }
 </script>
 

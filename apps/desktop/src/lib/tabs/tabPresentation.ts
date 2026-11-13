@@ -1,5 +1,4 @@
 import { useConnectionStore } from "@/stores/connectionStore";
-import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { hexToRgba } from "@/lib/common/color";
 import { isLegacyWebView } from "@/lib/ui/legacyWebView";
@@ -13,7 +12,6 @@ import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import type { SqlErrorPosition } from "@/lib/backend/errorUtils";
 import { queryResultSourceNameParts } from "@/lib/sql/queryResultSource";
-import { normalizeExternalSqlPath } from "@/lib/sql/sqlFileOpen";
 import type { BatchSqlExecution, ConnectionConfig, DatabaseType, QueryResult, QueryResultRun, QueryTab } from "@/types/database";
 import type { ResultTabNamingMode } from "@/stores/settingsStore";
 
@@ -77,8 +75,7 @@ export function tabConnectionColor(connectionId: string): string {
 
 export function isConnectionReadonly(connectionId: string): boolean {
   const connectionStore = useConnectionStore();
-  const connection = connectionStore.getConfig(connectionId);
-  return mysqlDataCharsetEnabled(connection) || connection?.read_only === true;
+  return connectionStore.getConfig(connectionId)?.read_only ?? false;
 }
 
 function jdbcTargetLabel(connection: ConnectionConfig): string {
@@ -149,8 +146,7 @@ export function joinTabTitleParts(parts: TabTitleParts): string {
  *
  * 编号不在这里计算，而是由 `syncTabTitleNumbers` 一次性写进标签（见该函数）：渲染
  * 函数只看标签上已有的编号，这样关闭一个重名标签不会让后面的标签被重新编号
- * （#9938）。未分配编号的标签按原样显示。编号同时也是「该标签参与重名」的标记，
- * 具体显示成序号还是连接名由 `duplicateTabTitleMode` 决定。
+ * （#9938）。未分配编号的标签按原样显示。
  */
 export function tabDisplayTitles(tabs: QueryTab[], t: Translate): Map<string, string> {
   const titles = new Map<string, string>();
@@ -164,10 +160,9 @@ export function tabDisplayTitles(tabs: QueryTab[], t: Translate): Map<string, st
  */
 export function tabDisplayTitleParts(tabs: QueryTab[], t: Translate): Map<string, TabTitleParts> {
   const parts = new Map<string, TabTitleParts>();
-  const connectionNameIds = connectionNameSuffixTabIds(tabs, t);
   for (const tab of tabs) {
     const base = tabDisplayTitle(tab, t);
-    parts.set(tab.id, { base, suffix: tabTitleSuffix(tab, base, connectionNameIds.has(tab.id)) });
+    parts.set(tab.id, { base, suffix: tabTitleSuffix(tab, base) });
   }
   return parts;
 }
@@ -176,62 +171,24 @@ function customTitleSuffix(tab: QueryTab): string | undefined {
   return tab.titleSuffix?.trim() || undefined;
 }
 
-/**
- * 在「对象名 + 连接名」策略下，挑出真正可以用连接名当后缀的标签。
- *
- * `syncTabTitleNumbers` 已经把「参与重名分组」记录在 `titleNumber` 上，这里只决定
- * 这个标记最终渲染成序号还是连接名，不在渲染路径里写标签状态。按整组判定，保证
- * 同一组不会混用两种后缀：
- * 1. 组内每个标签必须属于不同连接，否则连接名本身也重复，仍然区分不了；
- * 2. 组内标题不能已经带连接名（query 页签的完整标题就是 `连接名@数据库`，再加
- *    一次会变成 `prod@app prod`），这种情况保持序号。
- * 任一条件不满足就整组退回序号；序号策略下直接返回空集合，历史行为完全不变。
- */
-function connectionNameSuffixTabIds(tabs: QueryTab[], t: Translate): Set<string> {
-  const ids = new Set<string>();
-  if (useSettingsStore().editorSettings.duplicateTabTitleMode !== "connection") return ids;
-
-  const groups = new Map<string, { tab: QueryTab; base: string }[]>();
-  for (const tab of tabs) {
-    const base = tabDisplayTitle(tab, t);
-    const key = `${tab.mode || "query"}\u0000${base}`;
-    const group = groups.get(key);
-    if (group) group.push({ tab, base });
-    else groups.set(key, [{ tab, base }]);
-  }
-
-  for (const group of groups.values()) {
-    const candidates = group.filter(({ tab, base }) => !customTitleSuffix(tab) && tabTitleNumber(tab, base) !== undefined);
-    if (candidates.length === 0) continue;
-    const names = candidates.map(({ tab }) => connectionDisplayName(tab.connectionId));
-    if (new Set(names).size !== names.length) continue;
-    if (names.some((name, index) => candidates[index]!.base.includes(name))) continue;
-    for (const { tab } of candidates) ids.add(tab.id);
-  }
-  return ids;
-}
-
-/** The suffix a tab currently shows: its custom one, else the automatic disambiguator. */
-function tabTitleSuffix(tab: QueryTab, title: string, useConnectionName = false): string {
+/** The suffix a tab currently shows: its custom one, else its automatic number. */
+function tabTitleSuffix(tab: QueryTab, title: string): string {
   const custom = customTitleSuffix(tab);
   if (custom) return custom;
   const number = tabTitleNumber(tab, title);
-  if (number === undefined) return "";
-  return useConnectionName ? connectionDisplayName(tab.connectionId) : String(number);
+  return number !== undefined ? String(number) : "";
 }
 
 /**
  * Finds another open tab that would show exactly the same label as `target`
  * once `suffix` is applied to it — same title and same suffix, whether the other
- * tab's suffix is custom, a connection name or an automatic number.
+ * tab's suffix is custom or an automatic number.
  */
 export function findTabWithSameTitleSuffix(tabs: QueryTab[], target: QueryTab, suffix: string, t: Translate): QueryTab | undefined {
   const wanted = suffix.trim();
   if (!wanted) return undefined;
   const base = tabDisplayTitle(target, t);
-  const targetMode = target.mode || "query";
-  const connectionNameIds = connectionNameSuffixTabIds(tabs, t);
-  return tabs.find((tab) => tab.id !== target.id && (tab.mode || "query") === targetMode && tabDisplayTitle(tab, t) === base && tabTitleSuffix(tab, base, connectionNameIds.has(tab.id)) === wanted);
+  return tabs.find((tab) => tab.id !== target.id && tabDisplayTitle(tab, t) === base && tabTitleSuffix(tab, base) === wanted);
 }
 
 function tabTitleNumber(tab: QueryTab, title: string): number | undefined {
@@ -265,7 +222,6 @@ export function syncTabTitleNumbers(tabs: QueryTab[], t: Translate): void {
   for (const tab of tabs) {
     if (isPreviewTab(tab)) continue;
     const title = tabDisplayTitle(tab, t);
-    const groupKey = `${tab.mode || "query"}\u0000${title}`;
     const custom = customTitleSuffix(tab);
     if (custom) {
       // A custom suffix replaces the number, so the tab leaves the numbering
@@ -273,18 +229,17 @@ export function syncTabTitleNumbers(tabs: QueryTab[], t: Translate): void {
       // fresh one instead of resurrecting a stale value.
       tab.titleNumber = undefined;
       tab.titleNumberKey = undefined;
-      const used = customSuffixes.get(groupKey);
+      const used = customSuffixes.get(title);
       if (used) used.add(custom);
-      else customSuffixes.set(groupKey, new Set([custom]));
+      else customSuffixes.set(title, new Set([custom]));
       continue;
     }
-    const group = groups.get(groupKey);
+    const group = groups.get(title);
     if (group) group.push(tab);
-    else groups.set(groupKey, [tab]);
+    else groups.set(title, [tab]);
   }
 
-  for (const [groupKey, group] of groups) {
-    const title = groupKey.slice(groupKey.indexOf("\u0000") + 1);
+  for (const [title, group] of groups) {
     const numbered = group.filter((tab) => tabTitleNumber(tab, title) !== undefined);
     if (group.length < 2 && numbered.length === 0) {
       // A lone, never-numbered tab shows its plain title; drop a number that a
@@ -300,7 +255,7 @@ export function syncTabTitleNumbers(tabs: QueryTab[], t: Translate): void {
     let next = numbered.reduce((highest, tab) => Math.max(highest, tab.titleNumber ?? 0), 0) + 1;
     for (const tab of group) {
       if (tabTitleNumber(tab, title) !== undefined) continue;
-      while (customSuffixes.get(groupKey)?.has(String(next))) next += 1;
+      while (customSuffixes.get(title)?.has(String(next))) next += 1;
       tab.titleNumber = next;
       tab.titleNumberKey = title;
       next += 1;
@@ -314,10 +269,6 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
   const compact = settingsStore.editorSettings.compactTabTitle;
   if (isPreviewTab(tab)) return tab.title;
   if (useConnectionStore().getConfig(tab.connectionId)?.db_type === "redis") {
-    // Redis query tabs normally identify their logical database (db0/db1), but a
-    // saved SQL file or external SQL file is a document: show its file title
-    // instead, otherwise every Redis file tab looks like the same database.
-    if (!tab.isDefaultQuery && (tab.savedSqlId || tab.externalSqlPath) && tab.title.trim()) return tab.title;
     return tab.database ? database : connectionDisplayName(tab.connectionId);
   }
   if (tab.mode === "data" && tab.tableMeta?.tableName) {
@@ -508,14 +459,6 @@ export function middleEllipsis(value: string, maxLength = 24): string {
   return `${value.slice(0, startLength)}...${end}`;
 }
 
-// 无来源对象的结果（如外层 SELECT * FROM (...) 包装查询）页签 tooltip 会回退到 SQL 文本；
-// 整条语句会把浮层撑成遮挡工作区的巨块并拦截点击，这里折叠空白并限制长度 (#13266)
-export function sourceStatementTooltip(statement: string | undefined, maxLength = 160): string | undefined {
-  const singleLine = statement?.replace(/\s+/g, " ").trim();
-  if (!singleLine) return undefined;
-  return singleLine.length > maxLength ? `${singleLine.slice(0, maxLength)}…` : singleLine;
-}
-
 export function resultSqlForGrid(tab: Pick<QueryTab, "result" | "resultBaseSql" | "lastExecutedSql" | "sql">): string {
   return tab.result?.sourceStatement || tab.resultBaseSql || tab.lastExecutedSql || tab.sql;
 }
@@ -599,24 +542,20 @@ export function statementExecutionMarkers(
   if (!results?.length || sqlTextFingerprint(editorSql) !== executionEditorFingerprint) return [];
   const submittedStatements = statementRanges(submittedSql, databaseType, parameterOptions);
   if (submittedStatements.length <= 1) return [];
-  const submittedStatementTexts = new Set(submittedStatements.map((statement) => statement.sql));
+  const editorStatements = submittedSql === editorSql ? submittedStatements : statementRanges(editorSql, databaseType, parameterOptions);
 
   const byLine = new Map<number, { success: number; error: number }>();
   for (const result of results) {
-    if (result.server_message === true || !result.sourceStatement) continue;
-    const statementIndex = result.statement_index;
-    if (statementIndex !== undefined && (!Number.isInteger(statementIndex) || statementIndex < 0)) continue;
-    const absoluteRange =
-      Number.isInteger(result.sourceFrom) && Number.isInteger(result.sourceTo) && result.sourceFrom! >= 0 && result.sourceTo! > result.sourceFrom! && result.sourceTo! <= editorSql.length && editorSql.slice(result.sourceFrom, result.sourceTo) === result.sourceStatement
-        ? { from: result.sourceFrom!, to: result.sourceTo!, sql: result.sourceStatement }
-        : undefined;
-    // Manual transactions and non-streaming drivers can omit statement indexes.
-    // Their preserved editor ranges still identify the executed selection; never
-    // infer an unindexed result's position from its order in the result array.
-    if (statementIndex === undefined) {
-      if (!absoluteRange || !submittedStatementTexts.has(result.sourceStatement)) continue;
-    } else if (submittedStatements[statementIndex]?.sql !== result.sourceStatement) continue;
-    const range = absoluteRange ?? (submittedSql === editorSql && statementIndex !== undefined ? submittedStatements[statementIndex] : undefined);
+    if (!Number.isInteger(result.statement_index) || result.statement_index! < 0) continue;
+    const statementIndex = result.statement_index!;
+    const submittedStatement = submittedStatements[statementIndex];
+    if (!submittedStatement || submittedStatement.sql !== result.sourceStatement) continue;
+    const range =
+      typeof result.sourceFrom === "number" && typeof result.sourceTo === "number" && editorSql.slice(result.sourceFrom, result.sourceTo) === result.sourceStatement
+        ? { from: result.sourceFrom, to: result.sourceTo, sql: result.sourceStatement }
+        : editorStatements[statementIndex]?.sql === result.sourceStatement
+          ? editorStatements[statementIndex]
+          : undefined;
     if (!range) continue;
     const from = lineStartOffset(editorSql, range.from);
     const current = byLine.get(from) ?? { success: 0, error: 0 };
@@ -659,7 +598,7 @@ export function tabularResultItems(results: QueryResult[] | undefined, options: 
         label: displaySource,
         displayLabel,
         labelTruncated: !!displaySource && displayLabel !== displaySource,
-        title: item.result.sourceLabel || sourceStatementTooltip(item.result.sourceStatement),
+        title: item.result.sourceLabel || item.result.sourceStatement,
       };
     });
 }
@@ -722,15 +661,8 @@ export function resultGridCacheKey(tab: Pick<QueryTab, "id" | "activeResultRunId
   return `${tab.id}-${tab.activeResultRunId ?? "current"}-${tab.activeResultIndex ?? 0}`;
 }
 
-export function resultGridColumnWidthCacheKey(tab: Pick<QueryTab, "id"> & Partial<Pick<QueryTab, "activeResultIndex" | "externalSqlPath" | "savedSqlId">>): string {
-  const resultIndex = tab.activeResultIndex ?? 0;
-  if (tab.externalSqlPath) {
-    return `result-column-width-file-${normalizeExternalSqlPath(tab.externalSqlPath)}-${resultIndex}`;
-  }
-  if (tab.savedSqlId) {
-    return `result-column-width-saved-${tab.savedSqlId}-${resultIndex}`;
-  }
-  return `result-column-width-${tab.id}-${resultIndex}`;
+export function resultGridColumnWidthCacheKey(tab: Pick<QueryTab, "id"> & Partial<Pick<QueryTab, "activeResultIndex">>): string {
+  return `result-column-width-${tab.id}-${tab.activeResultIndex ?? 0}`;
 }
 
 export function resultGridInstanceKey(tab: Pick<QueryTab, "id" | "activeResultRunId" | "activeResultIndex" | "resultGridRevision">): string {
@@ -845,7 +777,7 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
 export function tabDatabaseIconType(tab: QueryTab): string {
   const connectionStore = useConnectionStore();
   const connection = connectionStore.getConfig(tab.connectionId);
-  if (!connection) return tab.mode === "mq" ? "mq" : "unknown";
+  if (!connection) return "mq";
   if (connection.db_type === "mq") {
     const externalConfig = connection.external_config as { systemKind?: unknown } | undefined;
     const systemKind = typeof externalConfig?.systemKind === "string" ? externalConfig.systemKind : "";
@@ -884,8 +816,9 @@ export function tabIconClass(tab: QueryTab): string {
   if (tab.mode === "mongo") return "text-green-400";
   if (tab.mode === "vector") return "text-cyan-400";
   if (tab.mode === "structure") return "text-blue-500";
-  // Match the saved query file icon in the connection sidebar.
-  if (tab.mode === "query") return "text-blue-400";
+  // query 的图标是数据库品牌 logo（TabModeIcon），不吃文字颜色；回退的
+  // Database 图标自带 text-blue-400，与 mq 模式同样返回空串。
+  if (tab.mode === "query") return "";
   return "text-blue-600 dark:text-blue-400";
 }
 
@@ -913,8 +846,7 @@ export function appTabActiveIndicator(): string {
 }
 
 export function tabColorStyle(tab: QueryTab, active: boolean, isClassic: boolean): CSSProperties | undefined {
-  const settings = useSettingsStore().editorSettings;
-  if (!settings.colorizeConnectionTabs || (settings.colorizeConnectionTabsScope === "active" && !active)) {
+  if (!useSettingsStore().editorSettings.colorizeConnectionTabs) {
     const activeIndicator = appTabActiveIndicator();
     const background = appTabActiveBackground();
     if (isClassic) return active ? { "--app-tab-background": background, boxShadow: activeIndicator } : undefined;

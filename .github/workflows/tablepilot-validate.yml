@@ -1,0 +1,51 @@
+# Validate proposals before they reach the installer pipeline. No secrets or writes.
+name: Validate TablePilot pull requests
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tablepilot-validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Check frontend types
+        run: pnpm exec vue-tsc --project apps/desktop/tsconfig.json
+      - name: Check TablePilot capabilities and import/export
+        run: >-
+          pnpm exec vitest run --maxWorkers=2
+          apps/desktop/src/lib/__tests__/tablepilot.spec.ts
+          apps/desktop/src/components/layout/__tests__/AppToolbar.tablepilotPlugins.spec.ts
+          apps/desktop/src/composables/__tests__/useComponentUpdates.tablepilot.spec.ts
+          apps/desktop/src/lib/app/tablepilotBranding.spec.ts
+          apps/desktop/src/composables/__tests__/useAppUpdater.spec.ts
+          apps/desktop/src/lib/import/__tests__/batchTableImport.spec.ts
+          apps/desktop/src/components/import/__tests__/TableImportDialog.existingTarget.spec.ts
+          apps/desktop/src/components/import/__tests__/TableImportDialog.batchSelection.spec.ts
+          apps/desktop/src/components/import/__tests__/TableImportDialogTheme.spec.ts
+          apps/desktop/src/lib/__tests__/import/importSource.spec.ts
+          apps/desktop/src/lib/export/__tests__/csvNullMode.spec.ts
+          apps/desktop/src/lib/export/__tests__/xlsxHeader.spec.ts
+          apps/desktop/src/lib/connection/__tests__/sshAuthMethod.spec.ts
+          apps/desktop/src/lib/sql/__tests__/ddlStorage.spec.ts
+          apps/desktop/src/lib/__tests__/sql/sqlMetadataRefresh.spec.ts
+      - name: Build frontend
+        run: pnpm build

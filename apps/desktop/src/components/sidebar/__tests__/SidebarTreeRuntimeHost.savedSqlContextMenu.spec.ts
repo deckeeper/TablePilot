@@ -89,8 +89,7 @@ describe("SidebarTreeRuntimeHost saved SQL context menu (#9127)", () => {
     expect(grouped[0]).toBe(filter);
     const hidden = buildSidebarMenuLayout(raw, "connection", "grouped", [], tr, { hiddenPrimaryIds: ["contextMenu.configureVisibleObjects"] });
     expect(hidden).not.toContain(filter);
-    // Opting out removes the entry from the grouped layout entirely (#12791).
-    expect(menuLabels(hidden)).not.toContain(tr(dbType === "oracle" ? "visibleSchemas.title" : "contextMenu.configureVisibleObjects"));
+    expect(hidden.find((entry) => entry.sidebarActionId === "group.organize")?.children).toContainEqual(expect.objectContaining({ action: filter!.action }));
   });
 
   it.each(["mysql", "postgres", "oracle", "sqlserver"])("puts database search in data tools and pinning directly in %s database and table menus", async (dbType) => {
@@ -158,7 +157,7 @@ describe("SidebarTreeRuntimeHost saved SQL context menu (#9127)", () => {
     expect(newQueryItem).toBeDefined();
 
     await newQueryItem?.action?.();
-    expect(createTabSpy).toHaveBeenCalledWith("conn-mysql", "app", undefined, "query", "public", undefined, "def", { schemaQualifiesSql: true });
+    expect(createTabSpy).toHaveBeenCalledWith("conn-mysql", "app", undefined, "query", "public", undefined, "def");
   });
 
   it("includes new query option on saved-sql-file node", async () => {
@@ -188,7 +187,7 @@ describe("SidebarTreeRuntimeHost saved SQL context menu (#9127)", () => {
     expect(newQueryItem).toBeDefined();
 
     await newQueryItem?.action?.();
-    expect(createTabSpy).toHaveBeenCalledWith("conn-mysql", "app", undefined, "query", "public", undefined, undefined, { schemaQualifiesSql: true });
+    expect(createTabSpy).toHaveBeenCalledWith("conn-mysql", "app", undefined, "query", "public", undefined, undefined);
   });
 
   it("omits new query option on saved-sql-root when database type does not support queries", async () => {

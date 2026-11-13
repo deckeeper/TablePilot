@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 // PR-A4/P2 global bottom panel dock (HOST_PLUGIN_UI_SPEC §8.3) — a generic host container:
 // it only provides the panel frame (tab strip, drag-resize height, collapse/maximize/hide) and hosts any plugin's
 // panel webviews, with zero plugin business inside; multi-terminal/shell selection/connection switching all live in the plugin
@@ -275,7 +274,7 @@ function onPlusAction(value: string) {
           host: connection.host,
           port: connection.port,
           username: connection.username,
-          readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+          readOnly: connection.read_only === true,
         },
       },
     });
@@ -329,15 +328,6 @@ function onPanelOpenWorkbench(entry: (typeof entries.value)[number], _contributi
     commandContext: payload,
   });
   activatePluginDockEntry(id);
-}
-
-function onSetEntryTitle(entry: PluginDockEntry, title: string | null) {
-  if (title && title.trim()) {
-    renamePluginDockEntry(entry.id, title.trim());
-  } else {
-    const contribution = workbenchContributionFor(entry);
-    renamePluginDockEntry(entry.id, contribution?.label || entry.workbenchContributionId);
-  }
 }
 
 // §8.3/§7.4 two-phase close: removing an entry first asks its panel webview to
@@ -648,8 +638,6 @@ onScopeDispose(() => window.removeEventListener("blur", onPlusMenuWindowBlur));
           :plugin="definitionFor(entry.pluginId)!"
           :contribution="workbenchContributionFor(entry)!"
           :context="entry.context"
-          :set-title="(title) => onSetEntryTitle(entry, title)"
-          :get-title="() => entry.title"
           @close-tab="closeEntry(entry.id)"
           @open-workbench="(_pluginId, contributionId, context, options) => onPanelOpenWorkbench(entry, contributionId, context, options)"
         />

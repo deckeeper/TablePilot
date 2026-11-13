@@ -5,7 +5,7 @@ import { supportsOracleSecurity } from "@/lib/database/oracleSecurity";
 
 export type UserAdminDialect = "mysql" | "postgres";
 export type PrivilegeScope = "mysql" | "database" | "schema" | "table" | "role" | "system";
-export type AuthorizationModel = "mysql" | "postgres" | "starrocks" | "doris";
+export type AuthorizationModel = "mysql" | "postgres" | "starrocks";
 
 export interface DatabaseUserIdentity {
   user: string;
@@ -59,7 +59,6 @@ export interface DatabaseUserAdminProvider {
   defaultScope: PrivilegeScope;
   authorizationModel?: AuthorizationModel;
   supportsTableGrantsOnCreate?: boolean;
-  supportsTableGrantsOnEdit?: boolean;
   listUsersSql(): string;
   fallbackListUsersSql?: () => string;
   parseUsers(result: QueryResult): DatabaseUserIdentity[];
@@ -924,9 +923,6 @@ export const gaussdbMUserAdminProvider: DatabaseUserAdminProvider = {
 export const dorisUserAdminProvider: DatabaseUserAdminProvider = {
   dialect: "mysql",
   defaultScope: "table",
-  authorizationModel: "doris",
-  supportsTableGrantsOnCreate: true,
-  supportsTableGrantsOnEdit: false,
   listUsersSql: dorisListUsersSql,
   fallbackListUsersSql: dorisListCurrentUserSql,
   parseUsers: dorisUsersResult,

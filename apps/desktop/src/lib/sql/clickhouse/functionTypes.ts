@@ -1,5 +1,3 @@
-import type { SqlCompletionMatchMode } from "@/lib/sql/sqlCompletionMatchMode";
-
 export type ClickHouseFunctionKind = "regular" | "aggregate" | "window" | "table";
 export type ClickHouseFunctionStatus = "stable" | "experimental" | "deprecated";
 
@@ -25,6 +23,6 @@ export interface ClickHouseFunctionDefinition {
 
 export interface ClickHouseFunctionRegistry {
   get(name: string): ClickHouseFunctionDefinition | undefined;
-  search(prefix: string, limit: number, kind?: ClickHouseFunctionKind, matchMode?: SqlCompletionMatchMode): ClickHouseFunctionDefinition[];
+  search(prefix: string, limit: number, kind?: ClickHouseFunctionKind): ClickHouseFunctionDefinition[];
   all(): readonly ClickHouseFunctionDefinition[];
 }

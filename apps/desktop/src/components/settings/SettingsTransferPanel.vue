@@ -17,7 +17,6 @@ import {
   SETTINGS_TRANSFER_FORMAT_VERSION,
   type ParsedSettingsTransfer,
   type SettingsTransferCategoryId,
-  type SettingsTransferExtras,
   type SettingsTransferParseError,
 } from "@/lib/settings/settingsTransfer";
 
@@ -28,8 +27,7 @@ const props = defineProps<{
   buildSavedExportPayload: () => string;
   buildAppliedExportPayload: () => Promise<string | null>;
   applyImportedSettings: (imported: Partial<EditorSettings>) => void;
-  applyImportedExtras: (extras: SettingsTransferExtras) => void;
-  getDraftConflictCategories: (imported: Partial<EditorSettings>, extras?: SettingsTransferExtras) => SettingsTransferCategoryId[];
+  getDraftConflictCategories: (imported: Partial<EditorSettings>) => SettingsTransferCategoryId[];
 }>();
 
 const { t } = useI18n();
@@ -197,19 +195,14 @@ async function handleFileInputChange(event: Event) {
 }
 
 function handleImportedText(text: string, fileName: string) {
-  // The desktop section carries switches that only exist in the Tauri app;
-  // on web it is skipped so the preview lists only what will be applied.
-  const result = parseSettingsTransferFile(text, { includeDesktopSettings: isTauriRuntime() });
+  const result = parseSettingsTransferFile(text);
   if (!result.ok) {
     toast(translateParseError(result.error), 5000);
     return;
   }
   pendingImport.value = result.value;
   pendingImportFileName.value = fileName;
-  pendingImportConflicts.value = props.getDraftConflictCategories(result.value.editorSettings, {
-    themeMode: result.value.themeMode,
-    desktopSettings: result.value.desktopSettings,
-  });
+  pendingImportConflicts.value = props.getDraftConflictCategories(result.value.editorSettings);
   showImportConfirmDialog.value = true;
 }
 
@@ -240,13 +233,10 @@ function confirmImport() {
   const imported = pendingImport.value;
   if (!imported) return;
   props.applyImportedSettings(imported.editorSettings);
-  props.applyImportedExtras({ themeMode: imported.themeMode, desktopSettings: imported.desktopSettings });
   showImportConfirmDialog.value = false;
   pendingImport.value = null;
   pendingImportConflicts.value = [];
-  // The editor and desktop drafts are not persisted yet; applying is still
-  // the user's job. The theme mode applies immediately, like the theme
-  // buttons in the dialog.
+  // The draft is not persisted yet; applying is still the user's job.
   toast(t("settings.settingsTransferImportLoaded"));
 }
 </script>

@@ -1,5 +1,7 @@
 import type { SqlSemanticSpan, SqlSemanticToken } from "@/lib/sql/semantic/types";
-import { isFullwidthParenthesis, isSqlIdentifierPart, isSqlIdentifierStart } from "@/lib/sql/sqlIdentifierCharacters";
+
+const WORD_START = /[A-Za-z_@$#\p{ID_Start}]/u;
+const WORD_PART = /[A-Za-z0-9_@$#\p{ID_Continue}]/u;
 
 function characterAt(input: string, index: number): string {
   const codePoint = input.codePointAt(index);
@@ -101,19 +103,11 @@ export function matchDollarQuoteTag(input: string, index: number): string | unde
  * decides string-vs-identifier per token position instead of per dialect (see that function's doc
  * comment) -- but the option stays available as a general tokenizer capability.
  */
-export function tokenizeSqlSemantic(
-  input: string,
-  dialectId = "mysql",
-  options?: { mysqlDashCommentRequiresWhitespace?: boolean; mysqlBackslashEscape?: boolean; mysqlDoubleQuoteIsString?: boolean; squareBracketsAsDelimiters?: boolean; fullwidthParenthesesAsDelimiters?: boolean },
-): SqlSemanticToken[] {
+export function tokenizeSqlSemantic(input: string, dialectId = "mysql", options?: { mysqlDashCommentRequiresWhitespace?: boolean; mysqlBackslashEscape?: boolean; mysqlDoubleQuoteIsString?: boolean; squareBracketsAsDelimiters?: boolean }): SqlSemanticToken[] {
   const tokens: SqlSemanticToken[] = [];
   const mysqlDashCommentRequiresWhitespace = !!options?.mysqlDashCommentRequiresWhitespace;
   const mysqlBackslashEscape = !!options?.mysqlBackslashEscape;
   const mysqlDoubleQuoteIsString = !!options?.mysqlDoubleQuoteIsString;
-  // MySQL names can contain （）. Only INSERT hint expressions opt back into IME
-  // tolerance; other dialects retain their existing delimiter behavior.
-  const fullwidthParenthesesAsDelimiters = options?.fullwidthParenthesesAsDelimiters ?? dialectId !== "mysql";
-  const identifierDialectId = fullwidthParenthesesAsDelimiters ? "generic" : dialectId;
   let index = 0;
   let depth = 0;
 
@@ -214,7 +208,7 @@ export function tokenizeSqlSemantic(
       index += ch.length;
       while (index < input.length) {
         const part = characterAt(input, index);
-        if (!isSqlIdentifierPart(part)) break;
+        if (!WORD_PART.test(part)) break;
         index += part.length;
       }
       tokens.push(token("parameter", input.slice(start, index), start, index, depth));
@@ -228,18 +222,21 @@ export function tokenizeSqlSemantic(
       continue;
     }
 
-    if (isSqlIdentifierStart(ch, identifierDialectId)) {
+    if (WORD_START.test(ch)) {
       index += ch.length;
       while (index < input.length) {
         const part = characterAt(input, index);
-        if (!isSqlIdentifierPart(part, identifierDialectId) || (dialectId === "postgres" && part === "#")) break;
+        if (!WORD_PART.test(part) || (dialectId === "postgres" && part === "#")) break;
         index += part.length;
       }
       tokens.push(token("word", input.slice(start, index), start, index, depth));
       continue;
     }
 
-    if ("(),.;*".includes(ch) || (fullwidthParenthesesAsDelimiters && isFullwidthParenthesis(ch)) || (options?.squareBracketsAsDelimiters && (ch === "[" || ch === "]"))) {
+    // Fullwidth （） (U+FF08/U+FF09) are common IME typos in Chinese locales; treat them like
+    // ASCII () for nesting depth so commas inside to_date（…, …） stay nested and do not split
+    // INSERT ... SELECT projections (insert value column hints).
+    if ("(),.;*".includes(ch) || ch === "\uFF08" || ch === "\uFF09" || (options?.squareBracketsAsDelimiters && (ch === "[" || ch === "]"))) {
       if (ch === ")" || ch === "\uFF09" || ch === "]") depth = Math.max(0, depth - 1);
       tokens.push(token("punctuation", ch, start, start + ch.length, depth));
       if (ch === "(" || ch === "\uFF08" || ch === "[") depth += 1;

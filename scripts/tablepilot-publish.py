@@ -143,6 +143,7 @@ Source commit: `{args.target}`.
         text += '\nWindows source: `8b0a975c5d5bc261bf170012f2d59db95bd7d031`; Linux source: `adfb658b14e90cbeb275216dd8c0c520c54910e8` (Linux packaging dependency fix). These are the existing 0.3.0 installers; GUI link removal arrives in 0.3.1.\n'
     else:
         changes = {
+            '0.4.3': 'Restore compatible application sources after the incomplete update proposal. Preserve comments when removing Oracle storage clauses and refresh schema metadata after additional routine DDL forms. Retain batch import/export, SSH, TablePilot update checks and the AI/Plugin Center exclusions. The larger upstream integration is deferred; this release does not include all of its changes.',
             '0.4.2': 'Import multiple files or Excel worksheets into selected existing tables in one batch. Review separate field mappings and destinations, reorder imports, and run once. Multi-table export remains available through sidebar selection. See README.md for instructions and VALIDATION.md for testing scope.',
             '0.3.1': 'Remove GitHub navigation from the GUI; add reviewed upstream update proposals and installer releases.',
             '0.3.2': 'Integrate reviewed database and interface improvements, excluding AI/MCP changes.',

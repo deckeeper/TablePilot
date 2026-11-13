@@ -17,21 +17,12 @@ function connectionNode(children: TreeNode[]): TreeNode {
 }
 
 describe("resolveSidebarSearchDatabaseScope", () => {
-  it("keeps the search unrestricted when the setting is disabled", () => {
+  it.each([
+    ["disabled setting keeps the search unrestricted", { enabled: false }, null],
+    ["no database opened falls back to every database", {}, null],
+  ] as const)("returns null when %s", (_name, overrides, expected) => {
     const node = connectionNode([databaseNode("conn-1:a", "a"), databaseNode("conn-1:b", "b")]);
-    expect(resolveSidebarSearchDatabaseScope(node, { ...OPTIONS, enabled: false })).toBeNull();
-  });
-
-  it("does not open every database when none has been opened", () => {
-    const databases = [databaseNode("conn-1:a", "a"), databaseNode("conn-1:b", "b")];
-    const scope = resolveSidebarSearchDatabaseScope(connectionNode(databases), OPTIONS);
-    expect(scope).toEqual(new Set());
-    expect(databases.every((node) => isSidebarSearchPrunedDatabaseNode(node, scope))).toBe(true);
-  });
-
-  it("also restricts databases discovered after resolving an empty connection root", () => {
-    const scope = resolveSidebarSearchDatabaseScope(connectionNode([]), OPTIONS);
-    expect(isSidebarSearchPrunedDatabaseNode(databaseNode("conn-1:new", "new"), scope)).toBe(true);
+    expect(resolveSidebarSearchDatabaseScope(node, { ...OPTIONS, ...overrides })).toEqual(expected);
   });
 
   it("keeps databases opened in the tree", () => {
@@ -53,10 +44,9 @@ describe("resolveSidebarSearchDatabaseScope", () => {
     expect(resolveSidebarSearchDatabaseScope(node, OPTIONS)).toEqual(new Set(["conn-1:cat:nested:loaded"]));
   });
 
-  it("keeps schema-mode trees searchable without database nodes", () => {
+  it("treats schema-mode trees without database nodes as unrestricted", () => {
     const schemaNode: TreeNode = { id: "conn-1:public", label: "public", type: "schema", connectionId: "conn-1", database: "main", isExpanded: false, children: [] };
-    const scope = resolveSidebarSearchDatabaseScope(connectionNode([schemaNode]), OPTIONS);
-    expect(isSidebarSearchPrunedDatabaseNode(schemaNode, scope)).toBe(false);
+    expect(resolveSidebarSearchDatabaseScope(connectionNode([schemaNode]), OPTIONS)).toEqual(null);
   });
 });
 
@@ -64,7 +54,6 @@ describe("isSidebarSearchPrunedDatabaseNode", () => {
   it.each([
     ["database outside the scope", databaseNode("conn-1:b", "b"), new Set(["conn-1:a"]), true],
     ["database inside the scope", databaseNode("conn-1:a", "a"), new Set(["conn-1:a"]), false],
-    ["database when none is opened", databaseNode("conn-1:a", "a"), new Set<string>(), true],
     ["unrestricted scope", databaseNode("conn-1:b", "b"), null, false],
     ["non-database container", { id: "conn-1", label: "prod", type: "connection", connectionId: "conn-1", isExpanded: true, children: [] } as TreeNode, new Set(["conn-1:a"]), false],
   ] as const)("returns %expected when the node is a %s", (_name, node, scope, expected) => {

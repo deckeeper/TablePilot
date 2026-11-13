@@ -118,19 +118,10 @@ describe("connectionStore pinned tree node removal", () => {
     store.sidebarLayout = layout;
     store.treeNodes = [group];
 
-    vi.useFakeTimers();
-    try {
-      const deleting = expect(store.deleteConnectionGroup(group.id)).rejects.toThrow("recovery was incomplete");
-      await vi.advanceTimersByTimeAsync(6000);
-      await deleting;
-    } finally {
-      vi.useRealTimers();
-    }
+    await expect(store.deleteConnectionGroup(group.id)).rejects.toThrow("layout unavailable");
 
     expect(store.sidebarLayout).toStrictEqual(layout);
-    // Recovery rebuilds the real tree, including pin/order metadata. Check the
-    // restored group state rather than the hand-built fixture's missing fields.
-    expect(store.treeNodes).toEqual([expect.objectContaining({ ...group, pinned: false })]);
+    expect(store.treeNodes).toEqual([group]);
     expect(saveSidebarLayout).toHaveBeenCalledWith({ groups: [], order: [] });
     expect(saveSidebarLayout).toHaveBeenLastCalledWith(layout);
   });

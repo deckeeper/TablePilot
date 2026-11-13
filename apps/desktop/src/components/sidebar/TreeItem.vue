@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, inject, nextTick, shallowRef, watch, onBeforeUnmount } from "vue";
+import { ref, computed, inject, shallowRef, watch, onBeforeUnmount } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   Database,
@@ -43,34 +43,20 @@ import {
 import OracleDatabaseLinksDialog from "@/components/objects/OracleDatabaseLinksDialog.vue";
 const showDatabaseLinks = ref(false);
 import { useConnectionStore } from "@/stores/connectionStore";
-import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import PluginIcon from "@/components/plugins/PluginIcon.vue";
 import ConnectionErrorIndicator from "@/components/connection/ConnectionErrorIndicator.vue";
-import ConnectionDetailContent from "@/components/connection/ConnectionDetailContent.vue";
 import ReadOnlySessionControl from "@/components/connection/ReadOnlySessionControl.vue";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
-import type { ColumnInfo, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
-import {
-  alignedCommentLeadingWidth,
-  canTreeNodePin,
-  canTreeNodeShowExpander,
-  isSidebarCommentSupportedType,
-  sidebarTreeNodeComment,
-  trailingCommentAvailableWidth,
-  trailingCommentGapPx,
-  sidebarRightCommentMaxWidthPx,
-  treeItemPaddingLeft,
-  treeLabelWidthClass,
-  usesFullWidthTreeLabel,
-} from "@/lib/sidebar/sidebarTreeItemLayout";
+import type { ColumnInfo, ConnectionConfig, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
+import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, isSidebarCommentSupportedType, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import {
   clearActiveTableReferencePayload,
   createColumnReferencePayload,
@@ -85,14 +71,16 @@ import {
 import { AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR } from "@/lib/ai/aiTableReferenceDrop";
 import { beginTableReferenceDragFeedback, isOverSqlEditorTarget, type TableReferenceDragFeedback } from "@/lib/editor/tableReferenceDragFeedback";
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
+import { effectiveRedisDatabaseIndex } from "@/lib/redis/redisDatabaseIndex";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { isTableVGroupGroupableRowType, selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
 import { findTreeNodeById } from "@/lib/sql/newQueryContext";
 import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
-import { connectionEndpointUserLabel } from "@/lib/connection/connectionPresentation";
-import { isCancelSearchShortcut, isExecuteSqlShortcut, isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
-import { connectionDetailRows, type ConnectionDetailRow } from "@/lib/connection/connectionDetailRows";
+import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
+import { redactConnectionStringSecrets } from "@/lib/connection/connectionStringRedaction";
+import { isExecuteSqlShortcut, isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
+import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
@@ -108,20 +96,20 @@ import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectName
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { isWindows } from "@/lib/backend/platform";
 import { flattenTree } from "@/composables/useFlatTree";
-import { isSidebarProductionContainer, showSidebarRowProductionBadge } from "@/lib/sidebar/sidebarProductionBadge";
+import { showSidebarRowProductionBadge } from "@/lib/sidebar/sidebarProductionBadge";
 import { focusSidebarRenameInput } from "@/lib/sidebar/sidebarRenameFocus";
 import { ensureSqlExtension, stripSqlExtension } from "@/lib/savedSql/savedSqlFileName";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { elasticsearchIndexAliasLabel } from "@/lib/sidebar/elasticsearchIndexActions";
-import { isXuguPublicSynonymTreeNode, isXuguSchedulerJobTreeNode } from "@/lib/sidebar/xuguPublicSynonyms";
+import { isXuguPublicSynonymTreeNode, isXuguSchedulerJobTreeNode, xuguSchemaDisplayName } from "@/lib/sidebar/xuguPublicSynonyms";
 import { xuguDatafileDetailRows, xuguTablespaceDetailRows } from "@/lib/sidebar/xuguTablespaces";
 // --- Drag and Drop ---
 import { useDragSort } from "@/composables/useDragSort";
 import { sidebarTreeRuntimeKey } from "@/lib/sidebar/sidebarTreeRuntime";
 import { treeNodePinKey } from "@/lib/app/pinnedItems";
-import { customTypeCapabilities, supportsOracleTypeAttributeExpansion } from "@/lib/database/databaseObjectCapabilities";
-import { sidebarTreeDisplayLabel, sidebarTreeSecondaryValue } from "@/lib/sidebar/sidebarTreeLabel";
+import { isTreeGroupNodeType } from "@/lib/sidebar/treeNodeGroup";
+import { customTypeCapabilities } from "@/lib/database/databaseObjectCapabilities";
 import { shouldActivateTreeNodeOnSingleClick } from "@/lib/sidebar/treeNodeClick";
 
 const { t } = useI18n();
@@ -241,22 +229,12 @@ const stopPasteHandlerRegistration = watch(
 
 const activeNode = shallowRef<TreeNode>(props.node);
 
-const isDisabledTrigger = computed(() => {
-  const current = activeNode.value;
-  if (current.type !== "trigger") return false;
-  const meta = (props.node.meta as TriggerInfo | undefined) ?? (current.meta as TriggerInfo | undefined);
-  return meta?.enabled === false;
-});
+const isDisabledTrigger = computed(() => activeNode.value.type === "trigger" && (activeNode.value.meta as TriggerInfo | undefined)?.enabled === false);
 
 const showProductionBadge = computed(() => {
   const node = activeNode.value;
   return showSidebarRowProductionBadge(node, node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined, props.isStickyContext);
 });
-
-// Object rows use an icon-only marker pinned to the row's trailing edge, so
-// every production table lines up in one column instead of pushing the name
-// aside at a different x per name length. Container rows keep the text badge.
-const showProductionRowMarker = computed(() => showProductionBadge.value && !isSidebarProductionContainer(activeNode.value));
 
 function currentDatabaseType(): DatabaseType | undefined {
   return activeNode.value.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(activeNode.value.connectionId)) : undefined;
@@ -264,15 +242,6 @@ function currentDatabaseType(): DatabaseType | undefined {
 
 function currentDriverProfile(): string | undefined {
   return activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId)?.driver_profile : undefined;
-}
-
-function externalTableKind(node: TreeNode): string | undefined {
-  if (node.type !== "table") return;
-  const kind = node.tableType
-    ?.trim()
-    .toUpperCase()
-    .replace(/[\s_]+/g, " ");
-  return kind === "FOREIGN TABLE" || kind === "EXTERNAL TABLE" ? kind : undefined;
 }
 
 function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
@@ -304,7 +273,6 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: FolderOpen, colorClass: "text-amber-500" };
     }
     case "table":
-      if (externalTableKind(node)) return { icon: Link2, colorClass: "text-cyan-500" };
       return { icon: Table, colorClass: "text-green-500" };
     case "view":
       return { icon: Eye, colorClass: "text-purple-500" };
@@ -350,7 +318,6 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "dameng-roles":
       return { icon: ShieldCheck, colorClass: "text-primary" };
     case "dameng-job-admin":
-    case "database-job-admin":
       return { icon: CalendarClock, colorClass: "text-primary" };
     case "saved-sql-root":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-blue-500" };
@@ -448,8 +415,6 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Clock, colorClass: "text-orange-400" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
-    case "group-package-bodies":
-      return { icon: Package, colorClass: "text-cyan-500" };
     case "group-types":
       return { icon: Braces, colorClass: "text-violet-500" };
     case "group-database-indexes":
@@ -475,12 +440,37 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
   }
 }
 
+function isGroupLabel(node: TreeNode): boolean {
+  return isTreeGroupNodeType(node.type);
+}
+
 function displayLabel(node: TreeNode): string {
-  return sidebarTreeDisplayLabel(node, t, node.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) : undefined);
+  // Synthetic Xugu scopes are persisted with their reserved protocol value.
+  // Resolve them at render time as well, so an already-cached tree never
+  // exposes that implementation detail after the feature is introduced.
+  if (node.type === "schema" && node.connectionId) {
+    const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId));
+    if (databaseType === "xugu") return xuguSchemaDisplayName(node.schema ?? node.label);
+  }
+  if (node.type === "load-more") return t(node.label);
+  if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
+  // Use the canonical key for persisted trees created before this label was
+  // internationalized; those nodes may still contain the old Chinese text.
+  if (node.type === "nacos-access-control") return t("nacos.accessControlSidebarLabel");
+  if (node.type === "user-admin" || node.type === "xugu-user-admin" || node.type === "dameng-users" || node.type === "dameng-roles" || node.type === "dameng-job-admin" || node.type === "meilisearch-system") return t(node.label);
+  if (node.type === "oracle-db-links" || node.type === "linked-server-root") return t(node.label);
+  if (node.type === "saved-sql-root") return t(node.label);
+  if (node.type === "mqtt-topic" && node.id.endsWith(":mqtt-topic:__console__")) return t(node.label);
+  if (node.label === "tree.defaultDatabase") return t(node.label);
+  return isGroupLabel(node) ? t(node.label) : node.label;
 }
 
 function treeNodeSecondaryValue(node: TreeNode): string | undefined {
-  return sidebarTreeSecondaryValue(node, t, node.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) : undefined);
+  if (node.type === "type" && node.customTypeKind) return t(`customType.kinds.${node.customTypeKind}`);
+  if (node.type === "type-member") return (node.meta as CustomTypeTreeMemberMeta | undefined)?.displayValue;
+  if (node.type === "datafile") return node.xuguDatafilePath;
+  if (node.type === "elasticsearch-index") return elasticsearchIndexAliasLabel(node);
+  return undefined;
 }
 
 function visibleLabel(node: TreeNode): string {
@@ -503,6 +493,16 @@ function hasActiveObjectNameFilter(node: TreeNode): boolean {
   return !!filter && (filter.includePatterns.length > 0 || filter.excludePatterns.length > 0);
 }
 
+type DetailTooltipRow = {
+  label: string;
+  value: string;
+  multiline?: boolean;
+  /** When set, renders each value on its own line (e.g. one host per line) */
+  values?: string[];
+  action?: () => void;
+  actionLabel?: string;
+};
+
 function cleanTooltipValue(value: string | number | null | undefined): string {
   return String(value ?? "").trim();
 }
@@ -523,13 +523,62 @@ function formatXuguStorageDetailValue(key: string, value: string): string {
   return value;
 }
 
+function isLocalFileConnection(config: Pick<ConnectionConfig, "db_type" | "port">): boolean {
+  return config.db_type === "sqlite" || config.db_type === "duckdb" || config.db_type === "access" || (config.db_type === "h2" && config.port === 0);
+}
+
+function hostForDisplay(host: string): string {
+  if (!host.includes(":") || host.startsWith("[") || host.includes("://") || host.includes(",")) return host;
+  return `[${host}]`;
+}
+
+// A Redis database is a numeric index; dirty stored values (e.g. redis-cli flags
+// pasted into the field) resolve to the index the backend actually connects with.
+function tooltipDatabaseValue(config: ConnectionConfig): string {
+  const database = cleanTooltipValue(config.database);
+  return config.db_type === "redis" && database ? effectiveRedisDatabaseIndex(database) : database;
+}
+
+function connectionTooltipUrl(config: ConnectionConfig): string {
+  const explicit = cleanTooltipValue(config.connection_string);
+  if (explicit) return redactConnectionStringSecrets(explicit);
+
+  const host = cleanTooltipValue(config.host);
+  if (!host) return "";
+  if (host.includes("://")) return redactConnectionStringSecrets(host);
+
+  if (isLocalFileConnection(config)) {
+    if (config.db_type === "access") return `jdbc:ucanaccess://${host}`;
+    return `${config.db_type}://${host}`;
+  }
+
+  const scheme = connectionDisplayUrlScheme(config);
+  const port = Number(config.port) > 0 ? `:${config.port}` : "";
+  const user = cleanTooltipValue(config.username);
+  const userInfo = user ? `${encodeURIComponent(user)}@` : "";
+  const database = tooltipDatabaseValue(config);
+  const encodedDatabase = config.db_type === "spanner" ? encodeSpannerResourcePath(database) : encodeURIComponent(database);
+  const path = database ? `/${encodedDatabase}` : "";
+  const params = cleanTooltipValue(config.url_params);
+  const query = params ? (params.startsWith("?") ? params : `?${params}`) : "";
+  return redactConnectionStringSecrets(`${scheme}://${userInfo}${hostForDisplay(host)}${port}${path}${query}`);
+}
+
 const detailTooltip = computed(() => {
   const node = activeNode.value;
   if (node.type === "connection" && node.connectionId) {
     const config = connectionStore.getConfig(node.connectionId);
     if (!config) return null;
+    const hostLabel = isLocalFileConnection(config) ? t("connection.filePath") : t("connection.host");
+    const hostValue = cleanTooltipValue(config.host);
+    const hostValues = hostValue.includes(",")
+      ? hostValue
+          .split(",")
+          .map((h) => h.trim())
+          .filter(Boolean)
+      : [];
     const visibleFilterSummary = connectionCanConfigureSidebarVisibleDatabases(config.db_type) || config.db_type === "nacos" ? connectionStore.getSidebarVisibleFilterSummary(node.connectionId) : null;
-    const visibleFilterRow: ConnectionDetailRow | null =
+    const visibleFilterRow: DetailTooltipRow | null =
       visibleFilterSummary?.selected != null && visibleFilterSummary.total != null
         ? {
             label: t(visibleFilterSummary.mode === "namespace" ? "nacos.nacosVisibleNamespacesDetailLabel" : visibleFilterSummary.mode === "schema" ? "visibleSchemas.detailLabel" : "visibleDatabases.detailLabel"),
@@ -538,14 +587,25 @@ const detailTooltip = computed(() => {
             actionLabel: t(visibleFilterSummary.mode === "namespace" ? "nacos.nacosVisibleNamespacesDetailActionLabel" : visibleFilterSummary.mode === "schema" ? "visibleSchemas.detailActionLabel" : "visibleDatabases.detailActionLabel", { connection: config.name }),
           }
         : null;
-    const rows = connectionDetailRows(config, t, visibleFilterRow ?? undefined);
+    const rows: DetailTooltipRow[] = [
+      { label: t("connection.name"), value: cleanTooltipValue(config.name) },
+      { label: "URL", value: connectionTooltipUrl(config), multiline: true },
+      ...(hostValues.length > 0 ? [{ label: hostLabel, value: hostValues[0], values: hostValues } as DetailTooltipRow] : [{ label: hostLabel, value: hostValue, multiline: isLocalFileConnection(config) } as DetailTooltipRow]),
+      { label: "Port", value: Number(config.port) > 0 ? String(config.port) : "" },
+      { label: t("connection.database"), value: tooltipDatabaseValue(config) },
+      { label: t("connection.user"), value: cleanTooltipValue(config.username) },
+      { label: t("connection.type"), value: config.driver_label || config.driver_profile || config.db_type },
+      { label: t("connection.databaseInfo.productVersion"), value: cleanTooltipValue(config.database_info?.productVersion) },
+      ...(visibleFilterRow ? [visibleFilterRow] : []),
+      { label: t("connection.note"), value: cleanTooltipValue(config.note), multiline: true },
+    ].filter((row) => row.value);
     return { rows };
   }
   if (node.type === "trigger" && node.meta && node.connectionId && effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) === "xugu") {
     const trigger = node.meta as TriggerInfo;
     const hasXuguDetails = trigger.level != null || trigger.condition != null || trigger.language != null || trigger.enabled != null || trigger.valid != null || trigger.created_at != null || trigger.comment != null;
     if (!hasXuguDetails) return null;
-    const rows: ConnectionDetailRow[] = [
+    const rows: DetailTooltipRow[] = [
       { label: t("objects.name"), value: visibleLabel(node) },
       { label: t("objects.triggerTiming"), value: cleanTooltipValue(trigger.timing) },
       { label: t("objects.triggerEvent"), value: cleanTooltipValue(trigger.event) },
@@ -560,7 +620,7 @@ const detailTooltip = computed(() => {
     return rows.length ? { rows } : null;
   }
   if (node.type === "tablespace" && node.xuguTablespace && node.connectionId && effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) === "xugu") {
-    const rows: ConnectionDetailRow[] = xuguTablespaceDetailRows(node.xuguTablespace).map((row) => ({
+    const rows: DetailTooltipRow[] = xuguTablespaceDetailRows(node.xuguTablespace).map((row) => ({
       label: t(`tree.xuguStorage.${row.key}`),
       value: formatXuguStorageDetailValue(row.key, row.value),
       multiline: row.multiline,
@@ -568,7 +628,7 @@ const detailTooltip = computed(() => {
     return rows.length ? { rows } : null;
   }
   if (node.type === "datafile" && node.xuguDatafile && node.connectionId && effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) === "xugu") {
-    const rows: ConnectionDetailRow[] = xuguDatafileDetailRows(node.xuguDatafile).map((row) => ({
+    const rows: DetailTooltipRow[] = xuguDatafileDetailRows(node.xuguDatafile).map((row) => ({
       label: t(`tree.xuguStorage.${row.key}`),
       value: formatXuguStorageDetailValue(row.key, row.value),
       multiline: row.multiline,
@@ -587,11 +647,9 @@ const detailTooltip = computed(() => {
   }
   const column = node.type === "column" ? (node.meta as ColumnInfo | undefined) : undefined;
   const comment = column && "comment" in column ? column.comment : node.comment;
-  const tableKind = externalTableKind(node);
-  if ((!comment && !column && !tableKind) || !isSidebarCommentSupportedType(node.type)) return null;
-  const rows: ConnectionDetailRow[] = [
+  if ((!comment && !column) || !isSidebarCommentSupportedType(node.type)) return null;
+  const rows: DetailTooltipRow[] = [
     { label: t("connection.name"), value: visibleLabel(node) },
-    ...(tableKind ? [{ label: t("postgresForeignTable.tableKind"), value: tableKind }] : []),
     ...(column ? [{ label: t("structureEditor.nullable"), value: t(column.is_nullable ? "structureEditor.nullable" : "structureEditor.notNull") }] : []),
     { label: t("structureEditor.comment"), value: cleanTooltipValue(comment), multiline: true },
   ].filter((row) => row.value);
@@ -789,7 +847,7 @@ const canExpand = computed(() => {
   // loadable members; types without members (enum/domain/range/base) do not
   // expand even if the catalog row lists child metadata.
   if (activeNode.value.type === "type" && customTypeCapabilities(currentDatabaseType()).details) {
-    return activeNode.value.hasMembers === true || (activeNode.value.hasMembers === undefined && supportsOracleTypeAttributeExpansion(currentDatabaseType()));
+    return activeNode.value.hasMembers === true;
   }
   return canTreeNodeShowExpander({
     type: activeNode.value.type,
@@ -824,11 +882,6 @@ const trailingComment = computed(() => {
   return sidebarTreeNodeComment(activeNode.value, settingsStore.editorSettings.sidebarShowConnectionNotes);
 });
 
-const connectionEndpointText = computed(() => {
-  if (activeNode.value.type !== "connection" || !settingsStore.editorSettings.sidebarShowConnectionEndpoints) return null;
-  return connectionEndpointUserLabel(activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined) || null;
-});
-
 function isRightAlignedComment(): boolean {
   return settingsStore.editorSettings.sidebarObjectInfoMode === "comment-right" && !!trailingComment.value;
 }
@@ -846,7 +899,7 @@ function measureTrailingCommentLayout() {
     trailingCommentMaxWidth.value = 0;
     return;
   }
-  trailingCommentMaxWidth.value = usesFullWidthLabel.value ? sidebarRightCommentMaxWidthPx : trailingCommentAvailableWidth(container.clientWidth, leading.scrollWidth);
+  trailingCommentMaxWidth.value = trailingCommentAvailableWidth(container.clientWidth, leading.scrollWidth);
 }
 
 function scheduleTrailingCommentMeasure() {
@@ -891,7 +944,7 @@ function formattedObjectStorage(): string {
 const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" && activeNode.value.type !== "connection" ? props.commentLabelWidth : undefined));
 
 function alignedCommentLeadingStyle(): { width: string } | { maxWidth: string } | undefined {
-  if (!usesFullWidthLabel.value && settingsStore.editorSettings.sidebarObjectInfoMode === "comment-and-size" && trailingComment.value) {
+  if (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-and-size" && trailingComment.value) {
     // Reserve the inline comment's margin so a long name cannot push into the size column.
     return { maxWidth: "max(0px, calc(100% - 1rem))" };
   }
@@ -907,8 +960,7 @@ const usesFullWidthLabel = computed(() => usesFullWidthTreeLabel(activeNode.valu
 
 const isCompactSidebar = computed(() => settingsStore.editorSettings.sidebarDensity === "compact");
 
-const isConnectionRow = computed(() => activeNode.value.type === "connection" || activeNode.value.type === "connection-group");
-const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0 tree-row-viewport"));
+const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0"));
 
 const labelWidthClass = computed(() => {
   // aligned 模式靠 leading 块固定宽度对齐 comment 列，label 需 flex-1 撑满 leading 块；
@@ -918,7 +970,7 @@ const labelWidthClass = computed(() => {
   return treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value, alignLeading });
 });
 
-watch(() => [settingsStore.editorSettings.sidebarAllowHorizontalScroll, isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
+watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
 
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth, settingsStore.editorSettings.sidebarIndent));
 
@@ -926,7 +978,6 @@ const tableSearchParentId = computed(() => activeNode.value.tableSearchParentId 
 
 const tableSearchValue = computed(() => {
   const parentId = tableSearchParentId.value;
-  if (activeNode.value.indexSearchOnly) return sidebarTreeContext?.getIndexSearchQuery?.(parentId) ?? "";
   return parentId ? connectionStore.sidebarTableSearchQueries[parentId] || "" : "";
 });
 
@@ -936,7 +987,7 @@ const isConnecting = computed(() => activeNode.value.type === "connection" && !!
 // database colors entirely; the trailing green dot still marks active ones.
 const connectionIconInactiveClass = computed(() => (activeNode.value.type === "connection" && activeNode.value.connectionId && !connectionStore.connectedIds.has(activeNode.value.connectionId) ? "saturate-50 opacity-70" : ""));
 
-const isConnectionReadonly = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && (mysqlDataCharsetEnabled(connectionStore.getConfig(activeNode.value.connectionId)) || (connectionStore.getConfig(activeNode.value.connectionId)?.read_only ?? false)));
+const isConnectionReadonly = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && (connectionStore.getConfig(activeNode.value.connectionId)?.read_only ?? false));
 
 const databaseOpenVisual = computed(() => {
   const databaseOpen = isSidebarDatabaseOpenForVisual(activeNode.value, connectionStore.isTreeNodeChildrenLoaded, queryStore.openDatabaseKeys);
@@ -972,9 +1023,7 @@ const selectionVisual = computed(() => {
   return {
     selected,
     multiSelected,
-    // The active row can remain the keyboard lead after Ctrl/Cmd toggles it
-    // out of the selection. Only actual members should keep the highlight.
-    rowSelected: connectionStore.selectedTreeNodeIds.length > 0 ? multiSelected : selected,
+    rowSelected: selected || multiSelected,
     usesSelectionSetHighlight: connectionStore.connectionMultiSelectActive || connectionStore.selectedTreeNodeIds.length > 1,
   };
 });
@@ -984,7 +1033,7 @@ const rowStyle = computed(() => {
   const backgroundColor = hexToRgba(color, isActiveConnectionScope.value ? 0.14 : 0.08);
   return {
     paddingLeft: paddingLeft.value,
-    paddingRight: props.isStickyContext && !showProductionBadge.value ? "72px" : showProductionRowMarker.value || (activeNode.value.type === "connection" && showProductionBadge.value) ? "8px" : trailingComment.value ? "12px" : undefined,
+    paddingRight: props.isStickyContext && !showProductionBadge.value ? "72px" : trailingComment.value ? "12px" : undefined,
     "--tree-connection-row-bg": backgroundColor,
     "--tree-connection-row-hover-bg": hexToRgba(color, isActiveConnectionScope.value ? 0.2 : 0.16),
     "--tree-connection-active-bg": hexToRgba(color, 0.18),
@@ -996,6 +1045,7 @@ const tableSearchStyle = computed(() => {
   const color = connectionColor.value;
   const rowBackgroundColor = color ? hexToRgba(color, isActiveConnectionScope.value ? 0.14 : 0.08) : "transparent";
   return {
+    paddingLeft: paddingLeft.value,
     "--tree-table-search-row-bg": rowBackgroundColor,
     "--tree-table-search-input-bg": color ? hexToRgba(color, isActiveConnectionScope.value ? 0.05 : 0.03) : "color-mix(in srgb, var(--background) 56%, transparent)",
     "--tree-table-search-border": color ? hexToRgba(color, isActiveConnectionScope.value ? 0.12 : 0.08) : "color-mix(in srgb, var(--border) 36%, transparent)",
@@ -1006,10 +1056,6 @@ function updateTableSearchQuery(value: string | number) {
   const parentId = tableSearchParentId.value;
   if (!parentId) return;
   const query = String(value);
-  if (activeNode.value.indexSearchOnly) {
-    sidebarTreeContext?.setIndexSearchQuery?.(parentId, query);
-    return;
-  }
   if (sidebarTreeContext?.setTableSearchQuery) {
     sidebarTreeContext.setTableSearchQuery(parentId, query, settingsStore.editorSettings.sidebarTableSearchLocal);
     return;
@@ -1039,16 +1085,6 @@ function onTableSearchControlKeydown(event: KeyboardEvent) {
     const input = control?.querySelector<HTMLInputElement>("[data-sidebar-table-search-parent-id]");
     input?.focus();
     input?.select();
-    event.stopPropagation();
-    return;
-  }
-  if (isCancelSearchShortcut(event)) {
-    if (tableSearchValue.value) {
-      event.preventDefault();
-      clearTableSearchQuery();
-    }
-    event.stopPropagation();
-    return;
   }
   // Let the app-level shortcut handler open the database default query while
   // the table-search input remains focused. Other tree-local key handling
@@ -1070,16 +1106,6 @@ const renameInputRef = ref<HTMLInputElement>();
 
 /** Snapshot of the row being renamed: reprojecting the tree mid-rename recycles activeNode. */
 const renameTargetNode = shallowRef<TreeNode | null>(null);
-
-function restoreRowFocus() {
-  void nextTick(() => {
-    // Only reclaim focus when it is genuinely lost (fell back to <body>).
-    // A blur triggered by the user focusing something else (editor, search
-    // box, Tab navigation) must keep that target focused.
-    if (document.activeElement && document.activeElement !== document.body) return;
-    rowRef.value?.focus({ preventScroll: true });
-  });
-}
 
 function startRenameGroup() {
   renameTargetNode.value = activeNode.value;
@@ -1139,17 +1165,12 @@ function finishRenameGroup() {
   const trimmed = renameInput.value.trim();
   // An empty name cancels the rename and keeps the group as-is — never delete
   // here. Deleting a group is done explicitly via the context menu (issue #681).
-  if (!trimmed || trimmed === target.label) {
-    restoreRowFocus();
-    return;
-  }
+  if (!trimmed || trimmed === target.label) return;
   if (target.type === "table-vgroup" && target.vgroupId) {
     connectionStore.renameTableVGroup(target, target.vgroupId, trimmed);
-    restoreRowFocus();
     return;
   }
   connectionStore.renameConnectionGroup(target.id, trimmed);
-  restoreRowFocus();
 }
 
 async function finishRenameSavedSql() {
@@ -1157,17 +1178,13 @@ async function finishRenameSavedSql() {
   isRenamingSavedSql.value = false;
   const fileId = activeNode.value.savedSqlId;
   const trimmed = renameInput.value.trim();
-  if (!fileId || !trimmed || ensureSqlExtension(trimmed) === activeNode.value.label) {
-    restoreRowFocus();
-    return;
-  }
+  if (!fileId || !trimmed || ensureSqlExtension(trimmed) === activeNode.value.label) return;
   try {
     const savedSqlStore = useSavedSqlStore();
     await savedSqlStore.renameFile(fileId, ensureSqlExtension(trimmed));
   } catch (e: any) {
     toast(t("savedSql.renameFailed", { message: savedSqlErrorMessage(e, t) }), 5000);
   }
-  restoreRowFocus();
 }
 
 async function finishRenameConnection() {
@@ -1175,16 +1192,12 @@ async function finishRenameConnection() {
   isRenamingConnection.value = false;
   const connectionId = activeNode.value.connectionId;
   const trimmed = renameInput.value.trim();
-  if (!connectionId || !trimmed || trimmed === activeNode.value.label) {
-    restoreRowFocus();
-    return;
-  }
+  if (!connectionId || !trimmed || trimmed === activeNode.value.label) return;
   try {
     await connectionStore.renameConnection(connectionId, trimmed);
   } catch (e: any) {
     toast(t("connection.saveFailed", { message: e?.message || String(e) }), 5000);
   }
-  restoreRowFocus();
 }
 
 function finishRename() {
@@ -1197,7 +1210,6 @@ function cancelRename() {
   isRenamingGroup.value = false;
   isRenamingSavedSql.value = false;
   isRenamingConnection.value = false;
-  restoreRowFocus();
 }
 
 const PINNED_TREE_NODE_DRAG_TYPE = "__pinned-tree-node__";
@@ -1551,21 +1563,15 @@ function onClick(event: MouseEvent) {
   }
   selectSingleTreeNode(props.node);
   rowRef.value?.focus({ preventScroll: true });
-  const tableClickNavigation = event.detail > 0 && props.node.type === "table" && settingsStore.editorSettings.sidebarTableClickNavigation;
-  if (!tableClickNavigation && !shouldActivateTreeNodeOnSingleClick(props.node.type, settingsStore.editorSettings.sidebarActivation) && props.node.type !== "load-more") return;
+  if (!shouldActivateTreeNodeOnSingleClick(props.node.type, settingsStore.editorSettings.sidebarActivation) && props.node.type !== "load-more") return;
   if (props.node.type === "oracle-db-link") {
     showDatabaseLinks.value = true;
-    return;
-  }
-  if (tableClickNavigation) {
-    treeRuntime.handleRowClick(props.node, event.detail, true);
     return;
   }
   treeRuntime.handleRowClick(props.node, event.detail);
 }
 
 function onDoubleClick(event: MouseEvent) {
-  if (props.node.type === "table" && settingsStore.editorSettings.sidebarTableClickNavigation && (event.shiftKey || event.ctrlKey || event.metaKey)) return;
   if (props.node.type === "oracle-db-link" || props.node.type === "oracle-db-links") {
     showDatabaseLinks.value = true;
     return;
@@ -1596,43 +1602,44 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div v-if="node.type === 'table-search-control'" data-sidebar-table-search-control class="tree-table-search-control" :class="isCompactSidebar ? 'h-6 py-0' : 'h-7 py-0.5'" :style="tableSearchStyle" @click.stop @dblclick.stop @mousedown.stop @keydown="onTableSearchControlKeydown">
-    <!-- Keep indentation inside the viewport-sized content so trailing controls fit. -->
-    <div class="tree-table-search-control__content flex w-full min-w-0 items-center gap-1.5 pr-2" :style="{ paddingLeft }">
-      <div class="relative min-w-0 flex-1">
-        <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          :model-value="tableSearchValue"
-          autocapitalize="off"
-          autocorrect="off"
-          spellcheck="false"
-          class="w-full rounded border pl-7 pr-6 text-xs shadow-none focus-visible:ring-1"
-          :class="isCompactSidebar ? 'h-5' : 'h-6'"
-          :style="{ backgroundColor: 'var(--tree-table-search-input-bg)', borderColor: 'var(--tree-table-search-border)' }"
-          :placeholder="t(node.label)"
-          :aria-label="t(node.label)"
-          :data-sidebar-table-search-parent-id="tableSearchParentId"
-          @update:model-value="updateTableSearchQuery"
-        />
-        <button
-          v-if="tableSearchValue"
-          type="button"
-          class="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-          :aria-label="t(node.indexSearchOnly ? 'sidebar.clearIndexSearch' : 'sidebar.clearTableSearch')"
-          @click.stop="clearTableSearchQuery"
-        >
-          <X class="h-3 w-3" />
-        </button>
-      </div>
-      <LightTooltip v-if="!node.indexSearchOnly" :text="t('sidebar.localTableSearchTooltip')" side="top" :delay="300">
-        <Switch size="sm" :model-value="settingsStore.editorSettings.sidebarTableSearchLocal" :aria-label="t('sidebar.localTableSearch')" @update:model-value="updateTableSearchLocal(Boolean($event))" />
-      </LightTooltip>
-      <LightTooltip v-if="!node.indexSearchOnly && settingsStore.editorSettings.sidebarTableSearchLocal" :text="t('sidebar.refreshLocalTableSearchIndex')" side="top" :delay="300">
-        <button type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.refreshLocalTableSearchIndex')" @click.stop="refreshTableSearchIndex">
-          <RefreshCw class="h-3 w-3" />
-        </button>
-      </LightTooltip>
+  <div
+    v-if="node.type === 'table-search-control'"
+    data-sidebar-table-search-control
+    class="tree-table-search-control flex items-center gap-1.5 pr-2"
+    :class="isCompactSidebar ? 'h-6 py-0' : 'h-7 py-0.5'"
+    :style="tableSearchStyle"
+    @click.stop
+    @dblclick.stop
+    @mousedown.stop
+    @keydown="onTableSearchControlKeydown"
+  >
+    <div class="relative min-w-0 flex-1">
+      <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        :model-value="tableSearchValue"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        class="w-full rounded border pl-7 pr-6 text-xs shadow-none focus-visible:ring-1"
+        :class="isCompactSidebar ? 'h-5' : 'h-6'"
+        :style="{ backgroundColor: 'var(--tree-table-search-input-bg)', borderColor: 'var(--tree-table-search-border)' }"
+        :placeholder="t(node.label)"
+        :aria-label="t(node.label)"
+        :data-sidebar-table-search-parent-id="tableSearchParentId"
+        @update:model-value="updateTableSearchQuery"
+      />
+      <button v-if="tableSearchValue" type="button" class="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.clearTableSearch')" @click.stop="clearTableSearchQuery">
+        <X class="h-3 w-3" />
+      </button>
     </div>
+    <LightTooltip :text="t('sidebar.localTableSearchTooltip')" side="top" :delay="300">
+      <Switch size="sm" :model-value="settingsStore.editorSettings.sidebarTableSearchLocal" :aria-label="t('sidebar.localTableSearch')" @update:model-value="updateTableSearchLocal(Boolean($event))" />
+    </LightTooltip>
+    <LightTooltip v-if="settingsStore.editorSettings.sidebarTableSearchLocal" :text="t('sidebar.refreshLocalTableSearchIndex')" side="top" :delay="300">
+      <button type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.refreshLocalTableSearchIndex')" @click.stop="refreshTableSearchIndex">
+        <RefreshCw class="h-3 w-3" />
+      </button>
+    </LightTooltip>
   </div>
 
   <div v-else @contextmenu="onTreeItemContextMenu">
@@ -1698,25 +1705,8 @@ function onKeydown(event: KeyboardEvent) {
             <Ban class="h-2.5 w-2.5 stroke-[3]" aria-hidden="true" />
           </span>
         </span>
-        <div
-          ref="trailingCommentLayoutRef"
-          :class="[hasTrailingMetadata() ? (usesFullWidthLabel ? 'flex min-w-max flex-1 items-center' : 'flex flex-1 min-w-0 items-center') : 'contents', { 'overflow-hidden': !usesFullWidthLabel && settingsStore.editorSettings.sidebarObjectInfoMode === 'comment-and-size' }]"
-        >
-          <div
-            ref="trailingCommentLeadingRef"
-            :class="
-              trailingComment
-                ? usesFullWidthLabel
-                  ? 'flex min-w-0 shrink-0 items-center gap-2'
-                  : isConnectionRow
-                    ? 'flex max-w-full min-w-0 shrink items-center gap-2'
-                    : 'flex max-w-full min-w-0 shrink-0 items-center gap-2'
-                : formattedObjectStorage()
-                  ? 'flex min-w-0 flex-1 items-center gap-2'
-                  : 'contents'
-            "
-            :style="alignedCommentLeadingStyle()"
-          >
+        <div ref="trailingCommentLayoutRef" :class="[hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents', { 'overflow-hidden': settingsStore.editorSettings.sidebarObjectInfoMode === 'comment-and-size' }]">
+          <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
             <input
               v-if="isRenamingGroup || isRenamingSavedSql || isRenamingConnection"
               ref="renameInputRef"
@@ -1733,7 +1723,7 @@ function onKeydown(event: KeyboardEvent) {
               :class="[
                 labelWidthClass,
                 {
-                  'flex-1': isConnectionRow && !trailingComment && !connectionEndpointText,
+                  'flex-1': node.type === 'connection' && !trailingComment,
                   'tree-connection-label': node.type === 'connection' || node.type === 'connection-group',
                   'tree-object-label': node.type !== 'connection' && node.type !== 'connection-group',
                   'font-semibold': isLoginUserNode(),
@@ -1741,7 +1731,6 @@ function onKeydown(event: KeyboardEvent) {
               ]"
               >{{ visibleLabel(node) }}</span
             >
-            <span v-if="connectionEndpointText && !isRenamingConnection" class="sidebar-connection-endpoint flex-1 min-w-0 truncate" :class="{ 'shrink-0 whitespace-nowrap': usesFullWidthLabel }" :title="connectionEndpointText">{{ connectionEndpointText }}</span>
             <span
               v-if="node.type === 'column' && node.meta"
               class="shrink-0 rounded px-1 text-[10px] leading-4"
@@ -1753,7 +1742,7 @@ function onKeydown(event: KeyboardEvent) {
             <button v-if="node.type === 'oracle-db-links'" class="ml-auto rounded p-0.5 text-muted-foreground hover:bg-muted" :aria-label="t('databaseLinks.manage')" :title="t('databaseLinks.manage')" @click.stop="showDatabaseLinks = true" @dblclick.stop>
               <TableProperties class="h-3.5 w-3.5" />
             </button>
-            <span v-if="treeNodeSecondaryValue(node)" class="flex min-w-0 items-center gap-1 text-xs text-muted-foreground" :class="usesFullWidthLabel ? 'shrink-0' : 'max-w-[55%] shrink'" :title="node.type === 'elasticsearch-index' ? undefined : treeNodeSecondaryValue(node)">
+            <span v-if="treeNodeSecondaryValue(node)" class="flex min-w-0 max-w-[55%] shrink items-center gap-1 text-xs text-muted-foreground" :title="node.type === 'elasticsearch-index' ? undefined : treeNodeSecondaryValue(node)">
               <Link2 v-if="node.type === 'elasticsearch-index'" class="h-3 w-3 shrink-0 text-sky-400" />
               <span class="min-w-0 truncate">{{ treeNodeSecondaryValue(node) }}</span>
             </span>
@@ -1770,7 +1759,7 @@ function onKeydown(event: KeyboardEvent) {
               <Pin class="h-3 w-3 fill-current" aria-hidden="true" />
             </button>
             <Pin v-else-if="isPinned" class="h-3 w-3 shrink-0 fill-current text-primary" aria-hidden="true" />
-            <ProductionContextBadge v-if="showProductionBadge && !showProductionRowMarker && node.type !== 'connection'" compact />
+            <ProductionContextBadge v-if="showProductionBadge" compact />
             <span
               v-if="
                 (node.type === 'group-tables' ||
@@ -1783,7 +1772,6 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-udf-functions' ||
                   node.type === 'group-columns' ||
                   node.type === 'group-indexes' ||
-                  node.type === 'group-database-indexes' ||
                   node.type === 'group-fkeys' ||
                   node.type === 'group-triggers' ||
                   node.type === 'group-events' ||
@@ -1794,7 +1782,6 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-synonyms' ||
                   node.type === 'group-jobs' ||
                   node.type === 'group-packages' ||
-                  node.type === 'group-package-bodies' ||
                   node.type === 'group-types' ||
                   node.type === 'group-partitions' ||
                   node.type === 'type-attributes' ||
@@ -1811,7 +1798,7 @@ function onKeydown(event: KeyboardEvent) {
               {{ t("editor.defaultSchema") }}
             </Badge>
           </div>
-          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont, 'sidebar-object-comment--horizontal': usesFullWidthLabel }">{{ trailingComment }}</span>
+          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
           <span v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0" class="min-w-0 flex-1" aria-hidden="true" />
           <span
             v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0"
@@ -1823,13 +1810,9 @@ function onKeydown(event: KeyboardEvent) {
         </div>
         <span v-if="node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
         <span v-if="databaseOpenVisual.showsIndicator" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
-        <ProductionContextBadge v-if="showProductionBadge && !showProductionRowMarker && node.type === 'connection'" class="ml-auto shrink-0" compact />
         <ReadOnlySessionControl v-if="isConnectionReadonly && activeNode.connectionId" :connection-id="activeNode.connectionId" show-label />
         <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
         <span v-if="formattedObjectStorage()" class="ml-auto shrink-0 text-right text-xs tabular-nums text-muted-foreground">{{ formattedObjectStorage() }}</span>
-        <span v-if="showProductionRowMarker" class="flex w-4 shrink-0 items-center justify-center" :class="{ 'ml-auto': !formattedObjectStorage() }">
-          <ProductionContextBadge marker />
-        </span>
         <button
           v-if="isConnecting"
           type="button"
@@ -1871,7 +1854,32 @@ function onKeydown(event: KeyboardEvent) {
         </button>
       </div>
       <template v-if="detailTooltip" #content>
-        <ConnectionDetailContent :rows="detailTooltip.rows" />
+        <div class="w-max min-w-40 max-w-[min(28rem,calc(100vw-24px))] rounded-md border border-border bg-popover p-2 text-popover-foreground shadow-lg">
+          <div class="space-y-1">
+            <div v-for="row in detailTooltip.rows" :key="row.label" class="grid grid-cols-[max-content_minmax(0,1fr)] gap-2 text-xs leading-5">
+              <span class="text-muted-foreground shrink-0">{{ row.label }}</span>
+              <template v-if="row.values">
+                <div class="flex flex-col gap-0.5 font-mono text-foreground/90">
+                  <span v-for="(v, vi) in row.values" :key="vi" class="break-all">{{ v }}</span>
+                </div>
+              </template>
+              <button
+                v-else-if="row.action"
+                type="button"
+                class="w-fit rounded bg-primary/10 px-1 font-mono text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                :aria-label="row.actionLabel"
+                :title="row.actionLabel"
+                @click.stop="row.action()"
+              >
+                {{ row.value }}
+              </button>
+              <span v-else-if="row.multiline" class="max-h-20 overflow-hidden whitespace-pre-wrap break-words text-foreground/90">
+                {{ row.value }}
+              </span>
+              <span v-else class="truncate font-mono text-foreground/90" :title="row.value">{{ row.value }}</span>
+            </div>
+          </div>
+        </div>
       </template>
     </LightTooltip>
   </div>
@@ -1903,29 +1911,11 @@ function onKeydown(event: KeyboardEvent) {
   flex-shrink: 999;
 }
 
-.sidebar-object-comment--horizontal {
-  flex: 0 0 auto;
-  min-width: max-content;
-  max-width: none;
-  overflow: visible;
-  white-space: nowrap;
-}
-
 .sidebar-object-comment--windows {
-  /* Inherit the interface font; only adjust readability on Windows. */
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
   font-size: 1em;
   font-weight: 500;
   opacity: 1;
-}
-
-.sidebar-connection-endpoint {
-  color: var(--muted-foreground);
-  /* Matches the connection detail tooltip (text-xs ≈ 12px at the default sidebar font size) and scales with the sidebar font size setting. */
-  font-size: 0.85em;
-  line-height: 1.25;
-  opacity: 0.7;
-  /* Two name-sized characters of gap; this element's own font is 0.85em, so scale the 2em back to the row font. */
-  margin-left: calc(2em / 0.85);
 }
 
 .tree-connection-label {
@@ -1991,6 +1981,10 @@ function onKeydown(event: KeyboardEvent) {
   background-color: var(--tree-connection-active-focus-bg, var(--tree-connection-active-bg));
 }
 
+.tree-item-connection-tint.tree-item-active--selection-set:focus::before {
+  background-color: var(--tree-connection-active-bg, var(--tree-connection-row-bg));
+}
+
 .tree-table-search-control {
   position: relative;
   isolation: isolate;
@@ -2035,33 +2029,15 @@ function onKeydown(event: KeyboardEvent) {
   background-color: var(--tree-connection-active-focus-bg, rgb(33 60 89)) !important;
 }
 
-/* Keep every member of a multi-selection visible, including after focus leaves
-   the tree. The inset marker also distinguishes selection from hover/tint. */
-.tree-item-active--selection-set {
-  --tree-selection-set-bg: rgb(211 227 245);
-  box-shadow: inset 3px 0 0 var(--primary);
+/* Multi-selection treats every selected row as equal; keep focus neutral. */
+.tree-item-active--selection-set:focus {
+  background-color: var(--tree-connection-active-bg, rgb(235 235 235)) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 14%, transparent);
 }
 
-:root.dark .tree-item-active--selection-set {
-  --tree-selection-set-bg: rgb(33 60 89);
-}
-
-.tree-item-active--selection-set,
-.tree-item-active--selection-set:focus,
-:root.dark .tree-item-active--selection-set,
 :root.dark .tree-item-active--selection-set:focus {
-  background-color: var(--tree-selection-set-bg) !important;
-}
-
-/* Colored connections paint their descendants through a separate background
-   layer; use the same selection tint on that layer as on ordinary rows. */
-.tree-item-connection-tint.tree-item-active--selection-set::before,
-.tree-item-connection-tint.tree-item-active--selection-set:focus::before {
-  /* Labels can be nested under display: contents wrappers, so keep the
-     opaque selection layer behind all content in the isolated row. */
-  z-index: -1;
-  background-color: var(--tree-selection-set-bg);
-  box-shadow: inset 3px 0 0 var(--primary);
+  background-color: var(--tree-connection-active-bg, rgb(36 36 36)) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 18%, transparent);
 }
 
 /* Locate highlight: instant warning tint, then fade on removal */

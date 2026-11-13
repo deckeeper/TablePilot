@@ -80,7 +80,6 @@ export function analyzeSqlCompletion(request: SqlCompletionAnalysisRequest, edit
   const options = {
     databaseType: request.databaseType,
     dialect: request.dialect,
-    driverProfile: request.driverProfile,
     editorState,
   };
   const legacyContext = getSqlCompletionContext(request.sql, request.cursor, options);

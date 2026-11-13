@@ -8,8 +8,6 @@ const props = withDefaults(
   defineProps<{
     modelValue: string;
     values: string[];
-    /** Optional labels aligned with `values`; the committed value is still `values[i]`. */
-    displayValues?: string[];
     nullable?: boolean;
     initialNull?: boolean;
     cellLayout?: "grid" | "transpose";
@@ -35,15 +33,9 @@ const closeHandled = ref(false);
 
 const triggerClass = computed(() => ["cell-edit-input absolute inset-0 z-10 flex items-center gap-1 border-2 border-primary bg-background py-0 text-left text-xs outline-none", props.cellLayout === "transpose" ? "px-1.5" : "px-2.5"].join(" "));
 
-function optionLabel(value: string, index: number): string {
-  return props.displayValues?.[index] ?? value;
-}
-
 const displayValue = computed(() => {
   if (props.initialNull && props.modelValue === "") return t("grid.nullValue");
-  if (props.modelValue === "") return "''";
-  const index = props.values.indexOf(props.modelValue);
-  return index >= 0 ? optionLabel(props.modelValue, index) : props.modelValue;
+  return props.modelValue === "" ? "''" : props.modelValue;
 });
 
 onMounted(() => {
@@ -107,7 +99,7 @@ function onPopoverInteractOutside(event: PointerDownOutsideEvent | FocusOutsideE
           {{ t("grid.nullValue") }}
         </button>
         <button
-          v-for="(val, index) in values"
+          v-for="val in values"
           :key="val"
           type="button"
           class="flex min-h-7 w-full items-center rounded-sm px-2 py-1 text-left text-xs hover:bg-accent hover:text-accent-foreground"
@@ -118,7 +110,7 @@ function onPopoverInteractOutside(event: PointerDownOutsideEvent | FocusOutsideE
             <code>''</code>
             <span class="ml-2 text-muted-foreground">{{ t("grid.emptyStringValue") }}</span>
           </template>
-          <template v-else>{{ optionLabel(val, index) }}</template>
+          <template v-else>{{ val }}</template>
         </button>
       </div>
     </PopoverContent>

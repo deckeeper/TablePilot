@@ -162,7 +162,6 @@ fn generate_schema_sync_sql_output_invariant() {
         target_ddl: None,
         source_table_comment: None,
         target_table_comment: None,
-        table_charset: None,
         sync_sql: None,
     }];
 

@@ -6,7 +6,6 @@ export interface SidebarDataOpenRequest {
 
 export interface SidebarDataOpenOptions {
   connectionKey: string;
-  targetKey?: string;
   supersede?: boolean;
 }
 
@@ -15,7 +14,6 @@ type OpenDataRunner = (request: SidebarDataOpenRequest) => void | Promise<void>;
 interface QueuedOpen {
   id: number;
   connectionKey: string;
-  targetKey?: string;
   superseding: boolean;
   controller: AbortController;
   runner: OpenDataRunner;
@@ -129,7 +127,6 @@ function enqueueRequest(options: SidebarDataOpenOptions, runner: OpenDataRunner)
   const request: QueuedOpen = {
     id: ++nextRequestId,
     connectionKey: options.connectionKey || DEFAULT_CONNECTION_KEY,
-    targetKey: options.targetKey,
     superseding,
     controller: new AbortController(),
     runner,
@@ -153,13 +150,6 @@ export function runSidebarDataOpenImmediately(optionsOrRunner: SidebarDataOpenOp
     return;
   }
   if (maybeRunner) enqueueRequest(optionsOrRunner, maybeRunner);
-}
-
-// Keep the selected table's load and independent new-tab opens in flight.
-export function supersedeSidebarDataNavigation(targetKey: string) {
-  for (const request of Array.from(requests.values())) {
-    if (request.superseding && request.targetKey !== targetKey) cancelRequest(request);
-  }
 }
 
 export function cancelPendingSidebarDataOpen() {

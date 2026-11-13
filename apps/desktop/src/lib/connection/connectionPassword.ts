@@ -1,5 +1,4 @@
 import type { ConnectionConfig, PluginFormField, PluginFormFieldValue } from "@/types/database";
-import type { MqttConnectionConfig } from "@/types/mqtt";
 import { isSavedCredential } from "@/lib/security/passwordViewer";
 import { pluginFieldIsRequired } from "@/lib/plugins/pluginFieldConditions";
 
@@ -31,11 +30,6 @@ export function connectionUsesPasswordlessAuthentication(config: PasswordAuthent
 }
 
 export function connectionNeedsPasswordPrompt(config: ConnectionConfig): boolean {
-  if (config.db_type === "mqtt") {
-    const mqttConfig = config.external_config as Partial<MqttConnectionConfig> | undefined;
-    // Certificate auth carries any optional broker credentials in external_config.auth.
-    if (mqttConfig?.auth?.kind === "certificate") return false;
-  }
   return config.save_password === false && (!config.password || isSavedCredential(config.password)) && !connectionUsesPasswordlessAuthentication(config);
 }
 

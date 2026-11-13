@@ -174,7 +174,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       toast(t("contextMenu.mysqlAutoIncrementSuccess", { name: node.label, value: mysqlAutoIncrementValue.value }), 3000);
       await options.refreshMutatedTableDataTabsForNode(node);
     } catch (error: any) {
-      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), { persistent: true });
+      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), 5000);
     }
   }
 
@@ -230,7 +230,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       toast(t("contextMenu.vacuumTableSuccess", { name: node.label }), 3000);
       return true;
     } catch (error: any) {
-      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), { persistent: true });
+      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), 5000);
       return false;
     } finally {
       vacuumTableExecuting.value = false;
@@ -442,11 +442,11 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     if (cancelConfirmed) {
       toast(t("contextMenu.tableOperationCancelled", { name }), 3000);
     } else if (wasCancelled) {
-      toast(t("contextMenu.tableOperationCancelUnconfirmed", { name, message }), { persistent: true });
+      toast(t("contextMenu.tableOperationCancelUnconfirmed", { name, message }), 8000);
     } else if (isQueryTimeoutErrorMessage(message, backendError)) {
-      toast(t("contextMenu.tableOperationTimedOut", { name, message }), { persistent: true });
+      toast(t("contextMenu.tableOperationTimedOut", { name, message }), 8000);
     } else {
-      toast(t("contextMenu.tableOperationFailed", { message }), { persistent: true });
+      toast(t("contextMenu.tableOperationFailed", { message }), 5000);
     }
   }
 

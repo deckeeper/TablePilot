@@ -6,7 +6,6 @@ export interface EditorSearchQueryOptions {
   replace?: string;
   caseSensitive: boolean;
   useRegex: boolean;
-  wholeWord?: boolean;
 }
 
 export function createEditorSearchQuery(options: EditorSearchQueryOptions): SearchQuery {
@@ -16,7 +15,6 @@ export function createEditorSearchQuery(options: EditorSearchQueryOptions): Sear
     caseSensitive: options.caseSensitive,
     regexp: options.useRegex,
     literal: !options.useRegex,
-    wholeWord: options.wholeWord ?? false,
   });
 }
 

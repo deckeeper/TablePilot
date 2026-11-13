@@ -11,7 +11,6 @@ import DateParams from "./DateParams.vue";
 import TimeParams from "./TimeParams.vue";
 import SequenceParams from "./SequenceParams.vue";
 import EnumParams from "./EnumParams.vue";
-import BitmaskParams from "./BitmaskParams.vue";
 import TextParams from "./TextParams.vue";
 import ImageBinaryParams from "./ImageBinaryParams.vue";
 import ForeignKeyParams from "./ForeignKeyParams.vue";
@@ -75,7 +74,6 @@ const componentMap: Record<string, any> = {
   time: TimeParams,
   sequence: SequenceParams,
   enum: EnumParams,
-  bitmask: BitmaskParams,
   text: TextParams,
   image: ImageBinaryParams,
   foreign_key: ForeignKeyParams,

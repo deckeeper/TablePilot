@@ -1,4 +1,3 @@
-import { patchConnectionParameter } from "@/lib/connection/connectionParameterDocument";
 const MYSQL_CLEAR_TEXT_PARAM_ALIASES = new Set(["allowcleartextpasswords", "enable_cleartext_plugin"]);
 const MYSQL_CLEAR_TEXT_PARAM = "enable_cleartext_plugin";
 
@@ -23,5 +22,11 @@ export function mysqlCleartextPasswordAuthEnabled(params: string | undefined): b
 }
 
 export function setMysqlCleartextPasswordAuthEnabled(params: string | undefined, enabled: boolean): string {
-  return patchConnectionParameter(params, MYSQL_CLEAR_TEXT_PARAM, enabled ? "true" : null, { aliases: Array.from(MYSQL_CLEAR_TEXT_PARAM_ALIASES), caseInsensitive: true });
+  const parsed = new URLSearchParams((params || "").trim().replace(/^\?/, ""));
+  // Snapshot keys because deleting from URLSearchParams during live iteration can skip duplicates.
+  for (const key of Array.from(parsed.keys())) {
+    if (isMysqlCleartextPasswordParam(key)) parsed.delete(key);
+  }
+  if (enabled) parsed.set(MYSQL_CLEAR_TEXT_PARAM, "true");
+  return parsed.toString();
 }

@@ -65,7 +65,6 @@ fn run() -> Result<(), String> {
             source_column: column.clone(),
             target_column: column.clone(),
             target_data_type: None,
-            generator: None,
         })
         .collect::<Vec<_>>();
     let parsed = ParsedImportFile {

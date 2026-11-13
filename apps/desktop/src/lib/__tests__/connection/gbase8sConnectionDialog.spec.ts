@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs";
 import { parse } from "vue/compiler-sfc";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
-import { gbaseProfileFromConfig } from "@/lib/connection/gbaseProfiles";
 
 const dialogSource = readFileSync(new URL("../../../components/connection/ConnectionDialog.vue", import.meta.url), "utf8");
 const parsedDialog = parse(dialogSource, { filename: "ConnectionDialog.vue" });
@@ -19,19 +18,17 @@ function selectedProfileHarness(selectedTypeValue: string, driverProfile: string
   }).outputText;
   // The merged dialog checks plugin providers before the profile table; the
   // plugin branch is stubbed out so this harness pins the GBase profile path.
-  const selectedProfile = new Function("driverProfiles", "selectedType", "form", "parsePluginConnectionProviderOptionValue", "selectedPluginProvider", "gbaseProfileFromConfig", `${javascript}\nreturn selectedProfile;`)(
+  const selectedProfile = new Function("driverProfiles", "selectedType", "form", "parsePluginConnectionProviderOptionValue", "selectedPluginProvider", `${javascript}\nreturn selectedProfile;`)(
     {
       mysql: { label: "MySQL" },
       gbase: { label: "南大通用 GBase 8a" },
       gbase8a: { label: "南大通用 GBase 8a" },
       gbase8s: { label: "南大通用 GBase 8s" },
-      gbase8c: { label: "南大通用 GBase 8c" },
     },
     { value: selectedTypeValue },
-    { value: { db_type: driverProfile === "gbase8c" ? "gbase8c" : driverProfile === "gbase8s" ? "gbase8s" : "gbase", driver_profile: driverProfile } },
+    { value: { driver_profile: driverProfile } },
     () => null,
     { value: null },
-    gbaseProfileFromConfig,
   ) as () => { label: string };
   return selectedProfile();
 }
@@ -40,7 +37,6 @@ describe("GBase 8s connection dialog", () => {
   it.each([
     ["gbase8a", "南大通用 GBase 8a"],
     ["gbase8s", "南大通用 GBase 8s"],
-    ["gbase8c", "南大通用 GBase 8c"],
   ])("shows the active %s profile in the merged GBase type field", (profile, label) => {
     expect(selectedProfileHarness("gbase", profile).label).toBe(label);
   });

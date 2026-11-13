@@ -13,22 +13,11 @@ export type DatabaseBackupFrequency = "hourly" | "daily" | "weekly";
 export type DatabaseBackupExportStatus = "Running" | "Done" | "Error" | "Cancelled";
 export type DatabaseBackupRunStatus = "running" | "success" | "failed" | "cancelled";
 export type DatabaseBackupRunTrigger = "manual" | "scheduled";
-/** `imported` runs list backup files created outside DBX; DBX never deletes their files. */
-export type DatabaseBackupRunSource = "scheduled" | "one-shot" | "imported";
+export type DatabaseBackupRunSource = "scheduled" | "one-shot";
 export type DatabaseBackupTableFilterMode = "all" | "include" | "exclude" | "selected";
-/** Output format of a backup file: plain SQL, gzipped SQL, or a Navicat `.nb3` archive. */
-export type DatabaseBackupOutputCompression = "none" | "gzip" | "nb3";
+export type DatabaseBackupOutputCompression = "none" | "gzip";
 
-const DATABASE_BACKUP_FILE_SUFFIXES: Record<DatabaseBackupOutputCompression, string> = { none: ".sql", gzip: ".sql.gz", nb3: ".nb3" };
-
-export function normalizeDatabaseBackupOutputCompression(value: unknown): DatabaseBackupOutputCompression {
-  return value === "gzip" || value === "nb3" ? value : "none";
-}
-
-const CONSISTENT_BACKUP_DATABASE_TYPES = new Set(["mysql", "postgres", "opengauss"]);
-// The backend writes and restores Navicat `.nb3` archives for MySQL and PostgreSQL only
-// (`navicat_nb3.rs`); openGauss backups must use plain or gzipped SQL.
-const NAVICAT_BACKUP_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres"]);
+const CONSISTENT_BACKUP_DATABASE_TYPES = new Set(["mysql", "postgres"]);
 
 export class DatabaseBackupConnectionQueue {
   private readonly tails = new Map<string, Promise<void>>();
@@ -58,11 +47,6 @@ export function databaseBackupAggregateExportStatus(status: DatabaseBackupExport
 
 export function supportsScheduledDatabaseBackup(databaseType: string | undefined): boolean {
   return !!databaseType && CONSISTENT_BACKUP_DATABASE_TYPES.has(databaseType);
-}
-
-/** Navicat `.nb3` archives are only supported when every selected connection is MySQL or PostgreSQL. */
-export function supportsNavicatBackupFormat(databaseTypes: readonly (DatabaseType | undefined)[]): boolean {
-  return databaseTypes.length > 0 && databaseTypes.every((databaseType) => !!databaseType && NAVICAT_BACKUP_DATABASE_TYPES.has(databaseType));
 }
 
 export function resolveScheduledDatabaseBackupTargets(configuredDatabases: readonly string[], availableDatabases: readonly string[], databaseType?: DatabaseType): string[] {
@@ -285,7 +269,7 @@ export function normalizeDatabaseBackupTime(value: unknown): string {
 }
 
 export function normalizeDatabaseBackupRetention(value: unknown): number {
-  return boundedInteger(value, 10, 0, 1000);
+  return boundedInteger(value, 10, 1, 100);
 }
 
 export function normalizeDatabaseBackupSchedule(value: unknown, now = new Date()): DatabaseBackupSchedule | null {
@@ -324,7 +308,7 @@ export function normalizeDatabaseBackupSchedule(value: unknown, now = new Date()
     includeData: booleanValue(input.includeData, true),
     includeObjects: booleanValue(input.includeObjects, true),
     dropTableIfExists: booleanValue(input.dropTableIfExists, false),
-    outputCompression: normalizeDatabaseBackupOutputCompression(input.outputCompression),
+    outputCompression: input.outputCompression === "gzip" ? "gzip" : "none",
     fileNamePattern: normalizeDatabaseBackupFileNamePattern(input.fileNamePattern),
     retentionCount: normalizeDatabaseBackupRetention(input.retentionCount),
     runDirectoryPattern: normalizeDatabaseBackupRunDirectoryPattern(input.runDirectoryPattern),
@@ -393,7 +377,7 @@ export function normalizeDatabaseBackupRun(value: unknown): DatabaseBackupRun | 
     connectionName: stringValue(input.connectionName).trim(),
     destinationDirectory: stringValue(input.destinationDirectory).trim() || undefined,
     trigger: input.trigger === "scheduled" ? "scheduled" : "manual",
-    source: input.source === "one-shot" || input.source === "imported" ? input.source : "scheduled",
+    source: input.source === "one-shot" ? "one-shot" : "scheduled",
     status,
     startedAt,
     completedAt: typeof input.completedAt === "string" && Number.isFinite(Date.parse(input.completedAt)) ? input.completedAt : undefined,
@@ -452,12 +436,10 @@ export function writeDatabaseBackupRuns(runs: readonly DatabaseBackupRun[]) {
 }
 
 export function databaseBackupRunsToPrune(runs: readonly DatabaseBackupRun[], scheduleId: string, retentionCount: number): DatabaseBackupRun[] {
-  const normalizedRetention = normalizeDatabaseBackupRetention(retentionCount);
-  if (normalizedRetention === 0) return [];
   return runs
     .filter((run) => run.scheduleId === scheduleId && run.status === "success")
     .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))
-    .slice(normalizedRetention);
+    .slice(normalizeDatabaseBackupRetention(retentionCount));
 }
 
 export function sanitizeDatabaseBackupFileSegment(value: string): string {
@@ -562,7 +544,7 @@ export function joinDatabaseBackupPath(directory: string, fileName: string): str
 }
 
 export function databaseBackupFilePath(directory: string, scheduleName: string, fileStem: string, startedAt: Date | string, runId: string, outputCompression: DatabaseBackupOutputCompression = "none", fileNamePattern?: string, timeZone?: string): string {
-  const suffix = DATABASE_BACKUP_FILE_SUFFIXES[outputCompression] ?? ".sql";
+  const suffix = outputCompression === "gzip" ? ".sql.gz" : ".sql";
   const fileName = `${renderDatabaseBackupFileNamePattern(fileNamePattern ?? DEFAULT_DATABASE_BACKUP_FILE_NAME_PATTERN, scheduleName, fileStem, startedAt, runId, timeZone)}${suffix}`;
   return joinDatabaseBackupPath(directory, fileName);
 }

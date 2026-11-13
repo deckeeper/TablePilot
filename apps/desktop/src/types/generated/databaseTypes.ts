@@ -47,8 +47,6 @@ export const DATABASE_TYPES = [
   "questdb",
   "oceanbase-oracle",
   "gbase",
-  "gbase8s",
-  "gbase8c",
   "access",
   "h2",
   "snowflake",

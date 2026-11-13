@@ -7,7 +7,7 @@ import "./sqlEditorWorkspace.css";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { createGroupTabBarPortal, GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
-import { hasFocusableQueryResult, hasQueryOutput } from "@/lib/query/queryOutput";
+import { hasQueryOutput } from "@/lib/query/queryOutput";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { beginPanelResize, endPanelResize } from "@/lib/app/panelResizeState";
 import { Button } from "@/components/ui/button";
@@ -17,7 +17,6 @@ import { createContentSurfaceEventForwarders } from "@/lib/tabs/contentSurfaceEv
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps, StatementRange } from "./querySurfaces";
 import type { QueryTab, TableInfoTab } from "@/types/database";
 import type { AiConversationBinding } from "@/lib/ai/aiConversationBinding";
-import { isObjectDependencySection } from "@/lib/database/objectDependencyDetails";
 
 defineOptions({ inheritAttrs: false });
 
@@ -47,11 +46,13 @@ const workspaceClass = computed(() => (typeof attrs.class === "string" ? attrs.c
 const surfaceProps = computed(() => ({
   activeTab: props.activeTab,
   activeConnection: props.activeConnection,
-  hasExecutableSql: props.hasExecutableSql,
+  executableSql: props.executableSql,
   activeOutputView: props.activeOutputView,
   formatSqlRequest: props.formatSqlRequest,
   compressSqlRequest: props.compressSqlRequest,
   keywordCaseRequest: props.keywordCaseRequest,
+  selectedSql: props.selectedSql,
+  cursorPos: props.cursorPos,
   blockDangerousRedisCommands: props.blockDangerousRedisCommands,
   zenMode: props.zenMode,
 }));
@@ -60,9 +61,6 @@ const editorGroupBindings = computed(() => ({ ...surfaceProps.value, ...contentE
 const resultSurfaceBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits, activeTab: activeQueryTab.value! }));
 
 defineExpose({
-  copyActiveResult,
-  focusResultGrid,
-  focusSqlEditor,
   focusSearch: (target: Element | null = null) => {
     const element = commandTargetElement(target);
     // The shared result pane (and its Teleported cell-detail dialog) lives
@@ -77,9 +75,6 @@ defineExpose({
   },
   focusWhere: () => activeEditorGroup()?.focusWhere() ?? false,
   openGoToColumn: () => activeEditorGroup()?.openGoToColumn() ?? false,
-  openConnectionPicker: () => activeEditorGroup()?.openConnectionPicker() ?? false,
-  openDatabasePicker: () => activeEditorGroup()?.openDatabasePicker() ?? false,
-  openSchemaPicker: () => activeEditorGroup()?.openSchemaPicker() ?? false,
   openTableStructureEditor: (initialTab?: TableInfoTab) => activeEditorGroup()?.openTableStructureEditor?.(initialTab) ?? false,
   refreshData: (target: Element | null = null) => {
     const element = commandTargetElement(target);
@@ -104,7 +99,6 @@ defineExpose({
     return group?.handleModRTarget(target) ?? false;
   },
   requestQueryEditorExecute: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecute() ?? false,
-  requestQueryEditorExecuteAll: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecuteAll() ?? false,
   captureQueryEditorExecutionSnapshot: (tabId?: string) => editorGroupForTab(tabId)?.captureQueryEditorExecutionSnapshot(),
   requestQueryEditorExecuteInNewResultTab: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecuteInNewResultTab() ?? false,
   requestQueryEditorPreviewChanges: (stackSql?: string) => activeEditorGroup()?.requestQueryEditorPreviewChanges(stackSql) ?? false,
@@ -164,7 +158,7 @@ const showResultPane = computed({
     if (tab?.mode === "query") queryStore.updateTabUiState(tab.id, { resultPaneOpen: open });
   },
 });
-const isResultPaneVisible = computed(() => hasSharedOutput.value && showResultPane.value && !isObjectDependencySection(activeQueryTab.value!));
+const isResultPaneVisible = computed(() => hasSharedOutput.value && showResultPane.value);
 // Keep the pane mounted, but apply its target size immediately so available
 // results never wait for an expansion animation before becoming visible.
 const resultPaneTargetSize = computed(() => (isResultPaneVisible.value ? resultPaneSize.value : 0));
@@ -184,47 +178,6 @@ function toggleSharedResultsPane(): boolean {
   if (!hasSharedOutput.value) return false;
   showResultPane.value = !showResultPane.value;
   return true;
-}
-
-let copyRequest = 0;
-function copyActiveResult(): boolean {
-  const tab = activeQueryTab.value;
-  if (props.contentSuppressed || !tab || !hasFocusableQueryResult(tab) || isObjectDependencySection(tab)) return false;
-  const request = ++copyRequest;
-  const result = tab.result;
-  const generation = tab.resultViewGeneration;
-  const isValid = () => request === copyRequest && !props.contentSuppressed && activeQueryTab.value?.id === tab.id && activeQueryTab.value.result === result && activeQueryTab.value.resultViewGeneration === generation;
-  // A collapsed pane is unmounted. Restore it without focusing the grid or
-  // synthesizing a selection in either the editor or the result table.
-  showResultPane.value = true;
-  void nextTick(() => {
-    if (isValid()) resultSurfaceRef.value?.copyActiveResult(isValid);
-  });
-  return true;
-}
-watch([() => activeQueryTab.value?.id, () => activeQueryTab.value?.result, () => activeQueryTab.value?.resultViewGeneration, () => props.contentSuppressed], () => ++copyRequest, { flush: "sync" });
-onBeforeUnmount(() => ++copyRequest);
-
-let focusRequest = 0;
-function focusResultGrid(): boolean {
-  const tab = activeQueryTab.value;
-  if (props.contentSuppressed || !tab || !hasFocusableQueryResult(tab) || isObjectDependencySection(tab)) return false;
-  const request = ++focusRequest;
-  const result = tab.result;
-  showResultPane.value = true;
-  void nextTick(() => {
-    if (request === focusRequest && activeQueryTab.value?.id === tab.id && activeQueryTab.value.result === result && isResultPaneVisible.value) {
-      resultSurfaceRef.value?.focusResultGrid();
-    }
-  });
-  return true;
-}
-
-function focusSqlEditor(): boolean {
-  if (props.contentSuppressed) return false;
-  ++focusRequest;
-  resultSurfaceRef.value?.cancelResultGridFocus();
-  return activeEditorGroup()?.focusSqlEditor() ?? false;
 }
 
 // Restores the pre-split "running a query re-expands the results pane"

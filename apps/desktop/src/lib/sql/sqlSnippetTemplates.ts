@@ -124,13 +124,8 @@ export const MANTICORESEARCH_SQL_SNIPPETS: SqlSnippet[] = [
 type BuiltinSqlSnippetBodyBuilder = (databaseType?: DatabaseType) => string;
 
 interface BuiltinSqlSnippetRule {
-  /** Default body with whitespace collapsed, so layout-only edits still count as the default. */
-  defaultShape: string;
+  defaultBody: string;
   buildBody: BuiltinSqlSnippetBodyBuilder;
-}
-
-function collapseSqlWhitespace(sql: string): string {
-  return sql.replace(/\s+/g, " ").trim();
 }
 
 const PARENTHESIZED_ADD_COLUMN_DATABASES = new Set<DatabaseType>(["oracle", "oceanbase-oracle", "yashandb", "xugu", "dameng", "iris", "informix"]);
@@ -157,7 +152,7 @@ const BUILTIN_SQL_SNIPPET_RULES = new Map<string, BuiltinSqlSnippetRule>(
   DEFAULT_SQL_SNIPPETS.map((snippet) => [
     snippet.id,
     {
-      defaultShape: collapseSqlWhitespace(snippet.body),
+      defaultBody: snippet.body,
       buildBody: () => snippet.body,
     },
   ]),
@@ -166,27 +161,15 @@ const BUILTIN_SQL_SNIPPET_RULES = new Map<string, BuiltinSqlSnippetRule>(
 function registerBuiltinSqlSnippetRule(id: string, buildBody: BuiltinSqlSnippetBodyBuilder): void {
   const rule = BUILTIN_SQL_SNIPPET_RULES.get(id);
   if (!rule) throw new Error(`Unknown built-in SQL snippet: ${id}`);
-  BUILTIN_SQL_SNIPPET_RULES.set(id, { defaultShape: rule.defaultShape, buildBody });
+  BUILTIN_SQL_SNIPPET_RULES.set(id, { defaultBody: rule.defaultBody, buildBody });
 }
 
 registerBuiltinSqlSnippetRule("builtin-sel", buildSelectSnippetBody);
 registerBuiltinSqlSnippetRule("builtin-upd", buildUpdateSnippetBody);
 registerBuiltinSqlSnippetRule("builtin-at", buildAlterTableAddColumnSnippetBody);
 
-/**
- * Resolve a built-in snippet body for the active database.
- *
- * Bodies whose content differs from the default (e.g. `LIMIT 7`) are kept
- * verbatim. Layout-only edits are still converted; the user's text is kept
- * when the dialect body matches it, and single-line bodies stay single-line.
- */
 export function resolveSqlSnippetBodyForDatabase(snippet: SqlSnippet, databaseType?: DatabaseType): string {
   const rule = BUILTIN_SQL_SNIPPET_RULES.get(snippet.id);
-  if (!rule) return snippet.body;
-  const bodyShape = collapseSqlWhitespace(snippet.body);
-  if (bodyShape !== rule.defaultShape) return snippet.body;
-  const dialectBody = rule.buildBody(databaseType);
-  const dialectShape = collapseSqlWhitespace(dialectBody);
-  if (dialectShape === bodyShape) return snippet.body;
-  return snippet.body.includes("\n") ? dialectBody : dialectShape;
+  if (!rule || snippet.body !== rule.defaultBody) return snippet.body;
+  return rule.buildBody(databaseType);
 }

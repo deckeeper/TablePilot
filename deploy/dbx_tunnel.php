@@ -65,11 +65,6 @@ try {
 
 function handle_open(): void
 {
-    $workerStartMethod = worker_start_method();
-    if ($workerStartMethod === null) {
-        respond_error(503, 'HTTP tunnel is unsupported on this PHP host: it requires PHP-FPM fastcgi_finish_request() or permission to spawn PHP CLI with popen()');
-    }
-
     $session = request_session();
     $host = request_param('dbx_target_host');
     $port = (int) request_param('dbx_target_port');
@@ -88,7 +83,7 @@ function handle_open(): void
     touch($dir . DIRECTORY_SEPARATOR . 'in.queue');
     touch($dir . DIRECTORY_SEPARATOR . 'out.queue');
 
-    if ($workerStartMethod === 'fastcgi') {
+    if (function_exists('fastcgi_finish_request')) {
         respond_json(['ok' => true], false);
         fastcgi_finish_request();
         run_worker($dir, $host, $port, $connectTimeout);
@@ -102,23 +97,7 @@ function handle_open(): void
         respond_error(500, 'PHP tunnel worker did not start');
     }
 
-    respond_error(503, 'HTTP tunnel worker could not be started with popen()');
-}
-
-function worker_start_method(): ?string
-{
-    return select_worker_start_method(function_exists('fastcgi_finish_request'), function_exists('popen'));
-}
-
-function select_worker_start_method(bool $hasFastcgiFinishRequest, bool $hasPopen): ?string
-{
-    if ($hasFastcgiFinishRequest) {
-        return 'fastcgi';
-    }
-    if ($hasPopen) {
-        return 'popen';
-    }
-    return null;
+    respond_error(500, 'PHP tunnel requires PHP-FPM fastcgi_finish_request or permission to spawn PHP CLI');
 }
 
 function handle_write(): void

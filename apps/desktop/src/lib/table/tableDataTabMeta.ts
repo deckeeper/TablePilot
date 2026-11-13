@@ -37,7 +37,6 @@ export function repairRestoredDataTabTableIdentity(tab: QueryTab, databaseType: 
   tab.tableMeta = {
     ...tab.tableMeta,
     schema: source.qualifier,
-    database: tab.tableMeta?.database ?? tab.database,
     tableName: source.name,
     columns: tab.tableMeta?.columns ?? [],
     primaryKeys: tab.tableMeta?.primaryKeys ?? [],
@@ -58,18 +57,7 @@ function fallbackColumnInfo(name: string): ColumnInfo {
 
 export function tableMetaForDataTab(tab: QueryTab | undefined): DataTabTableMeta | undefined {
   if (!tab || tab.mode !== "data") return undefined;
-  if (tab.tableMeta?.columns.length) {
-    const database = tab.tableMeta.database ?? tab.database;
-    const schema = tab.tableMeta.schema ?? tab.schema;
-    if (database !== tab.tableMeta.database || schema !== tab.tableMeta.schema) {
-      return {
-        ...tab.tableMeta,
-        database,
-        schema,
-      };
-    }
-    return tab.tableMeta;
-  }
+  if (tab.tableMeta?.columns.length) return tab.tableMeta;
   const tableName = tab.tableMeta?.tableName.trim() || titleTableName(tab);
   if (!tableName) return undefined;
 
@@ -77,7 +65,6 @@ export function tableMetaForDataTab(tab: QueryTab | undefined): DataTabTableMeta
   return {
     ...tab.tableMeta,
     schema: tab.tableMeta?.schema ?? tab.schema,
-    database: tab.tableMeta?.database ?? tab.database,
     tableName,
     columns: (tab.result?.columns ?? []).map(fallbackColumnInfo),
     primaryKeys: tab.tableMeta?.primaryKeys ?? [],

@@ -25,8 +25,6 @@ export interface DocumentBrowserDataSnapshot {
 export interface DocumentBrowserStateSnapshot {
   /** Manual JSON filter text from the collection filter input. */
   filterInput: string;
-  /** Whether manual and structured query filters are applied; defaults to true. */
-  filterEnabled?: boolean;
   /** Manual JSON sort text from the collection sort input. */
   sortInput: string;
   /** Structured-filter contribution applied on top of the manual filter. */

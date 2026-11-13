@@ -27,7 +27,7 @@ function structureRequest(overrides: Partial<TransferRequest> = {}): TransferReq
 }
 
 function structurePreview(sql = '-- orders -> reporting.orders\nCREATE TABLE "reporting"."orders" ("id" integer);'): TransferOwnershipPreview["structure"] {
-  return { sql, tables: [{ sourceTable: "orders", targetTable: "reporting.orders", preexisting: false, sql }], operations: [], schemaObjectsExpanded: false };
+  return { sql, tables: [{ sourceTable: "orders", targetTable: "reporting.orders", preexisting: false, sql }], operations: [] };
 }
 
 function preview(overrides: Partial<TransferOwnershipPreview> = {}): TransferOwnershipPreview {

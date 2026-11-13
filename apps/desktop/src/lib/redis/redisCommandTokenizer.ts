@@ -22,7 +22,7 @@ export function isRedisCommentLine(line: string): boolean {
 }
 
 function escapedCharacter(value: string): string {
-  return value === "n" ? "\n" : value === "r" ? "\r" : value === "t" ? "\t" : value === "a" ? "\x07" : value === "b" ? "\x08" : value;
+  return value === "n" ? "\n" : value === "r" ? "\r" : value === "t" ? "\t" : value;
 }
 
 export function tokenizeRedisLine(line: string): RedisArgvResult {
@@ -53,15 +53,6 @@ export function tokenizeRedisLine(line: string): RedisArgvResult {
     }
 
     if (escaping) {
-      if (character === "x" && index + 2 < end) {
-        const hex = line.slice(index + 1, index + 3);
-        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
-          value += String.fromCharCode(parseInt(hex, 16));
-          index += 2;
-          escaping = false;
-          continue;
-        }
-      }
       value += escapedCharacter(character);
       escaping = false;
       continue;

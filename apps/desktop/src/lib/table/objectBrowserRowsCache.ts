@@ -11,8 +11,6 @@ export interface ObjectBrowserRowsCacheScope {
   database: string;
   schema: string;
   catalog?: string;
-  oracleTriggerContract?: 1;
-  exactIdentity?: boolean;
 }
 
 export interface ObjectBrowserRowsCacheWriteToken {
@@ -39,31 +37,12 @@ function objectBrowserRowsScope(scope: ObjectBrowserRowsCacheScope): MetadataSco
     connectionId: scope.connectionId,
     database: scope.database,
     schema: scope.schema,
-    extra:
-      scope.catalog || scope.exactIdentity || scope.oracleTriggerContract !== undefined ? { catalog: scope.catalog, ...(scope.exactIdentity ? { exactIdentity: true } : {}), ...(scope.oracleTriggerContract !== undefined ? { oracleTriggerContract: scope.oracleTriggerContract } : {}) } : undefined,
+    extra: scope.catalog ? { catalog: scope.catalog } : undefined,
   };
 }
 
 function cloneRows(rows: readonly ObjectBrowserRow[]): ObjectBrowserRow[] {
-  return rows.map((row) => {
-    if (!row.trigger) return { ...row };
-    const metadata = row.trigger.oracle_metadata;
-    return {
-      ...row,
-      trigger: {
-        ...row.trigger,
-        oracle_metadata: metadata
-          ? {
-              ...metadata,
-              parent: metadata.parent ? { ...metadata.parent } : metadata.parent,
-              definition: metadata.definition ? { ...metadata.definition } : metadata.definition,
-              errors: metadata.errors?.map((error) => ({ ...error })) ?? metadata.errors,
-              reads: Object.fromEntries(Object.entries(metadata.reads).map(([field, value]) => [field, value ? { ...value } : value])),
-            }
-          : metadata,
-      },
-    };
-  });
+  return rows.map((row) => ({ ...row }));
 }
 
 function objectBrowserRowsCacheGeneration(scope: ObjectBrowserRowsCacheScope): ObjectBrowserRowsCacheGeneration {

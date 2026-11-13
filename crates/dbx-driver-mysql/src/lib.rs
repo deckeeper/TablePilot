@@ -11,7 +11,6 @@ pub mod doris;
 pub mod manticoresearch;
 pub mod mysql;
 pub mod mysql_compatible;
-mod mysql_data_charset;
 pub mod ob_oracle;
 pub mod oceanbase_mysql;
 pub mod starrocks;

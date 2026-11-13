@@ -1,6 +1,5 @@
 import { canonicalShortcutKey } from "@/lib/editor/shortcutDisplay";
 import { formatShortcut, SHORTCUT_DEFINITIONS, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
-import { MAX_QUERY_RESULT_MAX_ROWS } from "@/lib/dataGrid/queryResultRowLimit";
 import { buildSelectStarWithLimitSql, DEFAULT_SQL_SHORTCUT_SELECT_LIMIT } from "@/lib/sql/sqlDialectSelectLimit";
 import type { DatabaseType, SqlShortcutAction, SqlShortcutKind } from "@/types/database";
 import { DATABASE_TYPES } from "@/types/generated/databaseTypes";
@@ -50,9 +49,7 @@ export function resolveSqlShortcutTemplate(template: string, selectedTable: stri
 export function normalizeSqlShortcutLimit(value: unknown, fallback = DEFAULT_SQL_SHORTCUT_SELECT_LIMIT): number {
   const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   if (!Number.isFinite(n) || n < 1) return fallback;
-  // Same ceiling as queryResultMaxRows: silently clamping a configured 200000 down to
-  // 100000 made the generated LIMIT ignore the user's setting (#14149).
-  return Math.min(Math.floor(n), MAX_QUERY_RESULT_MAX_ROWS);
+  return Math.min(Math.floor(n), 100_000);
 }
 
 export function normalizeSqlShortcutKind(value: unknown): SqlShortcutKind {

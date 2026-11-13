@@ -15,7 +15,6 @@ export interface DataGridColumnLayoutHandle {
   toggleColumnVisibility: (columnIndex: number) => void;
   hideColumns: (columnIndexes: number[]) => void;
   showAllColumns: () => void;
-  showOnlyColumns?: (columnIndexes: number[]) => void;
   invertColumnVisibility: () => void;
   hasCustomColumnOrder: boolean;
   moveDisplayableColumn: (fromDisplayableIndex: number, toDisplayableIndex: number) => void;
@@ -23,9 +22,6 @@ export interface DataGridColumnLayoutHandle {
   /** Fit every visible column to its content (#9813). Optional so grids that
    *  only expose the visibility/order surface keep working. */
   autoFitAllColumns?: () => void;
-  /** Clear manual/remembered column widths and restore automatic calculation. */
-  resetColumnWidths?: () => void;
-  hasUserSizedColumns?: boolean;
 }
 
 export interface DataGridColumnLayoutVirtualWindow {

@@ -3,9 +3,8 @@ import type { useSettingsStore } from "@/stores/settingsStore";
 import type { useConnectionStore } from "@/stores/connectionStore";
 import type { QueryEditorProps, CompletionMetadataScope } from "./queryEditorTypes";
 import * as api from "@/lib/backend/api";
-import { maskSqlParametersForAnalysis, type SqlParameterOptions } from "@/lib/sql/sqlParameters";
+import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { createSqlDiagnosticAnalysisWorker } from "@/lib/sql/sqlDiagnosticAnalysisWorker";
-import { isGraphQueryDatabase } from "@/lib/graph/graphQueryProfiles";
 
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
@@ -15,14 +14,13 @@ import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { mergeSqlSemanticReferenceAnalysis } from "@/lib/sql/semantic/references";
 import { sqlServerUseDatabaseBeforeCursor } from "@/lib/sql/sqlCompletionLookupTarget";
 import { lineColumnToOffset, sqlErrorDecorationRange as resolveSqlErrorDecorationRange, sqlErrorSqlMatchesEditor } from "@/lib/sql/sqlDiagnostics";
-import { sqlErrorEditorRange } from "@/lib/sql/errorPosition";
+import { scalarPositionToUtf16Offset, sqlErrorEditorOffset } from "@/lib/sql/errorPosition";
 import { analyzeMysqlRoutineSyntax, supportsMysqlRoutineSyntaxDiagnostics } from "@/lib/sql/mysqlRoutineSyntaxDiagnostics";
 import { buildOracleSyntaxDiagnostics } from "@/lib/sql/oracleSyntaxDiagnostics";
 import { buildSqlServerRoutineSyntaxDiagnostics } from "@/lib/sql/sqlServerRoutineSyntaxDiagnostics";
 import { needsDiagnosticCaretReanchor } from "@/lib/editor/queryEditorDiagnosticCaretAnchor";
 import { metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
-import { analyzeSqlDiagnosticReferences } from "@/lib/sql/sqlDiagnosticKeywordRecovery";
 import type { SqlUnknownObjectSpan } from "@/lib/editor/codemirrorSqlUnknownObjectHighlights";
 import {
   areSqlSemanticDiagnosticsEqual,
@@ -71,7 +69,6 @@ interface QueryEditorDiagnosticsOptions {
   sqlDriverProfile: ComputedRef<string | undefined>;
   sqlStatementParameterOptions: () => SqlParameterOptions;
   sqlBehaviorDialect: () => QueryEditorProps["dialect"];
-  sqlSyntaxDialect?: () => QueryEditorProps["syntaxDialect"];
   queryEditorSelectionLanguage: () => "sql" | "text";
   semanticCompletionEnabled: boolean;
   maxCompletionTables: number;
@@ -97,12 +94,16 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
     if (!props.executionError) return [];
     if (props.executionErrorResult?.sourceStatement) {
       const sql = currentState.doc.toString();
-      const mapped = sqlErrorEditorRange({ editorSql: sql, result: props.executionErrorResult, resultIndex: props.executionErrorResult.statement_index, databaseType: props.databaseType, parameterOptions: sqlStatementParameterOptions() });
-      if (!mapped || mapped.from >= sql.length) return [];
-      return [{ ...mapped, message: props.executionError }];
+      const mapped = sqlErrorEditorOffset({ editorSql: sql, result: props.executionErrorResult, resultIndex: props.executionErrorResult.statement_index, databaseType: props.databaseType, parameterOptions: sqlStatementParameterOptions() });
+      if (!mapped || mapped.offset >= sql.length) return [];
+      const source = props.executionErrorResult.sourceStatement;
+      const sourceRange = source ? resolveSqlErrorDecorationRange(source, props.executionError) : null;
+      const sourceOffset = source ? scalarPositionToUtf16Offset(source, mapped.line, mapped.column) : undefined;
+      const width = sourceRange && sourceRange.from === sourceOffset ? sourceRange.to - sourceRange.from : (sql.codePointAt(mapped.offset) ?? 0) > 0xffff ? 2 : 1;
+      return [{ from: mapped.offset, to: Math.min(sql.length, mapped.offset + width), message: props.executionError }];
     }
     if (!props.executionErrorSql || !sqlErrorSqlMatchesEditor(currentState.doc.toString(), props.executionErrorSql)) return [];
-    const range = resolveSqlErrorDecorationRange(currentState.doc.toString(), props.executionError, props.databaseType);
+    const range = resolveSqlErrorDecorationRange(currentState.doc.toString(), props.executionError);
     if (!range) return [];
     return [
       {
@@ -118,34 +119,19 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
       line: span.start_line - 1,
       column: span.start_column - 1,
     });
-    const endLine = Math.max(span.end_line - 1, span.start_line - 1);
-    const endColumn = endLine === span.start_line - 1 ? Math.max(span.end_column, span.start_column) : span.end_column;
     const to = lineColumnToOffset(sql, {
-      line: endLine,
-      column: endColumn,
+      line: Math.max(span.end_line - 1, span.start_line - 1),
+      column: Math.max(span.end_column, span.start_column),
     });
     if (from == null || to == null || to <= from) return null;
     return { from, to };
   }
 
-  function sqlTextSpanToDocRange(doc: import("@codemirror/state").Text, span: SqlTextSpan): { from: number; to: number } | null {
-    if (!span.start_line || !span.start_column) return null;
-    if (span.start_line < 1 || span.start_line > doc.lines) return null;
-    const startLine = doc.line(span.start_line);
-    const from = Math.min(startLine.from + Math.max(0, span.start_column - 1), startLine.to);
-    const endLineNumber = Math.min(doc.lines, Math.max(span.start_line, span.end_line ?? span.start_line));
-    const endLine = doc.line(endLineNumber);
-    const rawEndCol = span.end_column ?? (endLineNumber === span.start_line ? span.start_column : endLine.length + 1);
-    const to = Math.min(endLine.from + Math.max(0, rawEndCol), endLine.to);
-    if (from >= to) return null;
-    return { from, to };
-  }
-
   function sqlSemanticDecorationRanges(currentState: import("@codemirror/state").EditorState) {
-    const doc = currentState.doc;
+    const sql = currentState.doc.toString();
     return semanticDiagnostics
       .map((diagnostic) => {
-        const range = sqlTextSpanToDocRange(doc, diagnostic.span);
+        const range = sqlTextSpanToRange(sql, diagnostic.span);
         return range
           ? {
               ...range,
@@ -223,7 +209,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
   }
 
   function shouldSkipSqlSemanticDiagnostics() {
-    return isGraphQueryDatabase(props.databaseType) || props.databaseType === "victoriametrics" || props.databaseType === "salesforce" || (props.databaseType !== "redis" && props.databaseType !== "mongodb" && !settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
+    return props.databaseType === "victoriametrics" || props.databaseType === "salesforce" || (props.databaseType !== "redis" && props.databaseType !== "mongodb" && !settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
   }
 
   function rangesOverlap(left: { from: number; to: number }, right: { from: number; to: number }): boolean {
@@ -262,10 +248,9 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
     }));
   }
 
-  function replaceSemanticDiagnosticsInRanges(next: SqlSemanticDiagnostic[], ranges: readonly { from: number; to: number }[], fullSql: string) {
-    const doc = view.value?.state.doc;
+  function replaceSemanticDiagnosticsInRanges(next: SqlSemanticDiagnostic[], ranges: readonly SqlTextRange[], fullSql: string) {
     const retained = semanticDiagnostics.filter((diagnostic) => {
-      const diagnosticRange = doc ? sqlTextSpanToDocRange(doc, diagnostic.span) : sqlTextSpanToRange(fullSql, diagnostic.span);
+      const diagnosticRange = sqlTextSpanToRange(fullSql, diagnostic.span);
       return !diagnosticRange || !ranges.some((range) => rangesOverlap(diagnosticRange, range));
     });
     setSemanticDiagnostics([...retained, ...next].sort(compareSqlSemanticDiagnostics));
@@ -372,10 +357,6 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
       return;
     }
     if (props.databaseType === "mongodb") {
-      if (props.mongoQueryLanguage === "sql") {
-        setSemanticDiagnostics([]);
-        return;
-      }
       // Shell commands have no SQL semantics; surface the parser's own diagnosis instead of waiting for Run.
       const cursor = currentView.state.selection.main.head;
       setSemanticDiagnostics(buildMongoSyntaxDiagnostics(sql, cursor));
@@ -383,29 +364,13 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
     }
     if (props.databaseType === "redis") {
       // Redis has no SQL semantics; run command-name / arity / quote / danger checks instead.
-      if (!shouldRunRedisDiagnostics(currentView.state.doc, currentView.state.selection.main.head)) {
+      if (!shouldRunRedisDiagnostics(sql, currentView.state.selection.main.head)) {
         scheduleSemanticDiagnostics(900, {
           preserveOutsideRanges: refreshOptions.preserveOutsideRanges,
         });
         return;
       }
-      const backgroundAnalysis = options.boundedAnalysisEnabled?.() === true;
-      if (backgroundAnalysis) {
-        const visibleRanges = currentView.visibleRanges.length > 0 ? currentView.visibleRanges : [currentView.viewport];
-        const lineRanges = visibleRanges.map((r) => ({
-          startLine: currentView.state.doc.lineAt(r.from).number,
-          endLine: currentView.state.doc.lineAt(r.to).number,
-        }));
-        const nextDiagnostics = buildRedisSyntaxDiagnostics(currentView.state.doc, lineRanges);
-        if (refreshOptions.preserveOutsideRanges) {
-          const textRanges: SqlTextRange[] = visibleRanges.map((r) => ({ from: r.from, to: r.to, sql: sql.slice(r.from, r.to) }));
-          replaceSemanticDiagnosticsInRanges(nextDiagnostics, textRanges, sql);
-        } else {
-          setSemanticDiagnostics(nextDiagnostics.sort(compareSqlSemanticDiagnostics));
-        }
-        return;
-      }
-      setSemanticDiagnostics(buildRedisSyntaxDiagnostics(currentView.state.doc));
+      setSemanticDiagnostics(buildRedisSyntaxDiagnostics(sql));
       return;
     }
     if (shouldSkipSqlSemanticDiagnostics()) {
@@ -468,27 +433,27 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
     for (const range of diagnosticRanges) {
       if (mysqlRoutineAnalysis?.routineRanges.some((routineRange) => rangesOverlap(routineRange, range))) continue;
       try {
-        const analysisSql = maskSqlParametersForAnalysis(range.sql, sqlStatementParameterOptions());
-        const referenceDialect = sqlReferenceAnalysisDialectFor({
-          databaseType: props.databaseType,
-          identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
-          fallbackDialect: props.databaseType === "kingbase" ? (options.sqlSyntaxDialect?.() ?? sqlBehaviorDialect() ?? "postgres") : (props.formatDialect ?? props.dialect ?? "generic"),
-        });
-        const { analysis, keywordDiagnostic } = await analyzeSqlDiagnosticReferences(analysisSql, referenceDialect, (statement) => api.analyzeSqlReferences(statement, referenceDialect));
+        const analysis = await api.analyzeSqlReferences(
+          range.sql,
+          sqlReferenceAnalysisDialectFor({
+            databaseType: props.databaseType,
+            identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
+            fallbackDialect: props.formatDialect ?? props.dialect ?? "generic",
+          }),
+        );
         if (runId !== semanticDiagnosticRunId) return;
-        if (keywordDiagnostic) nextDiagnostics.push(...offsetSqlSemanticDiagnostics([keywordDiagnostic], range, sql));
 
         const semanticCursor = Math.max(0, Math.min(currentView.state.selection.main.head - range.from, range.sql.length));
         const semanticModel =
-          SEMANTIC_SQL_COMPLETION_ENABLED && !backgroundAnalysis && !keywordDiagnostic
-            ? buildSqlSemanticModel(analysisSql, semanticCursor, {
+          SEMANTIC_SQL_COMPLETION_ENABLED && !backgroundAnalysis
+            ? buildSqlSemanticModel(range.sql, semanticCursor, {
                 databaseType: props.databaseType,
                 dialect: sqlBehaviorDialect(),
               })
             : null;
         const semanticAnalysis =
-          SEMANTIC_SQL_COMPLETION_ENABLED && backgroundAnalysis && !keywordDiagnostic
-            ? (await diagnosticAnalysisWorker.analyze({ sql: analysisSql, cursor: semanticCursor, databaseType: props.databaseType, dialect: sqlBehaviorDialect(), visibleRanges: [], referenceAnalysis: analysis }))?.referenceAnalysis
+          SEMANTIC_SQL_COMPLETION_ENABLED && backgroundAnalysis
+            ? (await diagnosticAnalysisWorker.analyze({ sql: range.sql, cursor: semanticCursor, databaseType: props.databaseType, dialect: sqlBehaviorDialect(), visibleRanges: [], referenceAnalysis: analysis }))?.referenceAnalysis
             : semanticModel
               ? mergeSqlSemanticReferenceAnalysis(analysis, semanticModel)
               : analysis;
@@ -496,7 +461,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
         const metadataScope = semanticDiagnosticMetadataScope(sql, range);
         const scopedAnalysis = {
           ...semanticAnalysis,
-          tables: semanticDiagnosticTablesForScope(semanticAnalysis.tables, metadataScope, analysisSql),
+          tables: semanticDiagnosticTablesForScope(semanticAnalysis.tables, metadataScope, range.sql),
         };
         const { tables, missingTables } = await enrichSemanticDiagnosticTables(scopedAnalysis.tables, metadataScope);
         const columnMetadataMissingTables = await ensureColumnsForSemanticDiagnostics(tables, metadataScope);
@@ -514,7 +479,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
               columnsByTable: metadata.cachedColumnsByTable,
               missingTables,
               loadedColumnTables: metadata.loadedColumnsByTable,
-              sql: analysisSql,
+              sql: range.sql,
               databaseType: props.databaseType,
               currentSchema: metadataScope.schema,
             }),
@@ -578,7 +543,6 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
   async function loadSqlUnknownObjectSpans(currentView: EditorViewType): Promise<SqlUnknownObjectSpan[]> {
     if (!SQL_UNKNOWN_OBJECT_HIGHLIGHT_ENABLED || !runtime.editorIsActive) return [];
     if (options.queryEditorSelectionLanguage() !== "sql") return [];
-    if (props.databaseType === "mongodb") return [];
     if (shouldSkipSqlSemanticDiagnostics()) return [];
     if (props.databaseType && NON_SQL_UNKNOWN_OBJECT_DATABASE_TYPES.has(props.databaseType)) return [];
     if (!props.connectionId || props.database == null) return [];
@@ -593,7 +557,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
     const ranges = sqlSemanticDiagnosticRangesForViewport(sql, [{ from: 0, to: sql.length }], props.databaseType, props.databaseType === "sqlserver" ? undefined : runtime.executableStatementRangeCache?.ranges, sqlStatementParameterOptions()).slice(0, MAX_SQL_UNKNOWN_OBJECT_STATEMENTS);
     if (ranges.length === 0) return [];
 
-    const metadataEpoch = `${resolveSqlDialectId({ databaseType: props.databaseType, dialect: sqlBehaviorDialect() })}|${props.connectionId}|${props.database}|${props.schema ?? ""}|${props.databaseType}|${semanticDiagnosticRunId}|${metadata.cachedColumnsByTable.size}:${metadata.loadedColumnsByTable.size}|${JSON.stringify(sqlStatementParameterOptions())}`;
+    const metadataEpoch = `${resolveSqlDialectId({ databaseType: props.databaseType, dialect: sqlBehaviorDialect() })}|${props.connectionId}|${props.database}|${props.schema ?? ""}|${props.databaseType}|${semanticDiagnosticRunId}|${metadata.cachedColumnsByTable.size}:${metadata.loadedColumnsByTable.size}`;
 
     const spans: SqlUnknownObjectSpan[] = [];
     let analyzedStatements = 0;
@@ -611,33 +575,28 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
 
       const statementSpans: SqlUnknownObjectSpan[] = [];
       try {
-        const analysisSql = maskSqlParametersForAnalysis(range.sql, sqlStatementParameterOptions());
-        const referenceDialect = sqlReferenceAnalysisDialectFor({
-          databaseType: props.databaseType,
-          identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
-          fallbackDialect: props.databaseType === "kingbase" ? (options.sqlSyntaxDialect?.() ?? sqlBehaviorDialect() ?? "postgres") : (props.formatDialect ?? props.dialect ?? "generic"),
-        });
-        const { analysis, keywordDiagnostic } = await analyzeSqlDiagnosticReferences(analysisSql, referenceDialect, (statement) => api.analyzeSqlReferences(statement, referenceDialect));
+        const analysis = await api.analyzeSqlReferences(
+          range.sql,
+          sqlReferenceAnalysisDialectFor({
+            databaseType: props.databaseType,
+            identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
+            fallbackDialect: props.formatDialect ?? props.dialect ?? "generic",
+          }),
+        );
         if (currentView.state.doc !== doc) return [];
-        if (keywordDiagnostic) {
-          const [diagnostic] = offsetSqlSemanticDiagnostics([keywordDiagnostic], range, sql);
-          const offsetRange = sqlTextSpanToRange(sql, diagnostic.span);
-          if (offsetRange) statementSpans.push(offsetRange);
-        }
 
         const semanticCursor = Math.max(0, Math.min(currentView.state.selection.main.head - range.from, range.sql.length));
-        const semanticModel =
-          SEMANTIC_SQL_COMPLETION_ENABLED && !keywordDiagnostic
-            ? buildSqlSemanticModel(analysisSql, semanticCursor, {
-                databaseType: props.databaseType,
-                dialect: sqlBehaviorDialect(),
-              })
-            : null;
+        const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED
+          ? buildSqlSemanticModel(range.sql, semanticCursor, {
+              databaseType: props.databaseType,
+              dialect: sqlBehaviorDialect(),
+            })
+          : null;
         const semanticAnalysis = semanticModel ? mergeSqlSemanticReferenceAnalysis(analysis, semanticModel) : analysis;
         const metadataScope = semanticDiagnosticMetadataScope(sql, range);
         const scopedAnalysis = {
           ...semanticAnalysis,
-          tables: semanticDiagnosticTablesForScope(semanticAnalysis.tables, metadataScope, analysisSql),
+          tables: semanticDiagnosticTablesForScope(semanticAnalysis.tables, metadataScope, range.sql),
         };
         const { tables, missingTables } = await enrichSemanticDiagnosticTables(scopedAnalysis.tables, metadataScope);
         const loadedColumnsBefore = metadata.loadedColumnsByTable.size;
@@ -656,7 +615,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
               columnsByTable: metadata.cachedColumnsByTable,
               missingTables,
               loadedColumnTables: metadata.loadedColumnsByTable,
-              sql: analysisSql,
+              sql: range.sql,
               databaseType: props.databaseType,
               currentSchema: metadataScope.schema,
             },
@@ -668,13 +627,8 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
           const offsetRange = sqlTextSpanToRange(sql, diagnostic.span);
           if (offsetRange) statementSpans.push(offsetRange);
         }
-      } catch (error) {
-        const diagnostic = buildSqlParserErrorDiagnostic(error, range.sql);
-        if (diagnostic) {
-          const [offsetDiagnostic] = offsetSqlSemanticDiagnostics([diagnostic], range, sql);
-          const offsetRange = sqlTextSpanToRange(sql, offsetDiagnostic.span);
-          if (offsetRange) statementSpans.push(offsetRange);
-        }
+      } catch {
+        // A failed parse must not colour anything.
       }
 
       analyzedStatements += 1;

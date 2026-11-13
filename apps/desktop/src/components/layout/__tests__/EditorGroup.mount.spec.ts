@@ -96,7 +96,7 @@ describe("EditorGroup mount contract", () => {
 
   it.each(["query", "data"] as const)("reuses hot %s tabs and remounts evicted surfaces", async (mode) => {
     const store = useQueryStore();
-    const tabIds = ["tab-a", "tab-b", "tab-c", "tab-d", "tab-e", "tab-f", "tab-g"];
+    const tabIds = ["tab-a", "tab-b", "tab-c", "tab-d"];
     store.tabs = tabIds.map((tabId) => tab(tabId, mode));
     const activeTabId = ref("tab-a");
     const host = createHost();
@@ -126,35 +126,36 @@ describe("EditorGroup mount contract", () => {
     app.mount(host);
     await nextTick();
 
-    for (const tabId of ["tab-b", "tab-c", "tab-d", "tab-e", "tab-f"]) {
-      activeTabId.value = tabId;
-      await nextTick();
-    }
-    expect(lifecycle.surfaceCreated).toBe(6);
-    expect(lifecycle.surfaceUnmounted).toBe(0);
-
+    activeTabId.value = "tab-b";
+    await nextTick();
     activeTabId.value = "tab-a";
     await nextTick();
-    expect(lifecycle.surfaceCreated).toBe(6);
+
+    expect(lifecycle.surfaceCreated).toBe(2);
     expect(lifecycle.surfaceUnmounted).toBe(0);
 
-    activeTabId.value = "tab-g";
+    activeTabId.value = "tab-c";
     await nextTick();
-    expect(lifecycle.surfaceCreated).toBe(7);
+    expect(lifecycle.surfaceCreated).toBe(3);
+    expect(lifecycle.surfaceUnmounted).toBe(0);
+
+    activeTabId.value = "tab-d";
+    await nextTick();
+    expect(lifecycle.surfaceCreated).toBe(4);
     expect(lifecycle.surfaceUnmounted).toBe(1);
 
     activeTabId.value = "tab-a";
     await nextTick();
-    expect(lifecycle.surfaceCreated).toBe(7);
+    expect(lifecycle.surfaceCreated).toBe(4);
     expect(lifecycle.surfaceUnmounted).toBe(1);
 
     activeTabId.value = "tab-b";
     await nextTick();
-    expect(lifecycle.surfaceCreated).toBe(8);
+    expect(lifecycle.surfaceCreated).toBe(5);
     expect(lifecycle.surfaceUnmounted).toBe(2);
 
     app.unmount();
-    expect(lifecycle.surfaceUnmounted).toBe(8);
+    expect(lifecycle.surfaceUnmounted).toBe(5);
     host.remove();
   });
 
@@ -201,7 +202,6 @@ describe("EditorGroup mount contract", () => {
       ...createNoopEditorToolbarActions(),
       captureExecutionSnapshot: vi.fn(),
       toolbarExecute: vi.fn(),
-      toolbarExecuteAll: vi.fn(),
       toolbarExecuteInNewResultTab: vi.fn(),
       cancelExecution: vi.fn(),
       explain: vi.fn(),
@@ -238,7 +238,6 @@ describe("EditorGroup mount contract", () => {
     // Toolbar events flow to the injected actions with the group's tab id.
     (toolbar as any).__vueParentComponent.emit("executePointerDown");
     (toolbar as any).__vueParentComponent.emit("toolbarExecute", "pointer");
-    (toolbar as any).__vueParentComponent.emit("toolbarExecuteAll", "pointer");
     (toolbar as any).__vueParentComponent.emit("toolbarExecuteInNewResultTab", "pointer");
     (toolbar as any).__vueParentComponent.emit("cancel");
     (toolbar as any).__vueParentComponent.emit("explain");
@@ -249,7 +248,6 @@ describe("EditorGroup mount contract", () => {
     await nextTick();
     expect(actions.captureExecutionSnapshot).toHaveBeenCalledWith(queryId);
     expect(actions.toolbarExecute).toHaveBeenCalledWith("pointer", queryId);
-    expect(actions.toolbarExecuteAll).toHaveBeenCalledWith("pointer", queryId);
     expect(actions.toolbarExecuteInNewResultTab).toHaveBeenCalledWith("pointer", queryId);
     expect(actions.cancelExecution).toHaveBeenCalledWith(queryId);
     expect(actions.explain).toHaveBeenCalledWith(queryId);

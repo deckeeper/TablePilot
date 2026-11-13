@@ -533,8 +533,7 @@ export function useQueryEditorBatchSelection(options: QueryEditorBatchSelectionO
     const session = batchColumnSelectionSession;
     if (!session || session.key !== item.sessionKey || session.document !== view.state.doc.toString()) return;
 
-    const includeComments = settingsStore.editorSettings.batchColumnSelectionIncludeComments;
-    const selected = session.candidates.filter((candidate) => session.selectedKeys.has(candidate.key)).map((candidate) => (includeComments ? candidate : { ...candidate, comment: undefined }));
+    const selected = session.candidates.filter((candidate) => session.selectedKeys.has(candidate.key));
     if (selected.length === 0) {
       toast(t("editor.completion.selectColumnsBeforeInsert"), 3000);
       return;

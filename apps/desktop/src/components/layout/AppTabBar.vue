@@ -70,9 +70,6 @@ function setTabBarTarget(groupId: string, element: unknown) {
 const closeConfirmDirtyCount = computed(() => queryStore.closeConfirmDirtyTabIds.length);
 const showCloseConfirmBulkActions = computed(() => closeConfirmDirtyCount.value > 1);
 const closeConfirmDirtyTabs = computed(() => queryStore.closeConfirmDirtyTabIds.map((id) => queryStore.tabs.find((tab) => tab.id === id)).filter((tab): tab is NonNullable<ReturnType<typeof queryStore.tabs.find>> => !!tab));
-const closeHasTypeRecovery = computed(() => closeConfirmDirtyTabs.value.some((tab) => tab.typeManagementDraft && tab.typeManagementDraft.state !== "complete"));
-const closeConfirmCurrentTab = computed(() => closeConfirmDirtyTabs.value.find((tab) => tab.id === queryStore.pendingCloseTabId) ?? closeConfirmDirtyTabs.value[0]);
-const closeCurrentHasTypeRecovery = computed(() => closeConfirmCurrentTab.value?.typeManagementDraft && closeConfirmCurrentTab.value.typeManagementDraft.state !== "complete");
 // Numbered across every open tab so unsaved-change confirmations show the
 // same suffixed titles as the tab strip.
 const tabTitles = computed(() => tabDisplayTitles(queryStore.tabs, t));
@@ -80,7 +77,7 @@ function closeConfirmTabTitle(tab: QueryTab): string {
   return tabTitles.value.get(tab.id) ?? tabDisplayTitle(tab, t);
 }
 const closeConfirmCurrentTitle = computed(() => {
-  const focusedTab = closeConfirmCurrentTab.value;
+  const focusedTab = closeConfirmDirtyTabs.value.find((tab) => tab.id === queryStore.pendingCloseTabId) ?? closeConfirmDirtyTabs.value[0];
   return focusedTab ? closeConfirmTabTitle(focusedTab) : "";
 });
 const closeConfirmMessage = computed(() => {
@@ -230,7 +227,7 @@ function handleCancelClose() {
     :open="queryStore.showCloseConfirm"
     @update:open="
       (open) => {
-        if (!open) handleCancelClose();
+        if (!open) queryStore.cancelClosePendingTab();
       }
     "
   >
@@ -245,7 +242,6 @@ function handleCancelClose() {
       <!-- 限制最大高度并允许滚动，确保内容超长时底部操作按钮始终可见可点-->
       <div class="max-h-120 min-h-0 min-w-0 overflow-y-auto space-y-2">
         <p class="wrap-anywhere text-sm text-muted-foreground">{{ closeConfirmMessage }}</p>
-        <p v-if="closeHasTypeRecovery" role="alert" class="wrap-anywhere text-sm text-destructive">{{ t("objects.typeManagementCloseWarning") }}</p>
         <Popover v-if="showCloseConfirmBulkActions" :open="closeConfirmListOpen" @update:open="closeConfirmListOpen = $event">
           <PopoverTrigger as-child>
             <button
@@ -275,9 +271,9 @@ function handleCancelClose() {
       <DialogFooter class="min-w-0 sm:flex-wrap">
         <Button variant="outline" @click="handleCancelClose">{{ t("common.cancel") }}</Button>
         <Button v-if="showCloseConfirmBulkActions" variant="secondary" class="border-border" @click="handleDiscardAllAndClose">{{ t("editor.discardAllChanges") }}</Button>
-        <Button v-if="showCloseConfirmBulkActions && !closeHasTypeRecovery" @click="handleSaveAllAndClose">{{ t("editor.saveAllChanges") }}</Button>
-        <Button variant="secondary" class="border-border" @click="handleDiscardAndClose">{{ t(closeCurrentHasTypeRecovery ? "objects.typeManagementDiscardClose" : "editor.discardChanges") }}</Button>
-        <Button v-if="!closeCurrentHasTypeRecovery" @click="handleSaveAndClose">{{ t("savedSql.save") }}</Button>
+        <Button v-if="showCloseConfirmBulkActions" @click="handleSaveAllAndClose">{{ t("editor.saveAllChanges") }}</Button>
+        <Button variant="secondary" class="border-border" @click="handleDiscardAndClose">{{ t("editor.discardChanges") }}</Button>
+        <Button @click="handleSaveAndClose">{{ t("savedSql.save") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

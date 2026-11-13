@@ -1,10 +1,9 @@
-import { markRaw, reactive, shallowReactive } from "vue";
+import { reactive, shallowReactive } from "vue";
 import { uuid } from "@/lib/common/utils";
 import * as api from "@/lib/backend/api";
 import { openDataCompareSession } from "@/composables/useDialogSources";
 import { useExportTracker } from "@/composables/useExportTracker";
-import { inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeKeyColumns, type DataCompareFromTablesPreparation, type DataCompareResult, type DataCompareSyncPlan, type DataCompareSyncPlanTableOptions } from "@/lib/dataGrid/dataCompare";
-import { createDataCompareSelection, selectedCompareRows, type DataCompareSelection } from "@/lib/dataGrid/dataCompareSelection";
+import { inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeKeyColumns, type DataCompareCellValue, type DataCompareFromTablesPreparation, type DataCompareResult, type DataCompareSyncPlan, type DataCompareSyncPlanTableOptions } from "@/lib/dataGrid/dataCompare";
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 
 export type CompareColumn = ColumnInfo;
@@ -23,6 +22,28 @@ export interface DataCompareTableTask {
 
 export type DataCompareTableStatus = "different" | "same" | "error";
 export type DiffKind = "added" | "removed" | "modified";
+
+export interface SelectableDataCompareRow {
+  key: string;
+  keyValues: Record<string, DataCompareCellValue>;
+  values: Record<string, DataCompareCellValue>;
+  selected: boolean;
+}
+
+export interface SelectableDataCompareModifiedRow {
+  key: string;
+  keyValues: Record<string, DataCompareCellValue>;
+  sourceValues: Record<string, DataCompareCellValue>;
+  targetValues: Record<string, DataCompareCellValue>;
+  changes: { column: string; source: DataCompareCellValue; target: DataCompareCellValue }[];
+  selected: boolean;
+}
+
+export interface SelectableDataCompareResult {
+  added: SelectableDataCompareRow[];
+  removed: SelectableDataCompareRow[];
+  modified: SelectableDataCompareModifiedRow[];
+}
 
 export interface DataCompareTableResult {
   sourceTable: string;
@@ -43,8 +64,7 @@ export interface DataCompareTableResult {
   syncEligible: boolean;
   databaseType?: DatabaseType;
   preSyncStatements?: string[];
-  diff: DataCompareResult;
-  selection: Record<DiffKind, DataCompareSelection>;
+  diff: SelectableDataCompareResult;
   expanded: boolean;
   showAll: Record<DiffKind, boolean>;
   error?: string;
@@ -160,17 +180,12 @@ function compareErrorMessage(dependencies: DataCompareSessionDependencies, kind:
   return dependencies.formatError?.(kind, columns) ?? fallbackCompareErrorMessage(kind, columns);
 }
 
-function tableResult(result: Omit<DataCompareTableResult, "selection">): DataCompareTableResult {
-  return shallowReactive({
-    ...result,
-    diff: markRaw(result.diff),
-    showAll: reactive(result.showAll),
-    selection: {
-      added: createDataCompareSelection(result.syncEligible),
-      removed: createDataCompareSelection(result.syncEligible),
-      modified: createDataCompareSelection(result.syncEligible),
-    },
-  });
+function toSelectableDiff(diff: DataCompareResult, selected: boolean): SelectableDataCompareResult {
+  return {
+    added: diff.added.map((row) => ({ ...row, selected })),
+    removed: diff.removed.map((row) => ({ ...row, selected })),
+    modified: diff.modified.map((row) => ({ ...row, selected })),
+  };
 }
 
 export function buildDataCompareSyncPlanTables(results: DataCompareTableResult[], targetSchema: string): DataCompareSyncPlanTableOptions[] {
@@ -183,9 +198,9 @@ export function buildDataCompareSyncPlanTables(results: DataCompareTableResult[]
       keyColumns: table.keyColumns,
       columnInfo: table.columnInfo,
       diff: {
-        added: selectedCompareRows(table.diff.added, table.selection.added),
-        removed: selectedCompareRows(table.diff.removed, table.selection.removed),
-        modified: selectedCompareRows(table.diff.modified, table.selection.modified),
+        added: table.diff.added.filter((row) => row.selected).map(({ selected: _selected, ...row }) => row),
+        removed: table.diff.removed.filter((row) => row.selected).map(({ selected: _selected, ...row }) => row),
+        modified: table.diff.modified.filter((row) => row.selected).map(({ selected: _selected, ...row }) => row),
       },
       databaseType: table.databaseType,
       preSyncStatements: table.preSyncStatements ?? [],
@@ -239,7 +254,7 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
   const removed = preparation.result.removed.length;
   const modified = preparation.result.modified.length;
   const status: DataCompareTableStatus = added || removed || modified ? "different" : "same";
-  return tableResult({
+  return {
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
@@ -257,14 +272,14 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
     syncEligible: preparation.syncEligible,
     databaseType,
     preSyncStatements: preparation.preSyncStatements,
-    diff: preparation.result,
+    diff: toSelectableDiff(preparation.result, preparation.syncEligible),
     expanded: status === "different",
     showAll: { added: false, removed: false, modified: false },
-  });
+  };
 }
 
 function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataCompareFromTablesPreparation, sourceColumns: CompareColumn[], keyColumns: string[], databaseType: DatabaseType | undefined): DataCompareTableResult {
-  return tableResult({
+  return {
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
@@ -282,14 +297,14 @@ function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataC
     syncEligible: preparation.syncEligible,
     databaseType,
     preSyncStatements: preparation.preSyncStatements,
-    diff: preparation.result,
+    diff: toSelectableDiff(preparation.result, preparation.syncEligible),
     expanded: preparation.result.added.length > 0,
     showAll: { added: false, removed: false, modified: false },
-  });
+  };
 }
 
 function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], databaseType: DatabaseType | undefined, error: unknown): DataCompareTableResult {
-  return tableResult({
+  return {
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
@@ -311,7 +326,7 @@ function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], data
     expanded: false,
     showAll: { added: false, removed: false, modified: false },
     error: sessionError(error),
-  });
+  };
 }
 
 /**

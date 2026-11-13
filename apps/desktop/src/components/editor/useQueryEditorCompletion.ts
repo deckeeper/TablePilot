@@ -1,12 +1,10 @@
 import { type RoutineCompletionTarget } from "./useQueryEditorCompletionMetadata";
 import { computed } from "vue";
-import { pickedCompletion, type CompletionContext } from "@codemirror/autocomplete";
-import { EditorSelection, StateEffect, Transaction, type ChangeSet } from "@codemirror/state";
+import type { CompletionContext } from "@codemirror/autocomplete";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { type QueryCompletionItem, type BatchColumnSelectionActionItem } from "./useQueryEditorBatchSelection";
 import type { CompletionMetadataScope } from "./queryEditorTypes";
 import { completionMatchRanges } from "@/lib/common/completionMatch";
-import { matchesIdentifierSearch } from "@/lib/sql/identifierSearch";
 import {
   buildSqlCompletionItemsFromContext,
   buildPostgresSequenceLiteralCompletionItems,
@@ -15,7 +13,6 @@ import {
   isSqlLikeCompletionStatement,
   normalizeIdentifierPart,
   prepareSqlCompletionReplacement,
-  quotedCompletionFilterPrefix,
   recordCompletionSelection,
   shouldAutoOpenSqlCompletion,
   shouldChainSqlCompletionAfterAccept,
@@ -47,7 +44,7 @@ import {
   sqlServerUseCompletionDatabaseNames,
   sqlServerUseDatabaseBeforeCursor,
 } from "@/lib/sql/sqlCompletionLookupTarget";
-import { appendSqlCompletionSpace, additionalSnippetApplyTargets } from "@/lib/editor/sqlCompletionInsertion";
+import { appendSqlCompletionSpace } from "@/lib/editor/sqlCompletionInsertion";
 import { completionReplacementTo, shouldResolveSqlColumnCompletion } from "@/lib/editor/batchColumnSelection";
 import { completionLabelPresentation } from "@/lib/editor/sqlCompletionPresentation";
 import { supportsDatabaseNameCompletion } from "@/lib/database/databaseFeatureSupport";
@@ -55,9 +52,7 @@ import { sqlSnippetDatabaseTypeForConnection } from "@/lib/database/jdbcDialect"
 import { oracleDatabaseLinkCompletionItems } from "@/lib/sql/oracleDatabaseLinkCompletion";
 import { isOracleCompletionDatabase, isSequenceCompletionDatabase } from "@/lib/sql/oracleCompletionSession";
 import { buildRedisCompletionItemsFromContext, getRedisCompletionContext, getRedisCompletionResultValidFor, shouldAutoOpenRedisCompletion, takesKeyArgument } from "@/lib/redis/redisCompletion";
-import { buildGraphCompletionItems, getGraphCompletionContext, graphCompletionValidFor, shouldAutoOpenGraphCompletion } from "@/lib/graph/graphCompletion";
-import { isGraphQueryDatabase, type GraphQueryDatabase } from "@/lib/graph/graphQueryLanguage";
-import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
+import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject } from "@/lib/sql/sqlCompletion";
 import type { CompletionAssistantObjectKind, SqlServerCompletionContext } from "@/types/database";
 import type { ShallowRef, ComputedRef } from "vue";
 import type { Composer } from "vue-i18n";
@@ -90,86 +85,6 @@ interface QueryEditorCompletionOptions {
   maxCompletionTables: number;
   onDemandTableLimit: number;
   semanticCompletionEnabled: boolean;
-}
-
-/**
- * Applies one snippet acceptance to the main selection and every additional
- * cursor that carries the same typed prefix, as a single transaction.
- *
- * CodeMirror's snippet apply dispatches its own transaction and keeps exactly
- * one active snippet session. Calling it repeatedly (the previous approach)
- * split one acceptance into several undo steps and left the session on the
- * first document target. Here each apply runs against a captured transaction,
- * the change sets are composed into one edit, and only the main target's
- * selection/effects (its snippet session) are dispatched. Tab field navigation
- * therefore stays on the line the user typed in, while Undo/Redo treats all
- * expanded lines as one edit.
- */
-function applySnippetWithAdditionalCursors(view: EditorViewType, originalApply: (view: EditorViewType, completion: unknown, from: number, to: number) => void, completionItem: unknown, from: number, to: number, replaceTo: number): void {
-  const extraTargets = additionalSnippetApplyTargets(view.state, from, to);
-  if (extraTargets.length === 0) {
-    originalApply(view, completionItem, from, replaceTo);
-    return;
-  }
-
-  let combinedChanges: ChangeSet | undefined;
-  let workingState = view.state;
-  let appendConfig: StateEffect<unknown> | undefined;
-  const applyCaptured = (targetFrom: number, targetTo: number): Transaction => {
-    let captured: Transaction | undefined;
-    const captureView = {
-      state: workingState,
-      dispatch(transaction: Transaction) {
-        captured = transaction;
-      },
-    } as unknown as EditorViewType;
-    originalApply(captureView, completionItem, targetFrom, targetTo);
-    if (!captured) throw new Error("snippet apply did not produce a transaction");
-    const transaction = captured;
-    // The first apply sees the real editor state, so its appendConfig effect is
-    // exactly the snippet field/keymap installation the final dispatch needs.
-    // Later applies already run against a captured state that has the field.
-    if (!appendConfig) {
-      appendConfig = transaction.effects.find((effect) => effect.is(StateEffect.appendConfig));
-    }
-    combinedChanges = combinedChanges ? combinedChanges.compose(transaction.changes) : transaction.changes;
-    workingState = transaction.state;
-    return transaction;
-  };
-
-  for (const target of [...extraTargets].sort((left, right) => left.from - right.from)) {
-    const targetFrom = combinedChanges ? combinedChanges.mapPos(target.from, 1) : target.from;
-    const targetTo = combinedChanges ? combinedChanges.mapPos(target.to, 1) : target.to;
-    applyCaptured(targetFrom, targetTo);
-  }
-  if (combinedChanges) {
-    // Snippet apply reads the current main selection and extends a completion
-    // range that starts exactly at it. After expanding an earlier target the
-    // captured state's main selection is that target's placeholder, so the
-    // main range could swallow the text just inserted next to it. Restore the
-    // original main selection (mapped through the expansions) before applying
-    // the main target.
-    const originalMain = view.state.selection.main;
-    const mappedMain = EditorSelection.single(combinedChanges.mapPos(originalMain.from, 1), combinedChanges.mapPos(originalMain.to, 1));
-    workingState = workingState.update({ selection: mappedMain }).state;
-  }
-  const mainFrom = combinedChanges ? combinedChanges.mapPos(from, 1) : from;
-  const mainTo = combinedChanges ? combinedChanges.mapPos(replaceTo, 1) : replaceTo;
-  const main = applyCaptured(mainFrom, mainTo);
-  const picked = main.annotation(pickedCompletion);
-  const addToHistory = main.annotation(Transaction.addToHistory);
-
-  view.dispatch(
-    view.state.update({
-      changes: combinedChanges!,
-      selection: main.selection,
-      effects: [...(appendConfig ? [appendConfig] : []), ...main.effects],
-      annotations: picked ? pickedCompletion.of(picked) : undefined,
-      userEvent: "input.complete",
-      ...(addToHistory === false ? { addToHistory: false } : {}),
-      scrollIntoView: main.scrollIntoView,
-    }),
-  );
 }
 
 export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) {
@@ -363,29 +278,20 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     return true;
   }
 
-  function buildCompletionResult(sourceItems: Array<QueryCompletionItem | BatchColumnSelectionActionItem>, from: number, validFor?: RegExp, prefix?: string, queryText?: string) {
+  function buildCompletionResult(sourceItems: Array<QueryCompletionItem | BatchColumnSelectionActionItem>, from: number, validFor?: RegExp, prefix?: string) {
     const items = filterExcludedCompletions(sourceItems, excludedCompletionLabelSet(settingsStore.editorSettings.excludedCompletionItems));
     if (items.length === 0) return null;
-    const matcherBypass = !!prefix && shouldBypassCompletionFilter(prefix, items);
-    // CodeMirror matches each label against `queryText` (the document span from
-    // `from` to the cursor). Inside a quoted identifier that span keeps the
-    // opening quote, so no label ever matches and the menu comes up empty
-    // (#12008). The provider already filtered by the unquoted prefix, so take
-    // over matching for exactly that case, like the Han/pinyin bypass does.
-    const quotedBypassPrefix = prefix && queryText ? quotedCompletionFilterPrefix(queryText, prefix) : undefined;
-    const bypassFilter = matcherBypass || !!quotedBypassPrefix;
-    const resultItems = matcherBypass && prefix ? completionItemsForBypassedFilter(prefix, items) : items;
+    const bypassFilter = !!prefix && shouldBypassCompletionFilter(prefix, items);
+    const resultItems = bypassFilter && prefix ? completionItemsForBypassedFilter(prefix, items) : items;
     return {
       from,
       // Keep CodeMirror's live filtering enabled so an already-open menu follows the typed prefix.
       options: resultItems.map((item) => completionOptionForItem(item)),
-      validFor: bypassFilter ? undefined : validFor,
+      validFor,
       // When bypassing CodeMirror's matcher, supply our own highlight ranges so
       // the matched characters (Han substring or pinyin initials) stay marked.
       // Ranges must target the rendered text, which is displayLabel when set.
-      ...(bypassFilter && prefix
-        ? { filter: false as const, getMatch: (option: { label: string; displayLabel?: string }) => completionMatchRanges(option.displayLabel ?? option.label, prefix, typeof settingsStore !== "undefined" ? settingsStore?.editorSettings?.completionMatchMode : undefined) }
-        : {}),
+      ...(bypassFilter && prefix ? { filter: false as const, getMatch: (option: { label: string; displayLabel?: string }) => completionMatchRanges(option.displayLabel ?? option.label, prefix) } : {}),
     };
   }
 
@@ -417,14 +323,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           },
         ]
       : [];
-    return buildCompletionResult(actions.length > 0 ? [...replacement.items, ...actions] : replacement.items, replacement.from, getSqlCompletionResultValidFor(fullDoc, position), completionContext.prefix, fullDoc.slice(replacement.from, position));
-  }
-
-  function itemHasHanText(item: QueryCompletionItem | BatchColumnSelectionActionItem): boolean {
-    if (/\p{Script=Han}/u.test(item.label)) return true;
-    if ("comment" in item && typeof item.comment === "string" && /\p{Script=Han}/u.test(item.comment)) return true;
-    if (typeof item.detail === "string" && /\p{Script=Han}/u.test(item.detail)) return true;
-    return false;
+    return buildCompletionResult(actions.length > 0 ? [...replacement.items, ...actions] : replacement.items, replacement.from, getSqlCompletionResultValidFor(fullDoc, position), completionContext.prefix);
   }
 
   // CodeMirror's built-in matcher only matches single-character queries against
@@ -433,32 +332,11 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
   // skip the second-stage filter exactly in the cases it would break.
   function shouldBypassCompletionFilter(prefix: string, items: Array<QueryCompletionItem | BatchColumnSelectionActionItem>): boolean {
     if (!prefix) return false;
-    if (typeof settingsStore !== "undefined" && settingsStore?.editorSettings?.completionMatchMode === "contains") return true;
     if (/\p{Script=Han}/u.test(prefix)) return true;
-    if (/^[a-z0-9]+$/i.test(prefix) && items.some(itemHasHanText)) return true;
-    const matchMode = typeof settingsStore !== "undefined" ? settingsStore?.editorSettings?.completionMatchMode : undefined;
-    return items.some((item) => {
-      const renderedLabel = "displayLabel" in item && typeof item.displayLabel === "string" ? item.displayLabel : item.label;
-      if (renderedLabel.toLowerCase().startsWith(prefix.toLowerCase())) return false;
-      if ("comment" in item && typeof item.comment === "string" && matchesIdentifierSearch(item.comment, prefix, matchMode)) return true;
-      if (typeof item.detail === "string" && matchesIdentifierSearch(item.detail, prefix, matchMode)) return true;
-      return false;
-    });
+    return /^[a-z0-9]+$/i.test(prefix) && items.some((item) => /\p{Script=Han}/u.test(item.label));
   }
 
   function completionItemsForBypassedFilter(prefix: string, items: Array<QueryCompletionItem | BatchColumnSelectionActionItem>): Array<QueryCompletionItem | BatchColumnSelectionActionItem> {
-    const matchMode = typeof settingsStore !== "undefined" ? settingsStore?.editorSettings?.completionMatchMode : undefined;
-    if (matchMode === "contains") {
-      return items.filter((item) => {
-        if (isBatchColumnSelectionAction(item)) return true;
-        const renderedLabel = "displayLabel" in item && typeof item.displayLabel === "string" ? item.displayLabel : item.label;
-        if (completionMatchRanges(renderedLabel, prefix, "contains").length > 0) return true;
-        if (renderedLabel !== item.label && completionMatchRanges(item.label, prefix, "contains").length > 0) return true;
-        if ("comment" in item && typeof item.comment === "string" && matchesIdentifierSearch(item.comment, prefix, "contains")) return true;
-        if (typeof item.detail === "string" && matchesIdentifierSearch(item.detail, prefix, "contains")) return true;
-        return false;
-      });
-    }
     if ([...prefix].length !== 1 || !/^[a-z0-9]$/i.test(prefix)) return items;
     const normalized = prefix.toLowerCase();
     return items.filter((item) => {
@@ -466,11 +344,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       // prefix, otherwise checked columns cannot be applied from that menu.
       if (isBatchColumnSelectionAction(item)) return true;
       const renderedLabel = "displayLabel" in item && typeof item.displayLabel === "string" ? item.displayLabel : item.label;
-      if (renderedLabel.toLowerCase().startsWith(normalized)) return true;
-      if (itemHasHanText(item)) return true;
-      if ("comment" in item && typeof item.comment === "string" && matchesIdentifierSearch(item.comment, prefix, matchMode)) return true;
-      if (typeof item.detail === "string" && matchesIdentifierSearch(item.detail, prefix, matchMode)) return true;
-      return false;
+      return /\p{Script=Han}/u.test(item.label) || renderedLabel.toLowerCase().startsWith(normalized);
     });
   }
 
@@ -497,8 +371,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     return mergeSqlCompletionQualifierNames(currentSchema ? [currentSchema] : [], connectionStore.lookupLocalCompletionSchemas(props.connectionId, currentDatabase, completionContext.qualifier, MAX_COMPLETION_TABLES));
   }
 
-  function shouldInsertSqlCompletionSpace(item: QueryCompletionItem): boolean {
-    if (isGraphQueryDatabase(props.databaseType)) return item.type === "keyword";
+  function shouldInsertSqlCompletionSpace(): boolean {
     return (
       props.databaseType !== "mongodb" &&
       props.databaseType !== "redis" &&
@@ -571,7 +444,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
             replaceSelectWildcard: "replaceSelectWildcard" in item ? item.replaceSelectWildcard : undefined,
           });
           if (typeof originalApply === "function") {
-            applySnippetWithAdditionalCursors(view, originalApply as never, completionItem, from, to, replaceTo);
+            originalApply(view, completionItem as never, from, replaceTo);
           } else {
             const insert = String(originalApply ?? item.label);
             view.dispatch({
@@ -608,7 +481,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           replaceSelectWildcard: "replaceSelectWildcard" in item ? item.replaceSelectWildcard : undefined,
         });
         let insert = appendSqlCompletionSpace(item.apply ?? item.label, {
-          enabled: ("appendSpace" in item && item.appendSpace === true) || (shouldInsertSqlCompletionSpace(item) && settingsStore.editorSettings.insertSpaceAfterCompletion),
+          enabled: ("appendSpace" in item && item.appendSpace === true) || (shouldInsertSqlCompletionSpace() && settingsStore.editorSettings.insertSpaceAfterCompletion),
           itemType: item.type,
           nextCharacter: view.state.sliceDoc(replaceTo, replaceTo + 1),
         });
@@ -818,56 +691,6 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     };
   }
 
-  async function provideGraphCompletions(context: CompletionContext, databaseType: GraphQueryDatabase) {
-    const { connectionId, database } = props;
-    if (!connectionId) return null;
-    const fullDoc = context.state.doc.toString();
-    const completionContext = getGraphCompletionContext(fullDoc, context.pos, databaseType);
-    if (completionContext.mode === "none") return null;
-    if (!context.explicit) {
-      const mode = settingsStore.editorSettings.completionTriggerMode;
-      if (mode === "manual" || (mode === "require-prefix" && !completionContext.prefix) || !shouldAutoOpenGraphCompletion(fullDoc, context.pos, databaseType)) return null;
-    }
-    const epoch = ++completionEpoch;
-    const isCurrent = () => !context.aborted && epoch === completionEpoch && props.connectionId === connectionId && props.database === database && props.databaseType === databaseType;
-    let tables: SqlCompletionTable[] = [];
-    let columns: SqlCompletionColumn[] = [];
-    let databases: string[] = [];
-    try {
-      if (completionContext.mode === "database") databases = await connectionStore.listCompletionDatabases(connectionId);
-      else if (database != null && ["label", "relationship", "object"].includes(completionContext.mode) && !(databaseType === "neo4j" && completionContext.mode === "relationship")) {
-        tables = await connectionStore.listCompletionTables(connectionId, database, completionContext.prefix, MAX_COMPLETION_TABLES, undefined, false, undefined, undefined, { activateConnection: false });
-      } else if (database != null && completionContext.mode === "property") {
-        for (const object of completionContext.objects) {
-          if (!isCurrent()) return null;
-          columns.push(...(await connectionStore.listCompletionColumns(connectionId, database, object)));
-        }
-      }
-    } catch {
-      // Native syntax remains available when a connection cannot supply metadata.
-    }
-    if (!isCurrent()) return null;
-    const result = buildCompletionResult(
-      buildGraphCompletionItems(
-        completionContext,
-        databaseType,
-        { tables, columns, databases },
-        {
-          keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
-          functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
-          functionCompletionIncludeParams: settingsStore.editorSettings.functionCompletionIncludeParams,
-          snippets: settingsStore.editorSettings.snippets,
-        },
-      ),
-      completionContext.from,
-      graphCompletionValidFor(completionContext),
-      completionContext.prefix,
-    );
-    // Candidates already match the typed prefix; the replacement can also cover an old suffix.
-    if (result && completionContext.to > context.pos) return { ...result, to: completionContext.to, filter: false as const, validFor: undefined };
-    return result ? { ...result, to: completionContext.to } : null;
-  }
-
   async function provideSqlCompletions(context: CompletionContext) {
     const currentState = context.state;
     const position = context.pos;
@@ -875,10 +698,8 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     const typedActivation = isTypedCompletionActivation(explicit);
     if (runtime.imeCompositionActive || view.value?.compositionStarted || view.value?.composing) return null;
     if (!props.connectionId) return null;
-    if (isGraphQueryDatabase(props.databaseType)) return provideGraphCompletions(context, props.databaseType);
     const fullDoc = currentState.doc.toString();
     if (props.databaseType === "mongodb") {
-      if (props.mongoQueryLanguage === "sql") return null;
       return provideMongoCompletions(currentState, position, explicit);
     }
     if (props.databaseType === "meilisearch" || props.databaseType === "solr" || props.databaseType === "couchdb") return null;
@@ -913,8 +734,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       const analysis = await getEditorSqlCompletionAnalysis(fullDoc, position, currentState);
       if (!analysis || context.aborted || epoch !== completionEpoch) return null;
       analyzedCtes = { sql: fullDoc, definitions: analysis.cteDefinitions };
-      const sequenceLiteralContext = settingsStore.editorSettings.sequenceCompletionEnabled ? analysis.sequenceLiteralContext : null;
-      const { databaseLinkContext, useDatabaseCompletion } = analysis;
+      const { sequenceLiteralContext, databaseLinkContext, useDatabaseCompletion } = analysis;
       if (analysis.suppressed && !sequenceLiteralContext) return null;
       const useDatabasePrefix = useDatabaseCompletion?.prefix ?? null;
 
@@ -1008,7 +828,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
         if (!hasDatabase) return null;
         const sequences = await connectionStore.listCompletionObjects(props.connectionId, props.database!, sequenceLiteralContext.prefix, MAX_COMPLETION_TABLES, sequenceLiteralContext.schema, undefined, false, undefined, ["sequence"], sequenceLiteralContext.nameQuoted);
         if (epoch !== completionEpoch) return null;
-        return buildCompletionResult(buildPostgresSequenceLiteralCompletionItems(sequenceLiteralContext, sequences, settingsStore.editorSettings.completionMatchMode), sequenceLiteralContext.from, undefined, sequenceLiteralContext.prefix);
+        return buildCompletionResult(buildPostgresSequenceLiteralCompletionItems(sequenceLiteralContext, sequences), sequenceLiteralContext.from, undefined, sequenceLiteralContext.prefix);
       }
 
       let completionContext = analysis.completionContext;
@@ -1032,8 +852,6 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
           functionCompletionIncludeParams: settingsStore.editorSettings.functionCompletionIncludeParams,
-          sequenceCompletionEnabled: settingsStore.editorSettings.sequenceCompletionEnabled,
-          completionMatchMode: settingsStore.editorSettings.completionMatchMode,
         });
         return buildSqlCompletionResult(items, completionContext, fullDoc, position);
       }
@@ -1099,8 +917,6 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
           functionCompletionIncludeParams: settingsStore.editorSettings.functionCompletionIncludeParams,
-          sequenceCompletionEnabled: settingsStore.editorSettings.sequenceCompletionEnabled,
-          completionMatchMode: settingsStore.editorSettings.completionMatchMode,
         });
         return buildSqlCompletionResult(items, completionContext, fullDoc, position);
       }
@@ -1112,12 +928,6 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
         prefix: completionContext.prefix,
         typedActivation,
         selectListColumnContext: completionContext.selectListColumnContext,
-        // The cursor sits right after `alias.` with nothing typed yet: columns for the
-        // referenced table are exactly what the user is asking for, so cold metadata
-        // must still be fetched instead of silently yielding no candidates (#12227).
-        // Table-name dots (`FROM myschema.`) share this shape but must keep their
-        // instant local path, hence the tableNameCompletion exclusion.
-        qualifierDot: !tableNameCompletion && !!completionContext.qualifier && !completionContext.prefix,
       });
       const shouldResolveAsyncCompletion = tableNameCompletion || shouldResolveColumnCompletion;
       const localResult = buildLocalSqlCompletionResult(completionContext, fullDoc, position, completionScope);
@@ -1213,16 +1023,11 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
   async function shouldTriggerSqlCompletionForPosition(fullDoc: string, position: number): Promise<boolean> {
     const mode = settingsStore.editorSettings.completionTriggerMode;
     if (mode === "manual") return false;
-    if (isGraphQueryDatabase(props.databaseType)) {
-      const context = getGraphCompletionContext(fullDoc, position, props.databaseType);
-      return (mode !== "require-prefix" || !!context.prefix) && shouldAutoOpenGraphCompletion(fullDoc, position, props.databaseType);
-    }
     const currentView = view.value;
     const expectedDoc = currentView?.state.doc;
     const analysis = await getEditorSqlCompletionAnalysis(fullDoc, position, currentView?.state);
     if (!analysis || view.value !== currentView || currentView?.state.doc !== expectedDoc || settingsStore.editorSettings.completionTriggerMode !== mode) return false;
-    const sequenceLiteralContext = settingsStore.editorSettings.sequenceCompletionEnabled ? analysis.sequenceLiteralContext : null;
-    const { databaseLinkContext, useDatabaseCompletion } = analysis;
+    const { sequenceLiteralContext, databaseLinkContext, useDatabaseCompletion } = analysis;
     if (analysis.suppressed && !sequenceLiteralContext) return false;
     const context = databaseLinkContext ?? sequenceLiteralContext ?? analysis.completionContext;
     const prevChar = fullDoc[position - 1] ?? "";
@@ -1425,8 +1230,6 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
       functionCompletionIncludeParams: settingsStore.editorSettings.functionCompletionIncludeParams,
-      sequenceCompletionEnabled: settingsStore.editorSettings.sequenceCompletionEnabled,
-      completionMatchMode: settingsStore.editorSettings.completionMatchMode,
     });
 
     return buildSqlCompletionResult(items, completionContext, fullDoc, position);
@@ -1659,8 +1462,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
 
   function completionObjectKindsForContext(completionContext: ReturnType<typeof getSqlCompletionContext>): CompletionAssistantObjectKind[] {
     if (completionContext.contextKind === "exec") return ["procedure"];
-    const allowSequences = settingsStore.editorSettings.sequenceCompletionEnabled;
-    if (allowSequences && isSequenceCompletionDatabase(props.databaseType)) {
+    if (isSequenceCompletionDatabase(props.databaseType)) {
       if (completionContext.suggestColumns && completionContext.referencedTables.length > 0 && !completionContext.qualifier) {
         return ["function", "sequence"];
       }
@@ -1965,8 +1767,6 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
       functionCompletionIncludeParams: settingsStore.editorSettings.functionCompletionIncludeParams,
-      sequenceCompletionEnabled: settingsStore.editorSettings.sequenceCompletionEnabled,
-      completionMatchMode: settingsStore.editorSettings.completionMatchMode,
     });
 
     return buildSqlCompletionResult(items, completionContext, fullDoc, position);

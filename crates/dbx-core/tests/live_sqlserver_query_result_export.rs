@@ -34,8 +34,6 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         connect_timeout_secs: 10,
         query_timeout_secs: 30,
         idle_timeout_secs: 60,
-        manual_transaction_timeout_secs: 300,
-        idle_disconnect_secs: 0,
         keepalive_interval_secs: 0,
         ssl: false,
         ca_cert_path: String::new(),
@@ -76,8 +74,6 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         show_system_schemas: false,
         sidebar_auto_load_all_tables: false,
         show_database_links: None,
-        show_native_jobs: None,
-        show_user_admin: None,
         database_info: None,
     }
 }
@@ -139,7 +135,6 @@ async fn live_sqlserver_xlsx_export_can_outlive_query_timeout_while_rows_keep_ar
         execution_id: Some(format!("live-sqlserver-xlsx-{suffix}")),
         date_time_format: None,
         csv_quote_mode: Default::default(),
-        csv_without_bom: false,
         null_literal: String::new(),
         export_table_name: None,
         export_schema: None,

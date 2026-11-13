@@ -60,7 +60,6 @@ export function useToolbarOverflow(rootRef: Ref<HTMLElement | null>, revalidateS
 
   if (revalidateSources.length > 0) {
     watch(revalidateSources, () => {
-      condensedAtWidth.value = 0;
       void nextTick(measure);
     });
   }

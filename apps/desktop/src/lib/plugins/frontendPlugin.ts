@@ -18,7 +18,6 @@ import type {
   PluginUiContribution,
   PluginWorkbenchContribution,
 } from "@/types/database";
-import { DEFAULT_MANUAL_TRANSACTION_TIMEOUT_SECS } from "@/lib/connection/timeoutLimits";
 import { uuid } from "@/lib/common/utils";
 import { clonePluginData } from "./pluginData";
 
@@ -208,17 +207,6 @@ export function pluginConnectionProviderIcon(entry: PluginContributionEntry<Plug
 }
 
 /**
- * 提供者声明的默认端口：取 `binding: "port"` 字段的声明默认值。
- *
- * 深链 `type=<插件类型>` 只用它做预填提示，链接上的 `port` 参数始终优先。
- */
-export function pluginConnectionProviderDefaultPort(contribution: PluginConnectionProviderContribution): number | undefined {
-  const field = contribution.fields.find((candidate) => candidate.binding === "port");
-  const value = field?.default;
-  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 65535 ? value : undefined;
-}
-
-/**
  * Well-known provider field key whose declared default seeds the typed
  * `ConnectionConfig.connect_timeout_secs`. A plugin knows its own transport
  * (SSH handshakes on slow links need far more than the generic 10s), so a
@@ -291,9 +279,6 @@ export function buildPluginConnectionConfig(pluginId: string, contribution: Plug
     connect_timeout_secs: existing?.connect_timeout_secs || pluginConnectionConnectTimeoutDefault(contribution) || 10,
     query_timeout_secs: existing?.query_timeout_secs || 60,
     idle_timeout_secs: existing?.idle_timeout_secs || 60,
-    manual_transaction_timeout_secs: existing?.manual_transaction_timeout_secs || DEFAULT_MANUAL_TRANSACTION_TIMEOUT_SECS,
-    // 空闲自动断开默认不启用（0）；0 是合法值，故用 ?? 而非 ||。
-    idle_disconnect_secs: existing?.idle_disconnect_secs ?? 0,
     keepalive_interval_secs: existing?.keepalive_interval_secs || 30,
     read_only: existing?.read_only || false,
     save_password: existing?.save_password !== false,

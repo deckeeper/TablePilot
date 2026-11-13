@@ -23,15 +23,6 @@ export interface SidebarDangerDialogTextInput {
   onInput?: (value: string) => void | Promise<void>;
 }
 
-/** A single-choice option (e.g. Navicat's "Foreign Key Checks: Default / Enable / Disable"). */
-export interface SidebarDangerDialogSelect {
-  value: string;
-  label: string;
-  hint?: string;
-  choices: Array<{ value: string; label: string }>;
-  onChange?: (value: string) => void | Promise<void>;
-}
-
 export interface SidebarDangerDialogRequest {
   target: SidebarActionTarget;
   title: string;
@@ -49,7 +40,6 @@ export interface SidebarDangerDialogRequest {
   option?: SidebarDangerDialogOption;
   options?: SidebarDangerDialogOption[];
   textInput?: SidebarDangerDialogTextInput;
-  select?: SidebarDangerDialogSelect;
   cancelRunning?: () => void | Promise<void>;
   confirm: () => void | boolean | Promise<void | boolean>;
 }

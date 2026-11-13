@@ -82,7 +82,6 @@ afterEach(() => {
 function mountToolbar() {
   const search = ref("");
   const updates: string[] = [];
-  const refreshes: number[] = [];
   const host = document.createElement("div");
   document.body.append(host);
   const app = createApp(
@@ -101,7 +100,7 @@ function mountToolbar() {
             loadingDatabases: false,
             loadingSchemas: false,
             loadingDiagram: false,
-            diagramReady: true,
+            diagramReady: false,
             tablesCount: 0,
             relationshipsCount: 0,
             customRelationshipCount: 0,
@@ -117,14 +116,13 @@ function mountToolbar() {
               updates.push(value);
               search.value = value;
             },
-            onRefresh: () => refreshes.push(Date.now()),
           });
       },
     }),
   );
   app.mount(host);
   mountedApps.push({ app, host });
-  return { host, search, updates, refreshes };
+  return { host, search, updates };
 }
 
 describe("DiagramToolbar", () => {
@@ -143,17 +141,5 @@ describe("DiagramToolbar", () => {
     expect(updates).toEqual(["u", "us", "use", "user"]);
     expect(search.value).toBe("user");
     expect(input.value).toBe("user");
-  });
-
-  it("renders exactly one existing Refresh control and emits one refresh action", async () => {
-    const { host, refreshes } = mountToolbar();
-    await nextTick();
-
-    const refreshButtons = host.querySelectorAll<HTMLButtonElement>('button[title="diagram.refresh"]');
-    expect(refreshButtons).toHaveLength(1);
-    refreshButtons[0].click();
-    await nextTick();
-
-    expect(refreshes).toHaveLength(1);
   });
 });

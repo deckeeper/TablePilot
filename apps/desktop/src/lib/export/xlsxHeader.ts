@@ -1,11 +1,8 @@
-import type { ManualExportMode } from "@/lib/export/manualExportQueue";
-
 export type XlsxHeaderMode = "name" | "comment" | "name-comment" | "name-comment-rows";
 
 export interface XlsxExportOptions {
   headerMode: XlsxHeaderMode;
   autoFilter: boolean;
-  executionMode?: ManualExportMode;
 }
 
 export function hasXlsxHeaderComments(comments: readonly (string | null | undefined)[] | undefined): boolean {

@@ -1,13 +1,12 @@
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { getSqlCompletionContext } from "@/lib/sql/sqlCompletion";
-import { resolveSqlDialectId } from "@/lib/sql/semantic/dialect";
 import { findCteColumnResolution, findCteReferenceAt } from "@/lib/sql/semantic/cteNavigation";
 import { extractIdentifierDetailsAt, isSqlKeyword, matchSqlObject, matchTable, resolveSqlObjectNavigationIdentity, sqlObjectNavigationTarget, sqlObjectNavigationTargetFromIdentity, sqlObjectNavigationTypeFromCompletionObjectType, type SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
-import { matchHoverTableCandidates, pickHoverObjectMatch, resolveHoverTableLookupTarget } from "@/lib/editor/hoverTableLookup";
+import { matchHoverTableCandidates, resolveHoverTableLookupTarget } from "@/lib/editor/hoverTableLookup";
 import { stabilizeUnfocusedQueryEditorPointerDown } from "@/lib/editor/queryEditorUnfocusedPointer";
 import { usesQueryEditorObjectNavigationModifier } from "@/lib/editor/queryEditorPointerSelection";
 import { queryTableNavigationTargetAtSqlPosition } from "@/lib/sql/queryCursorTableTarget";
-import type { SqlCompletionObject, SqlCompletionReferencedTable, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
+import type { SqlCompletionReferencedTable, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
 import type { Ref, ShallowRef } from "vue";
 import type { QueryEditorProps } from "./queryEditorTypes";
 import type { useConnectionStore } from "@/stores/connectionStore";
@@ -70,8 +69,7 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
     // modifier-held mouse moves never materialize the whole document string.
     const windowFrom = Math.max(0, pos - 1024);
     const doc = currentView.state.doc;
-    const dialectId = resolveSqlDialectId({ databaseType: props.databaseType, dialect: props.databaseType ? undefined : props.dialect });
-    const extracted = extractIdentifierDetailsAt(doc.sliceString(windowFrom, Math.min(doc.length, pos + 1024)), pos - windowFrom, dialectId);
+    const extracted = extractIdentifierDetailsAt(doc.sliceString(windowFrom, Math.min(doc.length, pos + 1024)), pos - windowFrom);
     if (!extracted || (!extracted.quoted && isSqlKeyword(extracted.identifier))) return null;
     return extracted.identifier;
   }
@@ -121,8 +119,7 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
     }
 
     const doc = currentView.state.doc.toString();
-    const dialectId = resolveSqlDialectId({ databaseType: props.databaseType, dialect: props.databaseType ? undefined : props.dialect });
-    const extracted = extractIdentifierDetailsAt(doc, pos, dialectId);
+    const extracted = extractIdentifierDetailsAt(doc, pos);
     if (!extracted) {
       return false;
     }
@@ -136,7 +133,7 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
     setTimeout(async () => {
       try {
         // Single identity model: quote flags + role (relation column list vs routine call vs unknown).
-        const identity = resolveSqlObjectNavigationIdentity(doc, pos, dialectId);
+        const identity = resolveSqlObjectNavigationIdentity(doc, pos);
         if (!identity) return;
 
         const identifierParts = identity.parts.map((part) => part.value);
@@ -244,18 +241,15 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
           return true;
         };
 
-        // 1b. Routine cache — skip for pure relation column lists (INSERT INTO t(...)).
-        // Unqualified names honor tableHoverLookupMode (same scope as tables); qualified names stay scoped.
+        // 1b. Local routine cache — skip for pure relation column lists (INSERT INTO t(...)).
         if (!isRelationColumnList) {
-          const matchNavigationObject = (objects: readonly SqlCompletionObject[]) => (identity.parts.length === 1 ? pickHoverObjectMatch(objectNameFilter, objects, props.schema) : matchSqlObject(identifier, objects));
-          const unqualifiedObjectSchema = tableLookup.preferGlobalFirst ? undefined : (tableLookup.schema ?? props.schema);
+          const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, props.schema);
+          let matchedObject = matchSqlObject(identifier, localObjects);
+          if (matchedObject && openMatchedObject(matchedObject)) return;
 
-          if (identity.parts.length === 2 && identity.qualifier) {
-            const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, props.schema);
-            let matchedObject = matchNavigationObject(localObjects);
-            if (matchedObject && openMatchedObject(matchedObject)) return;
-
-            if (!usesLocalOnlyCompletionMetadata()) {
+          if (!usesLocalOnlyCompletionMetadata()) {
+            // Disambiguate schema.routine vs package.member with small scoped lookups (no global scan).
+            if (identity.parts.length === 2 && identity.qualifier) {
               // Prefer package.member under session schema (Oracle common: PKG.MEMBER()).
               const packageObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, props.schema, identity.qualifier, false, props.schema, ["routine"]);
               matchedObject = matchSqlObject(identifier, packageObjects);
@@ -265,44 +259,10 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
               const schemaObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, identity.qualifier, undefined, false, props.schema, ["routine"]);
               matchedObject = matchSqlObject(identifier, schemaObjects);
               if (matchedObject && openMatchedObject(matchedObject)) return;
-            }
-          } else if (identity.parts.length >= 3) {
-            const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, objectSchemaHint);
-            let matchedObject = matchNavigationObject(localObjects);
-            if (matchedObject && openMatchedObject(matchedObject)) return;
-
-            if (!usesLocalOnlyCompletionMetadata()) {
+            } else {
               const scopedObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, objectSchemaHint, objectParentHint, false, props.schema, ["routine"]);
               matchedObject = matchSqlObject(identifier, scopedObjects);
               if (matchedObject && openMatchedObject(matchedObject)) return;
-            }
-          } else {
-            const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, unqualifiedObjectSchema);
-            let matchedObject = matchNavigationObject(localObjects);
-            if (matchedObject && openMatchedObject(matchedObject)) return;
-
-            if (!matchedObject && tableLookup.allowGlobalFallback && !tableLookup.preferGlobalFirst) {
-              const localGlobalObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, undefined);
-              matchedObject = matchNavigationObject(localGlobalObjects);
-              if (matchedObject && openMatchedObject(matchedObject)) return;
-            }
-
-            if (!usesLocalOnlyCompletionMetadata()) {
-              if (!tableLookup.preferGlobalFirst) {
-                const scopedObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, unqualifiedObjectSchema, objectParentHint, false, props.schema, ["routine"]);
-                matchedObject = matchNavigationObject(scopedObjects);
-                if (matchedObject && openMatchedObject(matchedObject)) return;
-
-                if (tableLookup.allowGlobalFallback) {
-                  const globalObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, undefined, objectParentHint, true, props.schema, ["routine"]);
-                  matchedObject = matchNavigationObject(globalObjects);
-                  if (matchedObject && openMatchedObject(matchedObject)) return;
-                }
-              } else {
-                const globalObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, undefined, objectParentHint, true, props.schema, ["routine"]);
-                matchedObject = matchNavigationObject(globalObjects);
-                if (matchedObject && openMatchedObject(matchedObject)) return;
-              }
             }
           }
         }

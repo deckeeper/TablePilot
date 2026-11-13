@@ -1,16 +1,8 @@
 // Message queue admin types, matching dbx-core/src/mq/types.rs
 
-import type { KafkaTlsConfig } from "@/lib/connection/kafkaTlsOptions";
-
 export type MqSystemKind = "pulsar" | "kafka" | "rocketmq" | "rabbitmq";
 
 export interface MqCapabilities {
-  supportsListTopics?: boolean;
-  supportsCreateTopic?: boolean;
-  supportsDeleteTopic?: boolean;
-  supportsTopicStats?: boolean;
-  supportsBrokerAdmin?: boolean;
-  supportsProducerListing?: boolean;
   supportsTenants: boolean;
   supportsNamespaces: boolean;
   supportsPartitionedTopics: boolean;
@@ -70,7 +62,6 @@ export interface MqAdminConfig {
   adminUrl: string;
   auth?: MqAuth;
   tlsSkipVerify?: boolean;
-  tls?: KafkaTlsConfig;
   pinnedVersion?: string;
   tokenSigning?: MqTokenSigningConfig;
   extra?: unknown;
@@ -241,7 +232,7 @@ export interface SubscriptionInfo {
   consumers: ConsumerInfo[];
   /** RocketMQ subscribed topics (cluster-wide listing). */
   topics?: string[];
-  /** Online clients for RocketMQ groups or Kafka topic subscriptions; absent when unavailable. */
+  /** RocketMQ online consumer client count. */
   onlineMembers?: number;
   /** RocketMQ consumer group delivery type: NORMAL / FIFO / SYSTEM. */
   consumerGroupType?: string;
@@ -368,13 +359,7 @@ export interface PeekMessagesResult {
 
 export interface PeekMessagesOptions {
   /** Kafka only. Omitted starts at earliest unless a legacy caller supplies offset. */
-  startPosition?: "latest" | "earliest" | "offset" | "timestamp";
-  /** Epoch milliseconds; Kafka resolves the first record batch at or after this time per partition. */
-  timestamp?: number;
-  /** Epoch milliseconds; optional inclusive upper bound for a timestamp read. */
-  endTimestamp?: number;
-  /** 仅 timestamp 窗口模式生效：newest 让 agent 从截止时间一侧倒序回扫读取。 */
-  sortOrder?: string;
+  startPosition?: "latest" | "earliest" | "offset";
   partition?: number;
   offset?: number;
 }
@@ -408,10 +393,6 @@ export interface BacklogQuota {
 export interface RetentionPolicy {
   retentionTimeInMinutes: number;
   retentionSizeInMb: number;
-  /** Kafka 专用：仅当用户改过保留时间才下发，避免未修改字段被覆盖。 */
-  writeRetentionTime?: boolean;
-  /** Kafka 专用：仅当用户改过保留大小才下发。 */
-  writeRetentionSize?: boolean;
 }
 
 export type AuthAction = "produce" | "consume" | "functions" | "sources" | "sinks" | "packages";
@@ -592,8 +573,6 @@ export interface SendMessageRequest {
   payloadText?: string;
   headers: Record<string, string>;
   partition?: number;
-  /** RabbitMQ: AMQP BasicProperties, separate from custom headers. */
-  properties?: Record<string, string>;
   /** RabbitMQ: target exchange; empty means the default exchange. */
   exchange?: string;
   /** RabbitMQ: routing key used when publishing to an exchange. */
@@ -604,8 +583,7 @@ export interface SendMessageRequest {
 
 export interface SendMessageResponse {
   topic: string;
-  /** Absent when the transport does not report the actual physical queue. */
-  partition?: number | null;
+  partition: number;
   offset: number;
   timestamp?: string;
 }

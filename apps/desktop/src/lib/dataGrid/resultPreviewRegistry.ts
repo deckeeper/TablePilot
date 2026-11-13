@@ -17,7 +17,6 @@ export interface PreviewActionContext {
   result: QueryResult;
   selectedRowIds: readonly number[];
   displayRowRefs: readonly { id: number; sourceIndex: number; isNew: boolean }[];
-  selectedColumnIndexes?: readonly number[];
 }
 
 /**

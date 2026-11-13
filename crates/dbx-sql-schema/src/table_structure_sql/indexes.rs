@@ -51,7 +51,7 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
         }
 
         if let Some(original) = &index.original {
-            if !has_existing_index_change_for_database(index, options.database_type) {
+            if !has_existing_index_change(index) {
                 continue;
             }
             if !capabilities.rebuild_index || !capabilities.drop_index || !capabilities.create_index {
@@ -61,18 +61,6 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
             }
             if original.is_primary {
                 warnings.push(format!("Primary index \"{}\" cannot be edited from this editor.", original.name));
-                continue;
-            }
-            if options.database_type == Some(DatabaseType::Mysql) && dialect == StructureDialect::Mysql {
-                // ALTER TABLE and standalone DROP/CREATE INDEX have different privilege
-                // requirements. Validate the replacement before building a single ALTER
-                // so an incomplete draft can never expose a DROP-only plan.
-                if let Some(definition) = mysql_inline_index_definition(index) {
-                    statements.push(format!(
-                        "ALTER TABLE {table} DROP INDEX {}, ADD {definition};",
-                        quote_ident(dialect, &original.name)
-                    ));
-                }
                 continue;
             }
             if is_dameng_constraint_backed(options.database_type, original) {
@@ -92,8 +80,8 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
                 continue;
             }
             let or_replace =
-                options.database_type == Some(DatabaseType::Dameng) && index_name_for_sql(index, true) == original.name;
-            if matches!(dialect, StructureDialect::Oracle | StructureDialect::Dameng) {
+                options.database_type == Some(DatabaseType::Dameng) && clean(&index.name) == clean(&original.name);
+            if dialect == StructureDialect::Oracle {
                 // Oracle-family index edits may require DROP/CREATE. Validate that the
                 // complete replacement plan can be built before exposing its destructive
                 // first step; an empty/invalid target must never become a DROP-only plan.
@@ -211,8 +199,9 @@ fn build_dameng_constraint_index_edit(
     concurrently_supported: bool,
     warnings: &mut Vec<String>,
 ) -> Vec<String> {
-    let name = index_name_for_sql(index, true);
-    let columns: Vec<String> = index.columns.iter().filter(|column| !column.trim().is_empty()).cloned().collect();
+    let name = clean(&index.name);
+    let columns: Vec<String> =
+        index.columns.iter().map(|column| clean(column)).filter(|column| !column.is_empty()).collect();
     // Same guard as `build_create_index_statements`: an empty name or an empty column list
     // cannot produce a valid replacement (`validate_draft` already reports it as a warning).
     // Emitting only the DROP would silently delete the constraint, so skip the edit entirely.
@@ -270,18 +259,6 @@ pub fn has_existing_index_change(index: &EditableStructureIndex) -> bool {
         )
 }
 
-pub(super) fn has_existing_index_change_for_database(
-    index: &EditableStructureIndex,
-    database_type: Option<DatabaseType>,
-) -> bool {
-    has_existing_index_change(index)
-        || (matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng))
-            && index.original.as_ref().is_some_and(|original| {
-                index.columns != original.columns
-                    || (original.name != clean(&original.name) && index.name != original.name)
-            }))
-}
-
 /// Compare opclass arrays positionally, skipping expression columns.
 /// When the column list has changed we already detect that above; here we only
 /// compare opclasses for columns that exist in both the edited and original lists.
@@ -336,7 +313,7 @@ pub(super) fn mysql_index_parts(index_type: &str) -> (String, String) {
     }
 }
 
-/// MySQL index definition shared by CREATE TABLE and ALTER TABLE ADD INDEX.
+/// Inline MySQL index definition for indexes required at CREATE TABLE time.
 pub(super) fn mysql_inline_index_definition(index: &EditableStructureIndex) -> Option<String> {
     let name = clean(&index.name);
     let columns: Vec<_> =
@@ -414,7 +391,7 @@ fn postgres_index_column_sql(column: &str, is_expression: bool, opclass: Option<
 /// tied to its true ordinal position instead of being re-derived by scanning for a text match
 /// (#6312 review). A key without explicit provenance is treated as a real column: the editor can
 /// only add table columns, and guessing from the identifier text breaks valid quoted names.
-fn key_expression_flags(index: &EditableStructureIndex, columns: &[String], exact_keys: bool) -> Vec<bool> {
+fn key_expression_flags(index: &EditableStructureIndex, columns: &[String]) -> Vec<bool> {
     let original = match &index.original {
         Some(original) if !original.key_is_expression.is_empty() => original,
         _ => return vec![false; columns.len()],
@@ -423,10 +400,11 @@ fn key_expression_flags(index: &EditableStructureIndex, columns: &[String], exac
     columns
         .iter()
         .map(|column| {
-            let claimed = original.columns.iter().enumerate().find(|(i, original_column)| {
-                !consumed[*i]
-                    && if exact_keys { *original_column == column } else { clean(original_column) == clean(column) }
-            });
+            let claimed = original
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(i, original_column)| !consumed[*i] && clean(original_column) == clean(column));
             match claimed {
                 Some((i, _)) => {
                     consumed[i] = true;
@@ -469,7 +447,7 @@ fn oracle_key_directions(
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(position, original_column)| !consumed[*position] && *original_column == column)
+                .find(|(position, original_column)| !consumed[*position] && clean(original_column) == clean(column))
                 .map(|(position, _)| {
                     consumed[position] = true;
                     original.key_directions[position].clone()
@@ -534,14 +512,6 @@ fn key_opclasses(index: &EditableStructureIndex, columns: &[String]) -> Vec<Opti
         .collect()
 }
 
-fn index_name_for_sql(index: &EditableStructureIndex, preserve_metadata_identity: bool) -> String {
-    if preserve_metadata_identity && index.original.as_ref().is_some_and(|original| original.name == index.name) {
-        index.name.clone()
-    } else {
-        clean(&index.name)
-    }
-}
-
 pub(super) fn build_drop_index_sql(
     database_type: Option<DatabaseType>,
     dialect: StructureDialect,
@@ -588,15 +558,9 @@ pub(super) fn build_create_index_statements(
     driver_profile: Option<&str>,
 ) -> Vec<String> {
     let capabilities = capabilities_for(database_type_for_dialect(dialect), None);
-    let exact_keys =
-        matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng));
-    let name = index_name_for_sql(index, exact_keys);
-    let columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|column| if exact_keys { column.clone() } else { clean(column) })
-        .filter(|column| !column.trim().is_empty())
-        .collect();
+    let name = clean(&index.name);
+    let columns: Vec<String> =
+        index.columns.iter().map(|column| clean(column)).filter(|column| !column.is_empty()).collect();
     if name.is_empty() || columns.is_empty() {
         return Vec::new();
     }
@@ -623,7 +587,7 @@ pub(super) fn build_create_index_statements(
 
     let unique = if index.is_unique { "UNIQUE " } else { "" };
     let replace = if or_replace { "OR REPLACE " } else { "" };
-    let key_is_expression = key_expression_flags(index, &columns, exact_keys);
+    let key_is_expression = key_expression_flags(index, &columns);
     let key_opclasses = key_opclasses(index, &columns);
     let cols = columns
         .iter()

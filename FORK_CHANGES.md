@@ -3,6 +3,14 @@
 Based on reviewed non-AI changes through DBX v0.6.45, commit `13b6acafed41e1ce65d5e97344e7e93cb88202c2`.
 Modified on 14–19 October 2026 for the independent TablePilot desktop prototype.
 
+## TablePilot 0.4.3 compatibility recovery (13 November 2026)
+
+- Restore the coherent application and dependency sources from `9c4a0ebd8caf0d16b8a626e20a4ee48572b19b0b` after the partial proposal merged in PR #3 failed both installer jobs with 546 frontend compatibility errors. Preserve PR #4's automation repair and the proposal report/branch for continued review.
+- Retain only two independently reviewed non-AI fixes from upstream commit `a099c06ff64de804798b6de013fa8fcc506d84cd`: preserve SQL comments inside removed Oracle storage clauses, and recognize additional routine DDL headers when refreshing metadata. Include their upstream regression tests.
+- The rest of v0.6.70 is deferred, not integrated. Keep the pinned baseline at v0.6.45. Preserve batch import/export, SSH, security dependency removals, product branding, update checks and native AI/MCP/Plugin Center exclusions.
+- Add pull-request frontend type checking, focused regression tests and production compilation. These checks run on draft proposals too; branch-protection enforcement is a separate repository setting.
+- Increment all application/installer version declarations to 0.4.3 for a new official release after both native builds succeed.
+
 ## TablePilot 0.4.2 batch table import (19 October 2026)
 
 - Pass accepted sidebar table selections through the dialog source into the import wizard; restrict a selected-table batch to tables in the active database/schema.
@@ -59,6 +67,7 @@ Original copyright/license notices remain applicable. `docs/upstream-reference/R
 
 The following list is also the modification notice for formats such as JSON and binary icons that cannot carry source comments.
 
+- `.github/workflows/tablepilot-validate.yml`
 - `.github/workflows/tablepilot-build.yml`
 - `.github/workflows/tablepilot-publish-existing.yml`
 - `.github/workflows/tablepilot-release.yml`

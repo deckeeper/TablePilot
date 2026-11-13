@@ -7,8 +7,6 @@ import { connectionTypesPlugin } from "./viteConnectionTypesPlugin.ts";
 
 const host = process.env.TAURI_DEV_HOST;
 const isTauri = !!host || !!process.env.TAURI_ENV_ARCH;
-const tauriDevPort = configuredPort(process.env.TAURI_DEV_PORT, 1420);
-const tauriHmrPort = configuredPort(process.env.TAURI_DEV_HMR_PORT, tauriDevPort + 1);
 const configuredBasePath = process.env.VITE_DBX_BASE_PATH || process.env.DBX_PUBLIC_BASE_PATH;
 const manualChunks: Record<string, string[]> = {
   codemirror: ["codemirror", "@codemirror/lang-sql", "@codemirror/view", "@codemirror/state", "@codemirror/autocomplete", "@codemirror/commands", "@codemirror/lint", "@codemirror/theme-one-dark"],
@@ -59,11 +57,6 @@ function normalizeViteBase(value: string | undefined): string {
   return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`;
 }
 
-function configuredPort(value: string | undefined, fallback: number): number {
-  const port = Number(value);
-  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : fallback;
-}
-
 const viteBase = normalizeViteBase(configuredBasePath);
 const publicBasePath = viteBase.startsWith("/") ? viteBase.replace(/\/+$/, "") : "";
 const apiProxyPath = publicBasePath ? `${publicBasePath}/api` : "/api";
@@ -98,14 +91,14 @@ export default defineConfig(async () => ({
     },
   },
   server: {
-    port: isTauri ? tauriDevPort : undefined,
+    port: isTauri ? 1420 : undefined,
     strictPort: isTauri,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: tauriHmrPort,
+          port: 1421,
         }
       : undefined,
     proxy: {

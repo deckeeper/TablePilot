@@ -1,5 +1,5 @@
 import { computed } from "vue";
-import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/app/appFonts";
+import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editor/editorThemes";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 export function useEditorFontFamilyStyle() {

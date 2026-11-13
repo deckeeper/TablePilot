@@ -45,13 +45,11 @@ const toggleLeafNodeTypes = new Set<TreeNodeType>([
   "user-admin",
   "dameng-users",
   "dameng-roles",
-  "dameng-job-admin",
-  "database-job-admin",
 ]);
 // These are application entry points rather than database objects. They should
 // always navigate on a single click, even when the user prefers double-click
 // activation for ordinary tree objects.
-const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview", "etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control", "meilisearch-system", "dameng-job-admin", "database-job-admin"]);
+const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview", "etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control", "meilisearch-system"]);
 const repeatableNavigationTreeNodeTypes = new Set<TreeNodeType>(["etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control"]);
 
 export function isDirectNavigationTreeNode(type: TreeNodeType): boolean {
@@ -98,11 +96,9 @@ const databaseChildGroupNodeTypes = new Set<TreeNodeType>([
   "group-triggers",
   "group-events",
   "group-sequences",
-  "group-database-indexes",
   "group-synonyms",
   "group-jobs",
   "group-packages",
-  "group-package-bodies",
   "group-types",
 ]);
 const displayPathObjectNodeTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "trigger", "event", "sequence", "synonym", "package", "package-body", "type", "type-body"]);
@@ -157,18 +153,17 @@ export function isDocumentBrowserTreeNode(type: TreeNodeType): boolean {
 /**
  * Whether a tree node type may open an object source dialog for the given
  * connection type. TYPE/TYPE_BODY only have a real source implementation on
- * Oracle-family databases and Xugu; PostgreSQL-family databases list types
- * without a CREATE TYPE getter this cycle.
+ * Xugu; other databases list types without a DDL getter this cycle.
  */
 function canOpenTreeNodeSource(type: TreeNodeType, dbType?: DatabaseType): boolean {
   if (type === "type" || type === "type-body") return supportsTypeObjectSource(dbType);
   return true;
 }
 
-export function treeNodeRowAction(type: TreeNodeType, canExpand: boolean, activation: SidebarActivation = "single", dbType?: DatabaseType, browseObjectsOnDatabaseActivation = false, canOpenObjectBrowser = false, autoExpandOnDatabaseActivation = true): TreeNodeRowAction {
+export function treeNodeRowAction(type: TreeNodeType, canExpand: boolean, activation: SidebarActivation = "single", dbType?: DatabaseType, browseObjectsOnDatabaseActivation = false, canOpenObjectBrowser = false): TreeNodeRowAction {
   if (!shouldActivateTreeNodeOnSingleClick(type, activation)) return "none";
   if (canOpenObjectBrowser && shouldBrowseObjectsOnDatabaseActivation(type, browseObjectsOnDatabaseActivation)) {
-    return canExpand && autoExpandOnDatabaseActivation ? "open-object-browser-and-expand" : "open-object-browser";
+    return canExpand ? "open-object-browser-and-expand" : "open-object-browser";
   }
   if (type === "extension") return "open-extension-details";
   if (type === "event-trigger") return "open-event-trigger-details";
@@ -176,7 +171,7 @@ export function treeNodeRowAction(type: TreeNodeType, canExpand: boolean, activa
   if (dataNodeTypes.has(type)) return "open-data";
   if (type === "column") return "locate-column";
   // PostgreSQL-family custom types: open read-only details (toggle when expandable).
-  if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : supportsTypeObjectSource(dbType) ? "open-source" : "none";
+  if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : "none";
   // Xugu and other databases: expandable package/type nodes toggle their members.
   if ((type === "package" || type === "type") && canExpand) return "toggle";
   if (sourceNodeTypes.has(type) && canOpenTreeNodeSource(type, dbType)) return "open-source";
@@ -192,16 +187,7 @@ export function shouldRunTreeNodeRowAction(action: TreeNodeRowAction, clickDetai
   return action !== "none" && clickDetail <= 1;
 }
 
-export function treeNodeRowDoubleClickAction(
-  type: TreeNodeType,
-  canOpenObjectBrowser: boolean,
-  activation: SidebarActivation = "single",
-  canExpand = false,
-  dbType?: DatabaseType,
-  canOpenDatabaseBrowser = false,
-  browseObjectsOnDatabaseActivation = false,
-  autoExpandOnDatabaseActivation = true,
-): TreeNodeRowDoubleClickAction {
+export function treeNodeRowDoubleClickAction(type: TreeNodeType, canOpenObjectBrowser: boolean, activation: SidebarActivation = "single", canExpand = false, dbType?: DatabaseType, canOpenDatabaseBrowser = false, browseObjectsOnDatabaseActivation = false): TreeNodeRowDoubleClickAction {
   // Single-click activation already handles the first click in a dblclick
   // sequence. Most rows have no trailing action, while field/index rows have
   // an explicit structure-editor action in either activation mode.
@@ -215,13 +201,13 @@ export function treeNodeRowDoubleClickAction(
   if (type === "column" || type === "index") return "open-structure-editor";
   if (activation === "double") {
     if (canOpenObjectBrowser && shouldBrowseObjectsOnDatabaseActivation(type, browseObjectsOnDatabaseActivation)) {
-      return canExpand && autoExpandOnDatabaseActivation ? "open-object-browser-and-expand" : "open-object-browser";
+      return canExpand ? "open-object-browser-and-expand" : "open-object-browser";
     }
     if (canOpenObjectBrowser && type === "object-browser") return "open-object-browser";
     if (type === "extension") return "open-extension-details";
     if (type === "event-trigger") return "open-event-trigger-details";
     if (dataNodeTypes.has(type)) return "open-data";
-    if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : supportsTypeObjectSource(dbType) ? "open-source" : "none";
+    if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : "none";
     if (sourceNodeTypes.has(type) && canOpenTreeNodeSource(type, dbType)) return "open-source";
     if (savedSqlNodeTypes.has(type)) return "open-saved-sql";
     if (toggleLeafNodeTypes.has(type)) return "toggle";
@@ -235,7 +221,6 @@ export function sidebarSelectionCopyAction(event: ShortcutLikeEvent, platform?: 
 }
 
 export function copyNameForTreeNode(node: TreeNode): string {
-  if (node.type === "index" && node.objectScope === "schema" && node.objectName) return node.objectName;
   if (tableChildGroupNodeTypes.has(node.type) && node.tableName) return node.tableName;
   if (databaseChildGroupNodeTypes.has(node.type)) return node.schema || node.database || node.label;
   if (node.type === "column") {

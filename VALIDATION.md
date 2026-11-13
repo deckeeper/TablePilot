@@ -77,3 +77,11 @@ Native installer compilation and installation remain pending GitHub Actions/manu
 - Four release-packaging tests passed. Frontend/native/installer version declarations are synchronized at 0.4.2.
 - Import component tests use mocked database/file APIs. No live database writes or end-to-end CSV/Excel round trips were performed. Native installer builds run in Windows/Linux GitHub Actions; publication requires both to succeed. Installation and live-database testing remain pending for this version.
 - A batch is sequential, not a cross-table transaction. Completed writes remain after failure/cancellation. Targets are limited to the active database/schema, duplicate target assignments are blocked, parsing options are shared, and update-existing-row conflict handling remains single-table only. Users can order parent tables before child tables on the Review page.
+
+## 0.4.3 compatibility recovery — 13 November 2026
+
+- The merged draft proposal failed both platforms at the full frontend type check: 546 errors, before native packaging. Restore the application and dependencies from the last coherent main revision (`9c4a0ebd8caf0d16b8a626e20a4ee48572b19b0b`), retaining only two reviewed SQL fixes and their regression tests. The full proposal remains deferred.
+- **120 tests passed across 15 files**, covering the SQL fixes, import field mapping and batches, CSV/Excel export options, SSH authentication, TablePilot branding/update checks and AI/Plugin Center exclusions.
+- Full Vue/TypeScript type checking passed. Production frontend compilation passed with existing chunk-size, dynamic-import and Vite config-loader warnings.
+- Four release-packaging tests and seven upstream-automation tests passed. The new PR workflow parses correctly and runs frontend type checking, the same focused tests, and production compilation before merge. Repository branch protection must separately require this check to prevent merging a failure.
+- All four application/installer version declarations match 0.4.3. Native implementation and dependency files match the last coherent application; only the desktop package version changes. Windows/Linux installer builds remain the native validation and publication gate. No local Rust toolchain, live database/SSH testing or installer testing is available in this session.

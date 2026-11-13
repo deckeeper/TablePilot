@@ -37,21 +37,13 @@ registerPreviewAction({
   },
 });
 
-export function hasGeometryMapPreviewColumns(result: Pick<QueryResult, "column_types"> & Partial<Pick<QueryResult, "spatial_columns">>): boolean {
-  return geometryColumnIndices(result.column_types, result.spatial_columns).length > 0;
+export function hasGeometryMapPreviewColumns(result: Pick<QueryResult, "column_types">): boolean {
+  return geometryColumnIndices(result.column_types).length > 0;
 }
 
 export function buildGeometryMapFeatureCollection(ctx: PreviewActionContext): GeometryMapFeatureCollection | null {
-  let geomIndices = geometryColumnIndices(ctx.result.column_types, ctx.result.spatial_columns);
+  const geomIndices = geometryColumnIndices(ctx.result.column_types);
   if (geomIndices.length === 0) return null;
-
-  if (ctx.selectedColumnIndexes && ctx.selectedColumnIndexes.length > 0) {
-    const selectedGeomIndices = geomIndices.filter((idx) => ctx.selectedColumnIndexes!.includes(idx));
-    // A column selection without geometry columns is not previewable; only an
-    // empty/absent selection falls back to every geometry column.
-    if (selectedGeomIndices.length === 0) return null;
-    geomIndices = selectedGeomIndices;
-  }
 
   const features: GeometryMapFeature[] = [];
   const seen = new Set<string>();
@@ -94,22 +86,15 @@ export function buildGeometryMapFeatureCollection(ctx: PreviewActionContext): Ge
   return features.length > 0 ? { type: "FeatureCollection", features, detectedSrid } : null;
 }
 
-export function geometryColumnIndices(columnTypes: readonly string[] | undefined, spatialColumns?: readonly { column_index: number }[]): number[] {
-  const indices = new Set<number>();
-  if (columnTypes && columnTypes.length > 0) {
-    for (let i = 0; i < columnTypes.length; i++) {
-      const base = (columnTypes[i] ?? "")
-        .trim()
-        .toLowerCase()
-        .split(/[(:\s]/)[0];
-      if (base === "geometry" || base === "geography") indices.add(i);
-    }
-  } else if (spatialColumns) {
-    for (const entry of spatialColumns) {
-      if (typeof entry.column_index === "number" && entry.column_index >= 0) {
-        indices.add(entry.column_index);
-      }
-    }
+function geometryColumnIndices(columnTypes: readonly string[] | undefined): number[] {
+  if (!columnTypes) return [];
+  const indices: number[] = [];
+  for (let i = 0; i < columnTypes.length; i++) {
+    const base = (columnTypes[i] ?? "")
+      .trim()
+      .toLowerCase()
+      .split(/[(:\s]/)[0];
+    if (base === "geometry" || base === "geography") indices.push(i);
   }
-  return [...indices].sort((a, b) => a - b);
+  return indices;
 }

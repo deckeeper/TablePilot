@@ -69,11 +69,7 @@ export function schemaDiffRoutineKey(name: string, args = ""): string {
   return trimmedArgs ? `${name}(${trimmedArgs})` : name;
 }
 
-export function schemaDiffRoutineKeyFromFunction(fn: Pick<FunctionInfo, "name" | "arguments"> & Partial<Pick<FunctionInfo, "function_type">>, exactKind = false): string {
-  if (exactKind || fn.function_type === "PACKAGE" || fn.function_type === "PACKAGE_BODY") {
-    if (!["PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY"].includes(fn.function_type ?? "")) throw new Error("An exact program key requires its supported object kind");
-    return JSON.stringify([fn.function_type, fn.name, fn.arguments.trim()]);
-  }
+export function schemaDiffRoutineKeyFromFunction(fn: Pick<FunctionInfo, "name" | "arguments">): string {
   return schemaDiffRoutineKey(fn.name, fn.arguments);
 }
 
@@ -171,35 +167,24 @@ export interface FilteredSchemaDiffFunctions {
  * When `selectedRoutines` is undefined, both sides keep all listed functions.
  * Non-identity (rename) mappings are ignored until backend rematch lands.
  */
-export function filterSchemaDiffFunctions(sourceFunctions: FunctionInfo[], targetFunctions: FunctionInfo[], selectedRoutines: string[] | undefined, routineMappings: SchemaDiffRoutineMapping[] = [], exactKind = false): FilteredSchemaDiffFunctions {
+export function filterSchemaDiffFunctions(sourceFunctions: FunctionInfo[], targetFunctions: FunctionInfo[], selectedRoutines: string[] | undefined, routineMappings: SchemaDiffRoutineMapping[] = []): FilteredSchemaDiffFunctions {
   if (selectedRoutines === undefined) {
     return { sourceFunctions, targetFunctions };
   }
 
   const selectedSet = new Set(selectedRoutines);
-  const typed = exactKind || [...sourceFunctions, ...targetFunctions].some((fn) => fn.function_type === "PACKAGE" || fn.function_type === "PACKAGE_BODY");
-  const key = (fn: FunctionInfo) => schemaDiffRoutineKeyFromFunction(fn, typed);
-  const filteredSource = sourceFunctions.filter((fn) => selectedSet.has(key(fn)));
-  const targetByKey = new Map(targetFunctions.map((fn) => [key(fn), fn]));
+  const filteredSource = sourceFunctions.filter((fn) => selectedSet.has(schemaDiffRoutineKeyFromFunction(fn)));
+  const targetByKey = new Map(targetFunctions.map((fn) => [schemaDiffRoutineKeyFromFunction(fn), fn]));
   const targetKeys = [...targetByKey.keys()];
-  const mappings = reconcileSchemaDiffRoutineMappings(filteredSource.map(key), targetKeys, identitySchemaDiffRoutineMappings(routineMappings));
+  const mappings = reconcileSchemaDiffRoutineMappings(
+    filteredSource.map((fn) => schemaDiffRoutineKeyFromFunction(fn)),
+    targetKeys,
+    identitySchemaDiffRoutineMappings(routineMappings),
+  );
   const selectedTargetKeys = new Set(mappings.map((mapping) => mapping.targetRoutine));
-  if (typed) {
-    for (const target of targetFunctions) {
-      const targetPackage = target.function_type === "PACKAGE" || target.function_type === "PACKAGE_BODY";
-      if (
-        selectedSet.has(key(target)) ||
-        filteredSource.some((source) => {
-          const sourcePackage = source.function_type === "PACKAGE" || source.function_type === "PACKAGE_BODY";
-          return source.name === target.name && source.arguments.trim() === target.arguments.trim() && source.function_type !== target.function_type && !(sourcePackage && targetPackage);
-        })
-      )
-        selectedTargetKeys.add(key(target));
-    }
-  }
 
   return {
     sourceFunctions: filteredSource,
-    targetFunctions: targetFunctions.filter((fn) => selectedTargetKeys.has(key(fn))),
+    targetFunctions: targetFunctions.filter((fn) => selectedTargetKeys.has(schemaDiffRoutineKeyFromFunction(fn))),
   };
 }

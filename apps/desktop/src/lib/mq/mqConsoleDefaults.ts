@@ -67,7 +67,7 @@ export function isFlatMqSystemKind(kind: MqSystemKind | undefined): boolean {
   return kind === "kafka" || kind === "rocketmq" || kind === "rabbitmq";
 }
 
-export function defaultMqCapabilitiesForSystemKind(kind: MqSystemKind | undefined, config?: ConnectionConfig): MqCapabilities {
+export function defaultMqCapabilitiesForSystemKind(kind: MqSystemKind | undefined): MqCapabilities {
   if (kind === "kafka") {
     return {
       ...FLAT_MQ_BASE_CAPABILITIES,
@@ -76,27 +76,6 @@ export function defaultMqCapabilitiesForSystemKind(kind: MqSystemKind | undefine
     };
   }
   if (kind === "rocketmq") {
-    const extra = (config?.external_config as Partial<MqAdminConfig> | undefined)?.extra as Record<string, unknown> | undefined;
-    if (extra?.connectionMode === "proxy") {
-      return {
-        ...FLAT_MQ_BASE_CAPABILITIES,
-        supportsPartitionedTopics: false,
-        supportsSubscriptions: false,
-        supportsResetCursor: false,
-        supportsClearBacklog: false,
-        supportsPeekMessages: false,
-        supportsPermissions: false,
-        supportsListTopics: false,
-        supportsCreateTopic: false,
-        supportsDeleteTopic: false,
-        supportsTopicStats: false,
-        supportsBrokerAdmin: false,
-        supportsProducerListing: false,
-        supportsMessageQuery: false,
-        supportsMessageTrace: false,
-        supportsDlq: false,
-      };
-    }
     return {
       ...FLAT_MQ_BASE_CAPABILITIES,
       supportsMessageQuery: true,
@@ -184,11 +163,7 @@ export type MqTab = "tenants" | "namespaces" | "topics" | "subscriptions" | "con
 export function resolveAvailableMqTabs(options: { systemKind?: MqSystemKind; capabilities: MqCapabilities }): MqTab[] {
   const { systemKind, capabilities } = options;
   if (systemKind === "rocketmq") {
-    const tabs: MqTab[] = [];
-    if (capabilities.supportsBrokerAdmin !== false) tabs.push("broker");
-    if (capabilities.supportsListTopics !== false) tabs.push("topics");
-    if (capabilities.supportsSubscriptions) tabs.push("subscriptions");
-    if (capabilities.supportsProducerListing !== false) tabs.push("producers");
+    const tabs: MqTab[] = ["broker", "topics", "subscriptions", "producers"];
     if (capabilities.supportsMessageQuery || capabilities.supportsSendMessage) tabs.push("messages");
     if (capabilities.supportsMessageTrace) tabs.push("trace");
     if (capabilities.supportsPermissions) tabs.push("permissions");

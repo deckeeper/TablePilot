@@ -82,7 +82,6 @@ const { t } = useI18n();
 
 let shouldFocusAdjacentOnClose = false;
 let tabDirection: 1 | -1 = 1;
-let focusRestoreElement: HTMLElement | null = null;
 
 function getTriggerElement(): HTMLElement | undefined {
   const target = triggerButton.value;
@@ -201,19 +200,11 @@ watch(open, async (value) => {
     searchText.value = "";
     highlightIndex.value = -1;
     activeHelpOption.value = undefined;
-    const restoreTarget = focusRestoreElement;
-    focusRestoreElement = null;
     if (shouldFocusAdjacentOnClose) {
       const dir = tabDirection;
       shouldFocusAdjacentOnClose = false;
       await nextTick();
       focusAdjacentElement(dir);
-    } else if (restoreTarget) {
-      // Reka's modal popover refocuses the trigger synchronously on close, so
-      // the restore must land on the next tick to win for shortcut-opened
-      // dropdowns.
-      await nextTick();
-      if (restoreTarget.isConnected) restoreTarget.focus();
     }
     return;
   }
@@ -352,15 +343,6 @@ function handleKeydown(event: KeyboardEvent) {
     open.value = false;
   }
 }
-
-defineExpose({
-  openDropdown: () => {
-    if (props.disabled) return false;
-    focusRestoreElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    open.value = true;
-    return true;
-  },
-});
 </script>
 
 <template>

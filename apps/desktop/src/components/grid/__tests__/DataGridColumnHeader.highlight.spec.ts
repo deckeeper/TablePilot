@@ -23,7 +23,6 @@ function mountHeader(props: Record<string, unknown>) {
         columnNameLabel: "Column",
         columnTypeLabel: "Type",
         columnCommentLabel: "Comment",
-        columnSourceLabel: "Source",
         columnIndexLabel: "Index",
         columnPrimaryIndexLabel: "PK",
         columnUniqueIndexLabel: "Unique",

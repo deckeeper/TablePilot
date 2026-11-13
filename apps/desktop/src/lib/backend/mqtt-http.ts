@@ -15,7 +15,7 @@ export async function mqttSubscribe(_connectionId: string, _topic: string, _qos?
   mqttWebNotAvailable("mqttSubscribe");
 }
 
-export async function mqttSaveTopicConfig(_connectionId: string, _topic: string, _qos: string, _noLocal: boolean, _enabled = false, _alias = "") {
+export async function mqttSaveTopicConfig(_connectionId: string, _topic: string, _qos: string, _noLocal: boolean, _enabled = false) {
   mqttWebNotAvailable("mqttSaveTopicConfig");
 }
 

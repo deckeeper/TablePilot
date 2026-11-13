@@ -122,7 +122,7 @@ fn validate(key: &OracleForeignKeyDefinition, oracle: bool) -> Result<(), &'stat
     }
     if (!key.state.deferrable && key.state.initially_deferred)
         || (key.state.validated && key.state.rely)
-        || (key.state.deferrable && !oracle)
+        || (!oracle && (key.state.deferrable || key.state.initially_deferred))
     {
         return Err("The foreign key state is invalid or unsupported by this engine.");
     }

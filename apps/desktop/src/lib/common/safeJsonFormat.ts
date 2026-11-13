@@ -8,7 +8,6 @@ export interface LosslessJsonNumber {
 interface ProtectedJsonNumbers {
   text: string;
   numbers: Map<string, string>;
-  placeholderPrefix: string;
 }
 
 const MAX_SAFE_INTEGER_TEXT = String(Number.MAX_SAFE_INTEGER);
@@ -38,18 +37,13 @@ export function parseJsonPreservingLargeNumbers(text: string): unknown {
 export function safeJsonFormat(text: string, indent?: number): string {
   const protectedJson = protectLargeJsonNumbers(text);
   const parsed = JSON.parse(protectedJson.text);
-  const result = JSON.stringify(parsed, null, indent ?? undefined);
-  return restorePlaceholders(result, protectedJson.placeholderPrefix, protectedJson.numbers);
-}
+  let result = JSON.stringify(parsed, null, indent ?? undefined);
 
-/**
- * Swaps every quoted placeholder back for its original numeric literal in one pass. Replacing the
- * placeholders one at a time rescanned the whole document per number, which made formatting a large
- * JSON value with many decimals take seconds.
- */
-function restorePlaceholders(json: string, placeholderPrefix: string, numbers: Map<string, string>): string {
-  if (numbers.size === 0) return json;
-  return json.replace(new RegExp(`"${placeholderPrefix}(\\d+)__"`, "g"), (match) => numbers.get(match.slice(1, -1)) ?? match);
+  for (const [placeholder, raw] of protectedJson.numbers) {
+    result = result.replaceAll(JSON.stringify(placeholder), raw);
+  }
+
+  return result;
 }
 
 /**
@@ -74,7 +68,11 @@ export function stringifyJsonPreservingLargeNumbers(value: unknown, indent?: num
   );
 
   if (result === undefined) throw new TypeError("Value is not JSON serializable");
-  return restorePlaceholders(result, placeholderPrefix, numbers);
+  let restored = result;
+  for (const [placeholder, raw] of numbers) {
+    restored = restored.replaceAll(JSON.stringify(placeholder), raw);
+  }
+  return restored;
 }
 
 /**
@@ -381,7 +379,6 @@ function protectLargeJsonNumbers(text: string): ProtectedJsonNumbers {
   const numbers = new Map<string, string>();
   let output = "";
   let index = 0;
-  const numberPattern = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
 
   while (index < text.length) {
     const character = text[index];
@@ -392,8 +389,7 @@ function protectLargeJsonNumbers(text: string): ProtectedJsonNumbers {
       continue;
     }
 
-    numberPattern.lastIndex = index;
-    const numberMatch = numberPattern.exec(text);
+    const numberMatch = text.slice(index).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/);
     if (numberMatch) {
       const raw = numberMatch[0];
       if (shouldPreserveJsonNumber(raw)) {
@@ -412,7 +408,7 @@ function protectLargeJsonNumbers(text: string): ProtectedJsonNumbers {
     index += 1;
   }
 
-  return { text: output, numbers, placeholderPrefix };
+  return { text: output, numbers };
 }
 
 function findJsonStringEnd(text: string, start: number): number {

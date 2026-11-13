@@ -202,12 +202,11 @@ describe("connectionStore timeout recovery", () => {
     expect(store.connections[0]?.keepalive_interval_secs).toBe(30);
   });
 
-  it.each([undefined, false, true])("loads persisted editor settings before startup migrations (%s user visibility)", async (legacyVisible) => {
+  it("loads persisted editor settings before startup timeout migration", async () => {
     const callOrder: string[] = [];
     const loadEditorSettings = vi.fn(async () => {
       callOrder.push("settings");
       return {
-        sidebarShowUserAdmin: legacyVisible,
         appLayout: "separated",
         uiFontFamily: "persisted-font",
         snippets: [{ id: "persisted", label: "Persisted", prefix: "persisted", body: "SELECT 42", enabled: true }],
@@ -242,7 +241,6 @@ describe("connectionStore timeout recovery", () => {
     await useConnectionStore().initFromDisk();
 
     expect(callOrder).toEqual(["settings", "connections"]);
-    expect(loadConnections).toHaveBeenCalledWith(legacyVisible !== false);
     expect(saveEditorSettings).toHaveBeenCalledWith(
       expect.objectContaining({
         appLayout: "separated",
@@ -266,25 +264,6 @@ describe("connectionStore timeout recovery", () => {
     await expect(useConnectionStore().initFromDisk()).rejects.toThrow("settings unavailable");
     expect(loadConnections).not.toHaveBeenCalled();
     expect(saveEditorSettings).not.toHaveBeenCalled();
-  });
-
-  it("retries a failed visibility migration with the original legacy opt-out", async () => {
-    const loadConnections = vi.fn().mockRejectedValueOnce(new Error("migration failed")).mockResolvedValue([]);
-    vi.doMock("@/lib/backend/api", () => ({
-      loadEditorSettings: vi.fn().mockResolvedValue({ sidebarShowUserAdmin: false }),
-      loadConnections,
-      loadPinnedTreeNodeIds: vi.fn().mockResolvedValue([]),
-      loadSidebarLayout: vi.fn().mockResolvedValue(null),
-      loadTableVGroups: vi.fn().mockResolvedValue({}),
-      loadTunnelProfiles: vi.fn().mockResolvedValue([]),
-      saveEditorSettings: vi.fn().mockResolvedValue(undefined),
-      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
-    }));
-    const { useConnectionStore } = await import("@/stores/connectionStore");
-    const store = useConnectionStore();
-    await expect(store.initFromDisk()).rejects.toThrow("migration failed");
-    await store.initFromDisk();
-    expect(loadConnections.mock.calls).toEqual([[false], [false]]);
   });
 
   it("migrates legacy timeout defaults to global inheritance and preserves custom overrides", async () => {

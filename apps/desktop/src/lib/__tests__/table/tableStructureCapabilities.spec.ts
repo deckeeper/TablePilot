@@ -105,7 +105,6 @@ describe("tableStructureCapabilities", () => {
     expect(getTableStructureCapabilities("sqlserver", "sqlserver")).toMatchObject({
       addPrimaryKey: true,
       alterPrimaryKey: true,
-      foreignKey: true,
     });
     expect(getTableStructureCapabilities("oceanbase-oracle", "oceanbase-oracle")).toMatchObject({
       addPrimaryKey: true,

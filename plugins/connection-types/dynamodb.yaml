@@ -11,7 +11,7 @@ skipTcpProbe: false
 defaultPort: 8000
 supportLevel: operate
 capabilities:
-  queryExecution: true
+  queryExecution: false
   metadataBrowse: true
   objectBrowser: false
   objectSource: false

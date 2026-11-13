@@ -288,17 +288,6 @@ export function buildSqlSemanticDiagnostics(analysis: SqlReferenceAnalysis, sche
     });
   }
 
-  // A two-part qualifier that names neither a table nor an alias in scope
-  // (`b.id` when only `a` is declared) is an error on its own: the column
-  // itself cannot be checked, because no relation owns it.
-  for (const unknown of analysis.unknown_qualifiers ?? []) {
-    diagnostics.push({
-      span: trimSqlTextSpanWhitespace(schema.sql, unknown.span),
-      message: `Unknown table alias ${unknown.qualifier}`,
-      severity: "error",
-    });
-  }
-
   for (const column of analysis.columns) {
     if (isUnquotedOracleBuiltinReference(column, schema)) continue;
     const table = resolveColumnTable(column, tables, knownTables, schema.sql, scopesById);
@@ -418,20 +407,10 @@ function trimSqlTextSpanWhitespace(sql: string | undefined, span: SqlTextSpan): 
   };
 }
 
-/**
- * Converts a 1-based inclusive `SqlTextSpan` into a 0-based half-open offset range `[from, to)`.
- *
- * Both `start_column` and `end_column` are 1-based and inclusive.
- * For a single-line span, `from` is `span.start_column - 1` and `to` is `span.end_column`.
- * For example, a token from col 8 to 14 (`USER_ID`) maps to `[7, 14)` without overshooting
- * into a following delimiter such as `,` or `;`.
- */
-export function sqlTextSpanToOffsetRange(sql: string, span: SqlTextSpan): { from: number; to: number } | null {
+function sqlTextSpanToOffsetRange(sql: string, span: SqlTextSpan): { from: number; to: number } | null {
   if (!span.start_line || !span.start_column) return null;
   const from = sqlTextPositionToOffset(sql, span.start_line, span.start_column - 1);
-  const endLine = Math.max(span.end_line, span.start_line);
-  const endColumn = endLine === span.start_line ? Math.max(span.end_column, span.start_column) : span.end_column;
-  const to = sqlTextPositionToOffset(sql, endLine, endColumn);
+  const to = sqlTextPositionToOffset(sql, Math.max(span.end_line, span.start_line), Math.max(span.end_column, span.start_column));
   if (from == null || to == null || to <= from) return null;
   return { from, to };
 }
@@ -441,7 +420,7 @@ function sqlTextPositionToOffset(sql: string, line: number, column: number): num
   if (line < 1 || line > lines.length) return null;
   let offset = 0;
   for (let index = 0; index < line - 1; index += 1) {
-    offset = sql.indexOf("\n", offset) + 1;
+    offset += lines[index].length + 1;
   }
   return Math.min(offset + Math.max(column, 0), offset + lines[line - 1].length);
 }

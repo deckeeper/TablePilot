@@ -27,15 +27,13 @@ import {
   LocateFixed,
   Pencil,
   Play,
+  Search,
   Trash2,
   Upload,
   X,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { useSqlPanelSearchMode } from "@/composables/useSqlPanelSearchMode";
-import SidebarLocateButton from "@/components/sidebar/SidebarLocateButton.vue";
-import SqlPanelSearch from "@/components/layout/SqlPanelSearch.vue";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import CustomContextMenu, { type ContextMenuItem as CtxMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import ConnectionTreeSelect from "@/components/connection/ConnectionTreeSelect.vue";
@@ -58,10 +56,8 @@ import { savedSqlFolderBranchFileCount } from "@/lib/savedSql/savedSqlFolderCoun
 import { collectSavedSqlDirectoryImportFiles } from "@/lib/savedSql/savedSqlDirectoryImport";
 import { savedSqlBatchErrorMessage, savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { savedSqlDatabaseScopeKey } from "@/lib/savedSql/savedSqlDatabaseTree";
-import { getSavedSqlExpandedFolderIds, saveSavedSqlExpandedFolderIds } from "@/lib/savedSql/savedSqlUiState";
 import { ensureSqlExtension, extractCandidateDatabaseFromName, nextAvailableSqlName } from "@/lib/savedSql/savedSqlFileName";
 import { savedSqlImportTarget } from "@/lib/savedSql/savedSqlImportTarget";
-import { buildSavedSqlTreeRows, savedSqlFolderBranchMatches, type SavedSqlTreeRow } from "@/lib/savedSql/savedSqlTreeRows";
 import { savedSqlExecutionTargetFromTab, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { uniqueSavedSqlExportFileName, exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
 import { orderedListRangeAnchorIndex, orderedListSelectionIntent } from "@/lib/selection/orderedListSelection";
@@ -79,13 +75,8 @@ const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions, catalogOptions, loadingCatalogOptions, loadCatalogOptions, catalogDatabaseOptions, loadingCatalogDatabaseOptions, loadCatalogDatabaseOptions } = useDatabaseOptions();
 
-const props = defineProps<{
-  locateRequest?: { id: number; fileId: string } | null;
-}>();
-
 const emit = defineEmits<{
   close: [];
-  "locate-handled": [id: number];
 }>();
 
 const UNFILED_DROP_TARGET_ID = "__sql-library-unfiled__";
@@ -95,35 +86,16 @@ type DragItemType = "folder" | "file" | "unfiled";
 type DropPosition = "before" | "after" | "inside";
 
 const activeConnectionIds = computed(() => new Set(connectionStore.connections.map((c) => c.id)));
-const searchInput = ref<InstanceType<typeof SqlPanelSearch> | null>(null);
-const searchInputPending = ref(false);
-const searchQuery = ref("");
+const searchText = ref("");
+const searchQuery = computed(() => searchText.value.trim().toLowerCase());
 
-const searchMode = useSqlPanelSearchMode("library");
-const loadingSearchContent = ref(false);
-const unloadedSearchFiles = computed(() => savedSqlStore.allFiles.filter((file) => file.sqlLoaded === false));
-const contentSearchActive = computed(() => searchMode.value === "content" && !!searchQuery.value);
-
-async function loadSearchContent() {
-  if (searchInputPending.value || loadingSearchContent.value || !contentSearchActive.value || unloadedSearchFiles.value.length === 0) return;
-  loadingSearchContent.value = true;
-  try {
-    await savedSqlStore.ensureAllFilesLoaded();
-  } catch {
-    // Unloaded files remain visible in the incomplete-search status below.
-  } finally {
-    loadingSearchContent.value = false;
+watch(searchText, (text) => {
+  if (text.trim()) {
+    void savedSqlStore.ensureAllFilesLoaded();
   }
-}
+});
 
-watch(
-  () => [searchMode.value, searchQuery.value, searchInputPending.value, unloadedSearchFiles.value.map((file) => file.id).join("\n")],
-  () => {
-    void loadSearchContent();
-  },
-);
-
-// Sort mode: "folder" (manual sibling order) or "date" (updated date among siblings)
+// Sort mode: "folder" (default tree structure) or "date" (flat list by update date)
 const sortMode = ref<"folder" | "date">("folder");
 
 function getConnectionLabel(connectionId: string) {
@@ -382,13 +354,14 @@ async function openSqlStorageDirectory() {
 function fileMatchesQuery(file: SavedSqlFile) {
   const q = searchQuery.value;
   if (!q) return true;
-  return (searchMode.value === "name" ? file.name : file.sql).toLowerCase().includes(q);
+  return [file.name, file.database, file.schema, file.sql, getConnectionLabel(file.connectionId)].filter(Boolean).some((value) => String(value).toLowerCase().includes(q));
 }
 
 function folderMatchesQuery(folder: SavedSqlFolder) {
   const q = searchQuery.value;
   if (!q) return true;
-  return searchMode.value === "name" && folder.name.toLowerCase().includes(q);
+  if (folder.name.toLowerCase().includes(q)) return true;
+  return savedSqlStore.filesInFolder(folder.id).some((file) => fileMatchesQuery(file));
 }
 
 function childFolders(parentFolderId?: string) {
@@ -401,13 +374,13 @@ function descendantFolders(parentFolderId: string): SavedSqlFolder[] {
 }
 
 function folderBranchMatchesQuery(folder: SavedSqlFolder) {
-  if (!searchQuery.value) return true;
-  return savedSqlFolderBranchMatches(folder, savedSqlStore.allFolders, savedSqlStore.allFiles, folderMatchesQuery, fileMatchesQuery);
+  if (folderMatchesQuery(folder)) return true;
+  return descendantFolders(folder.id).some((child) => folderMatchesQuery(child));
 }
 
 function filesInFolder(folderId: string) {
   const folder = savedSqlStore.allFolders.find((item) => item.id === folderId);
-  const includeAllFilesForMatchedFolder = !!folder && !!searchQuery.value && folderMatchesQuery(folder);
+  const includeAllFilesForMatchedFolder = !!folder && !!searchQuery.value && folder.name.toLowerCase().includes(searchQuery.value);
   return savedSqlStore.filesInFolder(folderId).filter((file) => includeAllFilesForMatchedFolder || fileMatchesQuery(file));
 }
 
@@ -420,41 +393,64 @@ function allFilesInFolderBranch(folderId: string): SavedSqlFile[] {
   return savedSqlStore.allFiles.filter((file) => file.folderId && branchFolderIds.includes(file.folderId));
 }
 
-const treeRows = computed<SavedSqlTreeRow[]>(() =>
-  buildSavedSqlTreeRows(savedSqlStore.allFolders, savedSqlStore.allFiles, {
-    mode: sortMode.value,
-    isFolderExpanded,
-    folderMatches: searchQuery.value ? folderMatchesQuery : undefined,
-    fileMatches: searchQuery.value ? fileMatchesQuery : undefined,
-  }),
-);
+type SqlLibraryRow = { type: "folder"; folder: SavedSqlFolder; depth: number; folderIndex: number } | { type: "file"; file: SavedSqlFile; depth: number };
 
-const hasAnyVisibleItem = computed(() => treeRows.value.length > 0);
+const visibleFolderRows = computed<SqlLibraryRow[]>(() => {
+  const rows: SqlLibraryRow[] = [];
+  let folderIndex = 0;
+  const appendFolder = (folder: SavedSqlFolder, depth: number) => {
+    if (!folderBranchMatchesQuery(folder)) return;
+    rows.push({ type: "folder", folder, depth, folderIndex: folderIndex++ });
+    if (!isFolderExpanded(folder)) return;
+    for (const child of childFolders(folder.id)) {
+      appendFolder(child, depth + 1);
+    }
+    for (const file of filesInFolder(folder.id)) {
+      rows.push({ type: "file", file, depth: depth + 1 });
+    }
+  };
+  for (const folder of childFolders()) {
+    appendFolder(folder, 0);
+  }
+  return rows;
+});
 
-const expandedFolders = ref<Set<string>>(getSavedSqlExpandedFolderIds());
+const visibleFiles = computed(() => savedSqlStore.filesWithoutFolder().filter((file) => fileMatchesQuery(file)));
 
-function saveExpandedFoldersState() {
-  saveSavedSqlExpandedFolderIds(expandedFolders.value);
-}
+// Flat list sorted by updatedAt (descending) - combines all folders and files
+const itemsByDate = computed(() => {
+  const allFolders = savedSqlStore.allFolders.filter((folder) => folderBranchMatchesQuery(folder)).map((folder) => ({ type: "folder" as const, item: folder, updatedAt: folder.updatedAt }));
 
-// Prune deleted folder IDs when folder list is loaded or modified.
+  const allFiles = [...savedSqlStore.allFolders.flatMap((folder) => filesInFolder(folder.id)), ...visibleFiles.value].map((file) => ({ type: "file" as const, item: file, updatedAt: file.updatedAt }));
+
+  return [...allFolders, ...allFiles].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+});
+
+const hasAnyVisibleItem = computed(() => visibleFolderRows.value.length > 0 || visibleFiles.value.length > 0);
+
+const collapsedFolders = ref<Set<string>>(new Set());
+
+// Seed a default-collapsed state when the library first becomes non-empty so
+// opening the panel shows every directory collapsed instead of fully expanded.
+// Guarded so a later in-session folder add/delete does not re-collapse folders
+// the user has already expanded.
+const collapseDefaultsSeeded = ref(false);
 watch(
   () => savedSqlStore.allFolders.map((folder) => folder.id),
   (folderIds) => {
-    if (folderIds.length === 0 || expandedFolders.value.size === 0) return;
-    const validIds = new Set(folderIds);
-    const pruned = new Set([...expandedFolders.value].filter((id) => validIds.has(id)));
-    if (pruned.size !== expandedFolders.value.size) {
-      expandedFolders.value = pruned;
-      saveExpandedFoldersState();
-    }
+    if (collapseDefaultsSeeded.value || folderIds.length === 0) return;
+    collapseDefaultsSeeded.value = true;
+    collapsedFolders.value = new Set(folderIds);
   },
+  { immediate: true },
 );
 
 function collapseAllFolders() {
-  if (expandedFolders.value.size === 0) return;
-  expandedFolders.value = new Set();
-  saveExpandedFoldersState();
+  // Collapse the whole tree: every folder currently known, including nested
+  // children, is marked collapsed in one shot.
+  const folderIds = savedSqlStore.allFoldersTreeOrder.map((folder) => folder.id);
+  if (folderIds.length === 0) return;
+  collapsedFolders.value = new Set(folderIds);
 }
 
 function hasAnyFolder(): boolean {
@@ -470,17 +466,16 @@ function toggleFolder(folderId: string) {
     const folder = savedSqlStore.allFolders.find((candidate) => candidate.id === folderId);
     if (folder && folderBranchMatchesQuery(folder)) return;
   }
-  const next = new Set(expandedFolders.value);
+  const next = new Set(collapsedFolders.value);
   if (next.has(folderId)) next.delete(folderId);
   else next.add(folderId);
-  expandedFolders.value = next;
-  saveExpandedFoldersState();
+  collapsedFolders.value = next;
 }
 
 function isFolderExpanded(folder: SavedSqlFolder) {
   // 搜索激活时,命中的分支自动展开以便直接看到匹配文件;否则遵循折叠状态。
   if (searchQuery.value && folderBranchMatchesQuery(folder)) return true;
-  return expandedFolders.value.has(folder.id);
+  return !collapsedFolders.value.has(folder.id);
 }
 
 async function openNewFolderInput(parentFolderId?: string) {
@@ -489,12 +484,11 @@ async function openNewFolderInput(parentFolderId?: string) {
   const connectionId = parent?.connectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
   if (parent?.id) {
-    expandedFolders.value = new Set([...expandedFolders.value, parent.id]);
-    saveExpandedFoldersState();
+    collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== parent.id));
   }
   try {
     const folder = await savedSqlStore.createFolder(connectionId, t("savedSql.newFolderDefault"), parent?.id);
-    searchInput.value?.clear();
+    searchText.value = "";
     startRenameFolder(folder);
   } catch (e: any) {
     toast(t("savedSql.createFolderFailed", { message: e?.message || String(e) }), 5000);
@@ -505,8 +499,7 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
   const connectionId = folder?.connectionId || connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
   if (folder?.id) {
-    expandedFolders.value = new Set([...expandedFolders.value, folder.id]);
-    saveExpandedFoldersState();
+    collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== folder.id));
   }
 
   const folderFiles = folder ? savedSqlStore.filesInFolder(folder.id) : [];
@@ -548,53 +541,6 @@ const lastClickedItemIndex = ref<number | null>(null); // Unified index for both
 const activeItemId = ref<string | null>(null);
 const activeItemType = ref<"file" | "folder" | null>(null);
 const activeSavedSqlId = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId)?.savedSqlId ?? null);
-const libraryTree = ref<HTMLElement | null>(null);
-const currentSavedSqlFile = computed(() => (activeSavedSqlId.value ? savedSqlStore.getFile(activeSavedSqlId.value) : undefined));
-
-async function locateFile(fileId: string) {
-  const file = savedSqlStore.getFile(fileId);
-  if (!file) return;
-  if (searchInputPending.value || !treeRows.value.some((row) => row.type === "file" && row.file.id === file.id)) {
-    searchInput.value?.clear();
-  }
-  const expanded = new Set(expandedFolders.value);
-  const visited = new Set<string>();
-  let folderId = file.folderId;
-  while (folderId && !visited.has(folderId)) {
-    visited.add(folderId);
-    expanded.add(folderId);
-    folderId = savedSqlStore.allFolders.find((folder) => folder.id === folderId)?.parentFolderId;
-  }
-  expandedFolders.value = expanded;
-  saveExpandedFoldersState();
-  clearSelection();
-  activeItemId.value = file.id;
-  activeItemType.value = "file";
-  lastClickedItemIndex.value = treeRows.value.findIndex((row) => row.type === "file" && row.file.id === file.id);
-  await nextTick();
-  const row = Array.from(libraryTree.value?.querySelectorAll<HTMLElement>("[data-sql-library-file]") ?? []).find((element) => element.dataset.sqlLibraryFile === file.id);
-  row?.scrollIntoView({ block: "center", inline: "nearest" });
-}
-
-async function locateCurrentFile() {
-  const file = currentSavedSqlFile.value;
-  if (!file) return;
-  await locateFile(file.id);
-}
-
-watch(
-  [() => savedSqlStore.loadState, () => props.locateRequest],
-  async ([loadState, request]) => {
-    if (!request || loadState === "loading") return;
-    try {
-      await locateFile(request.fileId);
-    } finally {
-      emit("locate-handled", request.id);
-    }
-  },
-  { immediate: true, flush: "post" },
-);
-
 const hasCurrentSavedSqlExecutionTarget = computed(() => {
   const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
   const target = savedSqlExecutionTargetFromTab(activeTab);
@@ -616,10 +562,16 @@ watch(
 
 // Unified item list for selection, matching the currently rendered order.
 const allSelectableItems = computed(() => {
-  return treeRows.value.map((row) => ({
-    type: row.type,
-    id: row.type === "folder" ? row.folder.id : row.file.id,
-  }));
+  if (sortMode.value === "date") {
+    return itemsByDate.value.map((item) => ({
+      type: item.type,
+      id: item.item.id,
+    }));
+  }
+
+  const treeItems = visibleFolderRows.value.map((row) => (row.type === "folder" ? { type: "folder" as const, id: row.folder.id } : { type: "file" as const, id: row.file.id }));
+  const rootFiles = visibleFiles.value.map((file) => ({ type: "file" as const, id: file.id }));
+  return [...treeItems, ...rootFiles];
 });
 
 const hasSelection = computed(() => selectedFileIds.value.size > 0 || selectedFolderIds.value.size > 0);
@@ -1641,12 +1593,6 @@ function showDropAfter(targetId: string) {
 function showDropInside(targetId: string) {
   return dragState.active && dragState.targetId === targetId && dragState.dropPosition === "inside";
 }
-
-defineExpose({
-  locateFile,
-  locateCurrentFile,
-  searchInput,
-});
 </script>
 
 <template>
@@ -1659,7 +1605,7 @@ defineExpose({
       <span v-if="hasSelection" class="text-[12px] text-muted-foreground ml-1">({{ selectedCount }})</span>
       <span class="flex-1" />
       <LightTooltip :text="t('sqlLibrary.collapseAll')" side="bottom" :delay="0" :close-delay="0" nowrap :disabled="!hasAnyFolder()">
-        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!hasAnyFolder()" @click="collapseAllFolders">
+        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!hasAnyFolder() || sortMode === 'date'" @click="collapseAllFolders">
           <ChevronsDownUp class="h-3 w-3" />
         </Button>
       </LightTooltip>
@@ -1667,9 +1613,6 @@ defineExpose({
         <Button variant="ghost" size="icon" class="h-5 w-5" @click="sortMode = sortMode === 'folder' ? 'date' : 'folder'">
           <ArrowDownWideNarrow :class="['h-3 w-3', sortMode === 'date' ? 'text-primary' : '']" />
         </Button>
-      </LightTooltip>
-      <LightTooltip :text="t('sqlFileTree.locateActiveFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
-        <SidebarLocateButton class="disabled:pointer-events-none disabled:opacity-50" :label="t('sqlFileTree.locateActiveFile')" :disabled="!currentSavedSqlFile" @locate="locateCurrentFile" />
       </LightTooltip>
       <LightTooltip :text="t('savedSql.newFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
         <Button variant="ghost" size="icon" class="h-5 w-5" @click="openNewFolderInput()">
@@ -1694,15 +1637,25 @@ defineExpose({
     </div>
 
     <div class="border-b shrink-0 px-2 py-1">
-      <SqlPanelSearch ref="searchInput" v-model:mode="searchMode" panel="library" @query="searchQuery = $event" @pending="searchInputPending = $event" />
-      <p v-if="searchInputPending || (contentSearchActive && loadingSearchContent)" class="mt-1 text-xs text-muted-foreground" role="status" aria-live="polite">{{ t("sqlFileTree.searching") }}</p>
-      <p v-else-if="contentSearchActive && unloadedSearchFiles.length" class="mt-1 text-xs text-destructive" role="status">
-        {{ t("sqlLibrary.searchContentIncomplete", { count: unloadedSearchFiles.length }) }}
-        <button type="button" class="underline" @click="loadSearchContent">{{ t("common.retry") }}</button>
-      </p>
+      <div class="relative">
+        <Search class="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground" />
+        <input
+          data-sql-library-search
+          v-model="searchText"
+          @focus="savedSqlStore.ensureAllFilesLoaded()"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+          class="w-full h-6 pl-7 pr-6 text-[13px] rounded border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+          :placeholder="t('grid.search')"
+        />
+        <button v-if="searchText" type="button" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" @click="searchText = ''">
+          <X class="h-3 w-3" />
+        </button>
+      </div>
     </div>
 
-    <div ref="libraryTree" class="min-h-0 flex-1 overflow-y-auto py-1">
+    <div class="min-h-0 flex-1 overflow-y-auto py-1">
       <CustomContextMenu :items="contextMenuItems" @close="clearContextTarget">
         <template #default="{ onContextMenu }">
           <div
@@ -1714,90 +1667,23 @@ defineExpose({
               onContextMenu($event);
             "
           >
-            <div
-              v-if="dragState.draggedType === 'file'"
-              class="relative px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground"
-              :class="showDropInside(UNFILED_DROP_TARGET_ID) ? 'ring-1 ring-primary/50 bg-primary/5' : ''"
-              @mousemove="updateDropTarget($event, UNFILED_DROP_TARGET_ID, 'unfiled')"
-              @mouseleave="clearDropTarget(UNFILED_DROP_TARGET_ID)"
-            >
-              {{ t("sqlLibrary.unfiled") }}
-            </div>
-
-            <div v-for="row in treeRows" :key="row.type + '-' + (row.type === 'folder' ? row.folder.id : row.file.id)">
-              <div
-                v-if="row.type === 'folder'"
-                class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
-                :data-sql-library-folder="row.folder.id"
-                :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
-                :class="[showDropInside(row.folder.id) ? 'ring-1 ring-primary/50 bg-primary/5' : folderRowClass(row.folder.id), isDraggingItem(row.folder.id) ? 'opacity-50' : '']"
-                @mousedown="handleDragMouseDown($event, row.folder.id, 'folder')"
-                @mousemove="updateDropTarget($event, row.folder.id, 'folder')"
-                @mouseleave="clearDropTarget(row.folder.id)"
-                @click="handleFolderClick(row.folder, $event)"
-                @contextmenu.capture="contextTarget = row.folder"
-                @contextmenu.prevent="
-                  contextTarget = row.folder;
-                  onContextMenu($event);
-                "
-              >
-                <div v-if="showDropBefore(row.folder.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
-                <div v-if="showDropAfter(row.folder.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
-                <component :is="isFolderExpanded(row.folder) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" />
-                <template v-if="isRenamingFolder(row.folder.id)">
-                  <input
-                    :ref="setRenameInputRef"
-                    v-model="renameValue"
-                    data-preserve-editor-focus
-                    data-no-drag="true"
-                    class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
-                    @keydown.enter.prevent="confirmRename"
-                    @keydown.escape.prevent="cancelRename"
-                    @focus="handleRenameInputFocus"
-                    @blur="handleRenameInputBlur"
-                    @mousedown.stop
-                    @click.stop
-                  />
-                </template>
-                <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
-                  {{ row.folder.name }}
-                  <span class="ml-1 text-muted-foreground">({{ folderFileCount(row.folder.id) }})</span>
-                </span>
-                <LightTooltip v-if="!isRenamingFolder(row.folder.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
-                  <button
-                    type="button"
-                    data-no-drag="true"
-                    class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    :aria-label="t('savedSql.newSubfolder')"
-                    @mousedown.stop
-                    @click.stop="openNewFolderInput(row.folder.id)"
-                  >
-                    <FolderPlus class="h-3.5 w-3.5" />
-                  </button>
-                </LightTooltip>
-              </div>
-
-              <template v-else>
+            <!-- Flat list sorted by date -->
+            <div v-if="sortMode === 'date'" class="space-y-0">
+              <div v-for="item in itemsByDate" :key="item.type + '-' + item.item.id">
                 <div
-                  class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
-                  :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
-                  :data-sql-library-file="row.file.id"
-                  :class="[fileRowClass(row.file.id), isDraggingItem(row.file.id) ? 'opacity-50' : '']"
-                  @mousedown="handleDragMouseDown($event, row.file.id, 'file')"
-                  @mousemove="updateDropTarget($event, row.file.id, 'file')"
-                  @mouseleave="clearDropTarget(row.file.id)"
-                  @click="handleFileClick(row.file, $event)"
-                  @contextmenu.capture="contextTarget = row.file"
+                  v-if="item.type === 'folder'"
+                  class="relative flex cursor-default items-center gap-1 px-2 py-1.5 text-[13px] group"
+                  :class="[folderRowClass(item.item.id), isDraggingItem(item.item.id) ? 'opacity-50' : '']"
+                  @mousedown="handleDragMouseDown($event, item.item.id, 'folder')"
+                  @click="handleFolderClick(item.item, $event)"
+                  @contextmenu.capture="contextTarget = item.item"
                   @contextmenu.prevent="
-                    contextTarget = row.file;
+                    contextTarget = item.item;
                     onContextMenu($event);
                   "
                 >
-                  <div v-if="showDropBefore(row.file.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
-                  <div v-if="showDropAfter(row.file.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
-                  <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
-                  <span v-if="isFileDirty(row.file)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
-                  <template v-if="isRenamingFile(row.file.id)">
+                  <FolderClosed class="h-4 w-4 text-amber-500 shrink-0" />
+                  <template v-if="isRenamingFolder(item.item.id)">
                     <input
                       :ref="setRenameInputRef"
                       v-model="renameValue"
@@ -1812,21 +1698,216 @@ defineExpose({
                       @click.stop
                     />
                   </template>
-                  <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate" :title="fileTitleLabel(row.file)" :style="fileTitleStyle(row.file)">{{ row.file.name }}</span>
-                  <span class="min-w-0 max-w-[45%] shrink truncate text-[13px]" :class="fileMetaClass(row.file.id)" :title="getConnectionLabel(row.file.connectionId)">[{{ getConnectionLabel(row.file.connectionId) }}]</span>
+                  <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
+                    {{ item.item.name }}
+                    <span class="ml-1 text-muted-foreground">({{ folderFileCount(item.item.id) }})</span>
+                  </span>
+                  <LightTooltip v-if="!isRenamingFolder(item.item.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
+                    <button
+                      type="button"
+                      data-no-drag="true"
+                      class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :aria-label="t('savedSql.newSubfolder')"
+                      @mousedown.stop
+                      @click.stop="openNewFolderInput(item.item.id)"
+                    >
+                      <FolderPlus class="h-3.5 w-3.5" />
+                    </button>
+                  </LightTooltip>
                 </div>
-                <SqlLibrarySearchSnippet v-if="contentSearchActive" :file="row.file" :query="searchQuery" :depth="row.depth" @select-match="(match) => handleMatchClick(row.file, match)" />
-              </template>
+
+                <template v-else>
+                  <div
+                    class="relative flex cursor-default items-center gap-1 px-2 py-1.5 text-[13px] group"
+                    :class="[fileRowClass(item.item.id), isDraggingItem(item.item.id) ? 'opacity-50' : '']"
+                    @mousedown="handleDragMouseDown($event, item.item.id, 'file')"
+                    @click="handleFileClick(item.item, $event)"
+                    @contextmenu.capture="contextTarget = item.item"
+                    @contextmenu.prevent="
+                      contextTarget = item.item;
+                      onContextMenu($event);
+                    "
+                  >
+                    <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
+                    <span v-if="isFileDirty(item.item)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
+                    <template v-if="isRenamingFile(item.item.id)">
+                      <input
+                        :ref="setRenameInputRef"
+                        v-model="renameValue"
+                        data-preserve-editor-focus
+                        data-no-drag="true"
+                        class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
+                        @keydown.enter.prevent="confirmRename"
+                        @keydown.escape.prevent="cancelRename"
+                        @focus="handleRenameInputFocus"
+                        @blur="handleRenameInputBlur"
+                        @mousedown.stop
+                        @click.stop
+                      />
+                    </template>
+                    <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate" :title="fileTitleLabel(item.item)" :style="fileTitleStyle(item.item)">{{ item.item.name }}</span>
+                    <span class="min-w-0 max-w-[45%] shrink truncate text-[13px]" :class="fileMetaClass(item.item.id)" :title="getConnectionLabel(item.item.connectionId)">[{{ getConnectionLabel(item.item.connectionId) }}]</span>
+                  </div>
+                  <SqlLibrarySearchSnippet v-if="searchQuery" :file="item.item" :query="searchQuery" @select-match="(match) => handleMatchClick(item.item, match)" />
+                </template>
+              </div>
             </div>
+
+            <!-- Tree structure sorted by folder -->
+            <div v-else>
+              <div v-for="row in visibleFolderRows" :key="row.type === 'folder' ? row.folder.id : row.file.id">
+                <div
+                  v-if="row.type === 'folder'"
+                  class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
+                  :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
+                  :class="[showDropInside(row.folder.id) ? 'ring-1 ring-primary/50 bg-primary/5' : folderRowClass(row.folder.id), isDraggingItem(row.folder.id) ? 'opacity-50' : '']"
+                  @mousedown="handleDragMouseDown($event, row.folder.id, 'folder')"
+                  @mousemove="updateDropTarget($event, row.folder.id, 'folder')"
+                  @mouseleave="clearDropTarget(row.folder.id)"
+                  @click="handleFolderClick(row.folder, $event)"
+                  @contextmenu.capture="contextTarget = row.folder"
+                  @contextmenu.prevent="
+                    contextTarget = row.folder;
+                    onContextMenu($event);
+                  "
+                >
+                  <div v-if="showDropBefore(row.folder.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
+                  <div v-if="showDropAfter(row.folder.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
+                  <component :is="isFolderExpanded(row.folder) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" />
+                  <template v-if="isRenamingFolder(row.folder.id)">
+                    <input
+                      :ref="setRenameInputRef"
+                      v-model="renameValue"
+                      data-preserve-editor-focus
+                      data-no-drag="true"
+                      class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
+                      @keydown.enter.prevent="confirmRename"
+                      @keydown.escape.prevent="cancelRename"
+                      @focus="handleRenameInputFocus"
+                      @blur="handleRenameInputBlur"
+                      @mousedown.stop
+                      @click.stop
+                    />
+                  </template>
+                  <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
+                    {{ row.folder.name }}
+                    <span class="ml-1 text-muted-foreground">({{ folderFileCount(row.folder.id) }})</span>
+                  </span>
+                  <LightTooltip v-if="!isRenamingFolder(row.folder.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
+                    <button
+                      type="button"
+                      data-no-drag="true"
+                      class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :aria-label="t('savedSql.newSubfolder')"
+                      @mousedown.stop
+                      @click.stop="openNewFolderInput(row.folder.id)"
+                    >
+                      <FolderPlus class="h-3.5 w-3.5" />
+                    </button>
+                  </LightTooltip>
+                </div>
+
+                <template v-else>
+                  <div
+                    class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
+                    :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
+                    :class="[fileRowClass(row.file.id), isDraggingItem(row.file.id) ? 'opacity-50' : '']"
+                    @mousedown="handleDragMouseDown($event, row.file.id, 'file')"
+                    @mousemove="updateDropTarget($event, row.file.id, 'file')"
+                    @mouseleave="clearDropTarget(row.file.id)"
+                    @click="handleFileClick(row.file, $event)"
+                    @contextmenu.capture="contextTarget = row.file"
+                    @contextmenu.prevent="
+                      contextTarget = row.file;
+                      onContextMenu($event);
+                    "
+                  >
+                    <div v-if="showDropBefore(row.file.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
+                    <div v-if="showDropAfter(row.file.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
+                    <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
+                    <span v-if="isFileDirty(row.file)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
+                    <template v-if="isRenamingFile(row.file.id)">
+                      <input
+                        :ref="setRenameInputRef"
+                        v-model="renameValue"
+                        data-preserve-editor-focus
+                        data-no-drag="true"
+                        class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
+                        @keydown.enter.prevent="confirmRename"
+                        @keydown.escape.prevent="cancelRename"
+                        @focus="handleRenameInputFocus"
+                        @blur="handleRenameInputBlur"
+                        @mousedown.stop
+                        @click.stop
+                      />
+                    </template>
+                    <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate" :title="fileTitleLabel(row.file)" :style="fileTitleStyle(row.file)">{{ row.file.name }}</span>
+                    <span class="min-w-0 max-w-[45%] shrink truncate text-[13px]" :class="fileMetaClass(row.file.id)" :title="getConnectionLabel(row.file.connectionId)">[{{ getConnectionLabel(row.file.connectionId) }}]</span>
+                  </div>
+                  <SqlLibrarySearchSnippet v-if="searchQuery" :file="row.file" :query="searchQuery" :depth="row.depth" @select-match="(match) => handleMatchClick(row.file, match)" />
+                </template>
+              </div>
+
+              <div v-if="visibleFiles.length > 0 || dragState.draggedType === 'file'">
+                <div
+                  v-if="dragState.draggedType === 'file'"
+                  class="relative px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground"
+                  :class="showDropInside(UNFILED_DROP_TARGET_ID) ? 'ring-1 ring-primary/50 bg-primary/5' : ''"
+                  @mousemove="updateDropTarget($event, UNFILED_DROP_TARGET_ID, 'unfiled')"
+                  @mouseleave="clearDropTarget(UNFILED_DROP_TARGET_ID)"
+                >
+                  {{ t("sqlLibrary.unfiled") }}
+                </div>
+                <template v-for="file in visibleFiles" :key="file.id">
+                  <div
+                    class="relative flex cursor-default items-center gap-1 px-2 py-1.5 text-[13px] group"
+                    :class="[fileRowClass(file.id), isDraggingItem(file.id) ? 'opacity-50' : '']"
+                    @mousedown="handleDragMouseDown($event, file.id, 'file')"
+                    @mousemove="updateDropTarget($event, file.id, 'file')"
+                    @mouseleave="clearDropTarget(file.id)"
+                    @click="handleFileClick(file, $event)"
+                    @contextmenu.capture="contextTarget = file"
+                    @contextmenu.prevent="
+                      contextTarget = file;
+                      onContextMenu($event);
+                    "
+                  >
+                    <div v-if="showDropBefore(file.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
+                    <div v-if="showDropAfter(file.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
+                    <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
+                    <span v-if="isFileDirty(file)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
+                    <template v-if="isRenamingFile(file.id)">
+                      <input
+                        :ref="setRenameInputRef"
+                        v-model="renameValue"
+                        data-preserve-editor-focus
+                        data-no-drag="true"
+                        class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
+                        @keydown.enter.prevent="confirmRename"
+                        @keydown.escape.prevent="cancelRename"
+                        @focus="handleRenameInputFocus"
+                        @blur="handleRenameInputBlur"
+                        @mousedown.stop
+                        @click.stop
+                      />
+                    </template>
+                    <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate" :title="fileTitleLabel(file)" :style="fileTitleStyle(file)">{{ file.name }}</span>
+                    <span class="min-w-0 max-w-[45%] shrink truncate text-[13px]" :class="fileMetaClass(file.id)" :title="getConnectionLabel(file.connectionId)">[{{ getConnectionLabel(file.connectionId) }}]</span>
+                  </div>
+                  <SqlLibrarySearchSnippet v-if="searchQuery" :file="file" :query="searchQuery" @select-match="(match) => handleMatchClick(file, match)" />
+                </template>
+              </div>
+            </div>
+            <!-- End tree structure -->
 
             <div v-if="savedSqlStore.loadState === 'idle' || savedSqlStore.loadState === 'loading'" class="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground" role="status" aria-live="polite">
               <Loader2 class="h-6 w-6 animate-spin motion-reduce:animate-none" aria-hidden="true" />
               <p class="text-[13px]">{{ t("common.loading") }}</p>
             </div>
 
-            <div v-else-if="!hasAnyVisibleItem && !(searchInputPending || (contentSearchActive && (loadingSearchContent || unloadedSearchFiles.length)))" class="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
+            <div v-else-if="!hasAnyVisibleItem" class="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
               <Library class="h-8 w-8 opacity-30" />
-              <p class="text-[13px]">{{ t(searchQuery ? "grid.noSearchResults" : "sqlLibrary.empty") }}</p>
+              <p class="text-[13px]">{{ t("sqlLibrary.empty") }}</p>
             </div>
           </div>
         </template>

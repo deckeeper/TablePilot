@@ -1,5 +1,4 @@
 import { pinyin } from "pinyin-pro";
-import type { SqlCompletionMatchMode } from "@/lib/sql/sqlCompletionMatchMode";
 
 const HAN_CHAR = /\p{Script=Han}/u;
 const ASCII_ALNUM = /[a-z0-9]/i;
@@ -12,7 +11,7 @@ const ASCII_QUERY = /^[a-z0-9]+$/;
  * Tiers: case-insensitive substring → pinyin initials ("zzj" highlights each
  * Han character of 总租金) → in-order fuzzy. Returns [] when nothing matches.
  */
-export function completionMatchRanges(label: string, query: string, matchMode: SqlCompletionMatchMode = "fuzzy"): number[] {
+export function completionMatchRanges(label: string, query: string): number[] {
   if (!query) return [];
   const lowerLabel = label.toLowerCase();
   const lowerQuery = query.toLowerCase();
@@ -23,10 +22,6 @@ export function completionMatchRanges(label: string, query: string, matchMode: S
   if (ASCII_QUERY.test(lowerQuery) && HAN_CHAR.test(label)) {
     const pinyinRanges = pinyinInitialMatchRanges(label, lowerQuery);
     if (pinyinRanges) return pinyinRanges;
-  }
-
-  if (matchMode === "contains") {
-    return [];
   }
 
   return fuzzyMatchRanges(lowerLabel, lowerQuery);

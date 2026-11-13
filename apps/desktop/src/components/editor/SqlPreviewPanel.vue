@@ -132,12 +132,8 @@ async function toggleFormat() {
 
   formatting.value = true;
   try {
-    let diagnostic: "custom-rules-fallback" | undefined;
-    formattedSql.value = await formatSqlText(props.sql, props.sqlFormatDialect ?? "generic", settingsStore.editorSettings.sqlFormatter, (value) => {
-      diagnostic = value;
-    });
+    formattedSql.value = await formatSqlText(props.sql, props.sqlFormatDialect ?? "generic", settingsStore.editorSettings.sqlFormatter);
     isFormatted.value = true;
-    if (diagnostic === "custom-rules-fallback") toast(t("settings.sqlFormatterFallbackNotice"), 4000);
     await highlightSql();
   } catch {
     toast(t("toolbar.formatSqlFailed"), 3000);
