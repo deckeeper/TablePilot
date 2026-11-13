@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 
 def run(*args, check=True, binary=False):
@@ -88,6 +89,47 @@ def summary(message):
             f.write(message + '\n')
 
 
+
+def compact_pr_body(repo, branch, tag, report):
+    applied = re.search(r'^## Applied upstream files \((\d+)\)', report, re.M)
+    held = re.search(r'^## Manual review required \((\d+)\)', report, re.M)
+    counts = ''
+    if applied and held:
+        counts = f"Proposed file changes: **{applied.group(1)}**. Files held for manual review: **{held.group(1)}**.\n\n"
+    return f'''# Review upstream {tag} for TablePilot
+
+{counts}[Full file-by-file report](https://github.com/{repo}/blob/{branch}/.tablepilot/proposals/{tag}.md)
+
+This cumulative proposal is a **draft**, never an automatic merge. The existing filter holds back modified TablePilot files, AI-related paths, dependencies and build configuration. It is not a complete semantic review: copied code may depend on skipped changes or reference AI functionality.
+
+Before merging, review all proposed and held changes, exclude AI/MCP functionality, preserve TablePilot customizations, resolve dependencies, refresh the source manifest, choose a release version, and complete frontend/native and database/import/export/SSH checks. Advance the pinned baseline only after reviewing the skipped changes.
+
+The sync workflow has not executed or validated upstream code. Do not merge this draft as-is.
+'''
+
+
+def ensure_draft_pr(repo, branch, tag, report):
+    # Include closed/merged PRs so an intentionally closed review is not reopened.
+    existing = json.loads(run('gh', 'pr', 'list', '--repo', repo, '--base', 'main',
+                              '--head', branch, '--state', 'all',
+                              '--json', 'number,state,url').stdout)
+    if existing:
+        summary(f"Proposal PR already exists ({existing[0]['state']}): {existing[0]['url']}. Existing review work was preserved.")
+        return
+    # The report can exceed GitHub's 65,536-character PR-body limit. Keep it in
+    # the branch and submit a bounded summary with a link to the complete report.
+    with tempfile.TemporaryDirectory(prefix='tablepilot-pr-') as tmp:
+        body_file = Path(tmp) / 'body.md'
+        body_file.write_text(compact_pr_body(repo, branch, tag, report), encoding='utf-8')
+        result = run('gh', 'pr', 'create', '--repo', repo, '--base', 'main', '--head', branch,
+                     '--draft', '--title', f'Review upstream {tag} updates for TablePilot',
+                     '--body-file', str(body_file), check=False)
+    if result.returncode:
+        summary(f'Candidate branch preserved: https://github.com/{repo}/compare/main...{branch}\n\nDraft PR creation was blocked: {result.stderr.strip()}\n\nIf Actions PR creation is disabled, enable Settings → Actions → General → Allow GitHub Actions to create and approve pull requests, then rerun this job.')
+        raise SystemExit('Draft PR creation failed; the candidate branch is preserved for retry.')
+    summary(f'Draft upstream update prepared: {result.stdout.strip()}')
+
+
 def main():
     config = json.loads(Path('.tablepilot/upstream.json').read_text())
     if config['repository'] != 't8y2/dbx':
@@ -105,7 +147,10 @@ def main():
         return
     branch = f'upstream/tablepilot-{tag}'
     if git('ls-remote', '--heads', 'origin', f'refs/heads/{branch}').stdout.strip():
-        summary(f'Proposal already exists: https://github.com/{repo}/compare/main...{branch}. Existing review work was preserved.')
+        # Retry a missing PR without regenerating or overwriting the branch.
+        git('fetch', '--no-tags', '--depth=1', 'origin', f'refs/heads/{branch}')
+        report = git('show', f'FETCH_HEAD:.tablepilot/proposals/{tag}.md').stdout
+        ensure_draft_pr(repo, branch, tag, report)
         return
     base = config['baseline_commit']
     if not re.fullmatch(r'[0-9a-f]{40}', base):
@@ -140,12 +185,7 @@ The baseline remains `{config['baseline_tag']}`. After reviewing every skipped c
     git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
     git('commit', '-m', f'Propose upstream {tag} updates for manual TablePilot review')
     git('push', 'origin', f'HEAD:refs/heads/{branch}')
-    result = run('gh', 'pr', 'create', '--repo', repo, '--base', 'main', '--head', branch,
-                 '--draft', '--title', f'Review upstream {tag} updates for TablePilot', '--body-file', str(report), check=False)
-    if result.returncode:
-        summary(f'Candidate branch created: https://github.com/{repo}/compare/main...{branch}\n\nDraft PR creation was blocked: {result.stderr.strip()}\n\nIf GitHub reports Actions PR creation is disabled, enable Settings → Actions → General → Allow GitHub Actions to create and approve pull requests, or open the PR from the compare link.')
-    else:
-        summary(f'Draft upstream update prepared: {result.stdout.strip()}')
+    ensure_draft_pr(repo, branch, tag, body)
 
 
 if __name__ == '__main__':
