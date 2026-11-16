@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use dbx_platform::fs_retry::rename_with_transient_lock_retry;
 use fs2::FileExt;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Url};
@@ -112,6 +113,10 @@ pub struct PluginMarketplacePlugin {
     pub tags: Vec<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// The plugin provides MCP tools (its manifest declares an `mcp`
+    /// contribution). Lets the store show the MCP mark before install.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_tools: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -800,7 +805,7 @@ fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
     // std::fs::rename atomically replaces an existing destination on POSIX
     // and Windows alike; remove-then-rename could lose the repository
     // document to a crash between the two calls.
-    crate::plugins::installer::rename_with_transient_lock_retry(&temporary, path).map_err(|error| error.to_string())?;
+    rename_with_transient_lock_retry(&temporary, path).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -843,6 +848,7 @@ mod tests {
                 icon: Some("../assets/icon.svg".to_string()),
                 tags: vec!["hello".to_string()],
                 permissions: vec!["host.events".to_string()],
+                mcp_tools: false,
                 source: None,
                 homepage: None,
                 license: Some("Apache-2.0".to_string()),
@@ -1119,6 +1125,7 @@ mod tests {
                 icon: None,
                 tags: vec![],
                 permissions: vec![],
+                mcp_tools: false,
                 source: None,
                 homepage: None,
                 license: None,

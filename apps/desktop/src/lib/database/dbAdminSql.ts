@@ -25,6 +25,31 @@ export interface TableAdminSqlOptions {
    * database type alone (Cloud Spanner's two dialects differ). Mirrors `identifierQuote` on the
    * table-data SQL options. */
   identifierQuote?: string;
+  /** The relation is a foreign table (PostgreSQL `relkind = 'f'`). PostgreSQL rejects `DROP TABLE`
+   * for those and needs `DROP FOREIGN TABLE`, so the drop statement follows the relation kind. */
+  foreignTable?: boolean;
+}
+
+/**
+ * Table admin SQL options for one Object Browser row.
+ *
+ * Lives here rather than inline in the component so the row → statement mapping is
+ * testable without mounting the browser. The foreign-table flag must come from the
+ * row's preserved `foreignTable` field, never from `row.type`: the row type
+ * normalizer folds a PostgreSQL foreign table into "TABLE", so a type check would
+ * miss it and the drop would fall back to `DROP TABLE`, which the server rejects
+ * (#14717 review).
+ */
+export function tableAdminSqlOptionsForRow(options: { row: { name: string; schema?: string | null; foreignTable?: boolean }; databaseType?: DatabaseType; schema?: string | null; identifierQuote?: string; cascade?: boolean }): TableAdminSqlOptions {
+  const result: TableAdminSqlOptions = {
+    databaseType: options.databaseType,
+    schema: options.schema,
+    tableName: options.row.name,
+    identifierQuote: options.identifierQuote,
+  };
+  if (options.cascade) result.cascade = true;
+  if (options.row.foreignTable) result.foreignTable = true;
+  return result;
 }
 
 export interface VacuumTableSqlOptions {
@@ -168,14 +193,6 @@ export function oracleDuplicateTableCreateOptions(options: { schema?: string | n
   };
 }
 
-function damengDuplicateTableName(targetName: string): string {
-  const hasLower = /[a-z]/.test(targetName);
-  const hasUpper = /[A-Z]/.test(targetName);
-  const hasSpecial = /[^a-zA-Z0-9_$#]/.test(targetName);
-  const hasInvalidStart = !/^[a-zA-Z_]/.test(targetName);
-  return (hasLower && hasUpper) || hasSpecial || hasInvalidStart ? targetName : targetName.toUpperCase();
-}
-
 function damengCloneIndexName(targetName: string, index: number): string {
   const normalized =
     targetName
@@ -200,7 +217,7 @@ export function damengDuplicateTableCreateOptions(options: { schema?: string | n
   return {
     databaseType: "dameng",
     schema: options.schema || undefined,
-    tableName: damengDuplicateTableName(options.targetName),
+    tableName: options.targetName,
     tableComment: options.tableComment || undefined,
     columns: createColumnDrafts(options.columns, "dameng").map((column, index) => ({
       ...column,
@@ -330,7 +347,7 @@ export async function buildDuplicateTableStructurePlan(options: DuplicateTableSt
   }
 
   let sourceColumns = options.sourceColumns;
-  if (options.databaseType === "vastbase") {
+  if (options.databaseType === "vastbase" || options.databaseType === "oscar") {
     sourceColumns ??= await api.getColumns(options.connectionId, options.database, options.schema || "", options.sourceName, options.catalog);
   }
   const sql = await buildDuplicateTableStructureSql({
@@ -339,7 +356,7 @@ export async function buildDuplicateTableStructurePlan(options: DuplicateTableSt
     sourceName: options.sourceName,
     targetName: options.targetName,
     tableComment: options.tableComment,
-    columnComments: options.databaseType === "vastbase" ? collectDuplicateTableColumnComments(sourceColumns ?? []) : [],
+    columnComments: options.databaseType === "vastbase" || options.databaseType === "oscar" ? collectDuplicateTableColumnComments(sourceColumns ?? []) : [],
     identifierQuote: options.identifierQuote,
   });
   return { sql, sourceColumns, executeAsScript: duplicateTableStructureRequiresScript(sql) };
