@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { createApp, nextTick, ref } from "vue";
+import { createApp, defineComponent, h, nextTick, ref } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,12 +9,12 @@ vi.mock("@/components/ui/CustomContextMenu.vue", () => ({
     name: "CustomContextMenuStub",
     props: ["items"],
     mounted() {
-      (this.$el as any).__ctxMenuItems = this.items;
+      (this.$el as any).__ctxMenuItems = typeof this.items === "function" ? this.items() : this.items;
     },
     updated() {
-      (this.$el as any).__ctxMenuItems = this.items;
+      (this.$el as any).__ctxMenuItems = typeof this.items === "function" ? this.items() : this.items;
     },
-    template: `<div class="ctx-menu-stub" :data-menu-items="JSON.stringify(items.map((item) => ({ label: item.label, disabled: item.disabled === true, visible: item.visible })))"><slot /></div>`,
+    template: `<div class="ctx-menu-stub" :data-menu-items="JSON.stringify((typeof items === 'function' ? items() : items).flatMap((item) => item.children ?? [item]).map((item) => ({ label: item.label, disabled: item.disabled === true, visible: item.visible })))"><slot /></div>`,
   },
 }));
 
@@ -48,6 +48,8 @@ vi.mock("@/components/icons/DatabaseIcon.vue", () => ({
 }));
 
 import EditorGroupTabBar from "../EditorGroupTabBar.vue";
+import { TAB_DRAG_SELECTION_CLASS } from "@/lib/tabs/tabDragSelection";
+import { TAB_WINDOW_TRANSFER, type useTabWindowTransfer } from "@/composables/useTabWindowTransfer";
 import { createNoopEditorToolbarActions, EDITOR_TOOLBAR_ACTIONS, type EditorToolbarActions } from "../editorToolbarActions";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
@@ -74,11 +76,14 @@ function mountBar(
   specialPageTabs?: { settingsOpen: boolean; settingsActive: boolean; driverStoreOpen: boolean; driverStoreActive: boolean; pluginCenterOpen: boolean; pluginCenterActive: boolean; driverUpdateCount: number },
   toolbarActions?: EditorToolbarActions,
   onSaveAllTabs?: () => void,
+  extraProps: Record<string, unknown> = {},
+  windowTransfer?: ReturnType<typeof useTabWindowTransfer>,
 ): Mounted {
   const store = useQueryStore();
   const host = createHost();
   const app = createApp(EditorGroupTabBar, {
     groupId,
+    ...extraProps,
     tabs: tabs.map((id) => store.tabs.find((candidate) => candidate.id === id)!),
     activeTabId,
     "onActivate-tab": onActivateTab,
@@ -89,6 +94,7 @@ function mountBar(
   // instance the test drives — otherwise drag validation runs against an
   // empty store and silently early-returns.
   app.use(activePinia);
+  if (windowTransfer) app.provide(TAB_WINDOW_TRANSFER, windowTransfer);
   if (toolbarActions) app.provide(EDITOR_TOOLBAR_ACTIONS, toolbarActions);
   app.use(
     createI18n({
@@ -105,6 +111,9 @@ function mountBar(
             tooltipDatabase: "Database:",
           },
           contextMenu: {
+            splitTab: "Split",
+            batchCloseTabs: "Close multiple tabs",
+            copyTabName: "Copy tab name",
             splitRight: "Split right",
             splitDown: "Split down",
             changeOrientation: "Change orientation",
@@ -124,7 +133,8 @@ function mountBar(
             fullTabTitle: "Full title",
             compactTabTitle: "Compact title",
           },
-          sidebar: { locateActiveTab: "Locate" },
+          sidebar: { locateActiveTab: "Locate", locateSqlFile: "Locate in SQL file list" },
+          sqlFileTree: { locateActiveFile: "Locate current file" },
         },
       },
     }),
@@ -181,6 +191,58 @@ describe("EditorGroupTabBar behavior", () => {
     setActivePinia(pinia);
   });
 
+  it.each(["pointerup", "pointercancel", "blur", "unmount"])("blocks content selection from pointerdown until %s", async (ending) => {
+    const store = useQueryStore();
+    useSettingsStore().editorSettings.tabSortMode = "manual";
+    const tabId = store.createTab("pg-1", "app", "Query");
+    const { app, host } = mountBar(store.groups[0].id, [tabId], tabId, pinia);
+    try {
+      await settle();
+      pointerDownOn(tabPill(host, tabId));
+      expect(document.documentElement.classList.contains(TAB_DRAG_SELECTION_CLASS)).toBe(true);
+      if (ending === "unmount") app.unmount();
+      else if (ending === "blur") window.dispatchEvent(new Event("blur"));
+      else window.dispatchEvent(new PointerEvent(ending, { bubbles: true, pointerId: 1 }));
+      expect(document.documentElement.classList.contains(TAB_DRAG_SELECTION_CLASS)).toBe(false);
+      const select = new Event("selectstart", { bubbles: true, cancelable: true });
+      document.body.dispatchEvent(select);
+      expect(select.defaultPrevented).toBe(false);
+    } finally {
+      if (ending !== "unmount") app.unmount();
+      host.remove();
+    }
+  });
+
+  it("hands a cross-window drag to the workspace coordinator without reordering the source group", async () => {
+    const store = useQueryStore();
+    useSettingsStore().editorSettings.tabSortMode = "manual";
+    const firstId = store.createTab("pg-1", "app", "Query 1");
+    const secondId = store.createTab("pg-1", "app", "Query 2");
+    const groupId = store.groups[0].id;
+    const coordinator = {
+      move: vi.fn(() => true),
+      end: vi.fn(() => true),
+      cancel: vi.fn(),
+      refreshOtherTabWindows: vi.fn(async () => {}),
+      otherTabWindows: ref([]),
+    } as unknown as ReturnType<typeof useTabWindowTransfer>;
+    const moveTab = vi.spyOn(store, "moveTabToGroup");
+    const { app, host } = mountBar(groupId, [firstId, secondId], secondId, pinia, undefined, undefined, undefined, undefined, {}, coordinator);
+    await settle();
+    vi.spyOn(document, "elementFromPoint").mockReturnValue(fakeDropTarget(secondId, groupId));
+
+    pointerDownOn(tabPill(host, firstId));
+    pointerMoveTo(70, 10);
+    pointerUpAt(70, 10);
+
+    expect(coordinator.move).toHaveBeenCalledWith(firstId, expect.any(PointerEvent), expect.any(Function));
+    expect(coordinator.end).toHaveBeenCalledWith(firstId, expect.any(PointerEvent));
+    expect(moveTab).not.toHaveBeenCalled();
+    expect(store.groups[0].tabIds).toEqual([firstId, secondId]);
+    app.unmount();
+    host.remove();
+  });
+
   it("opens a new query through the app action for this editor group", async () => {
     const store = useQueryStore();
     const id = store.createTab("pg-1", "app", "users", "data", "public");
@@ -191,11 +253,38 @@ describe("EditorGroupTabBar behavior", () => {
     await settle();
     const buttons = host.querySelectorAll<HTMLButtonElement>("[data-new-query-tab]");
     expect(buttons).toHaveLength(1);
+    expect(buttons[0]!.classList.contains("items-center")).toBe(true);
+    expect(buttons[0]!.classList.contains("justify-center")).toBe(true);
     buttons[0].click();
     expect(actions.newQuery).toHaveBeenCalledExactlyOnceWith(store.groups[0].id);
     actions.canNewQuery.value = false;
     await settle();
     expect(host.querySelector("[data-new-query-tab]")).toBeNull();
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps the tab list control at the far right of the new query button", async () => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    settings.editorSettings.appLayout = "separated";
+    settings.editorSettings.tabGroupMode = "connection";
+    settings.editorSettings.tabGroupRows = "two-row";
+    settings.editorSettings.tabPlacement = "top";
+    const id = store.createTab("pg-1", "app", "users", "data", "public");
+    const actions = createNoopEditorToolbarActions();
+    actions.canNewQuery = ref(true);
+    const { app, host } = mountBar(store.groups[0].id, [id], id, pinia, undefined, undefined, actions);
+    await settle();
+
+    const newQueryButton = host.querySelector<HTMLButtonElement>("[data-new-query-tab]");
+    const actionControls = host.querySelector<HTMLElement>(".has-tab-action-controls");
+    const overflowControl = host.querySelector<HTMLElement>(".tab-overflow-control");
+    expect(newQueryButton?.classList.contains("absolute")).toBe(true);
+    expect(newQueryButton?.classList.contains("right-7")).toBe(true);
+    expect(actionControls).not.toBeNull();
+    expect(overflowControl?.classList.contains("right-0")).toBe(true);
+
     app.unmount();
     host.remove();
   });
@@ -546,6 +635,24 @@ describe("EditorGroupTabBar behavior", () => {
     host.remove();
   });
 
+  it("groups tab actions without dropping split and bulk close commands", async () => {
+    const store = useQueryStore();
+    const id = store.createTab("pg-1", "app", "Query 1", "query");
+    const { app, host } = mountBar(store.groups[0].id, [id], id, pinia);
+    await settle();
+    const items = (tabPill(host, id).closest(".ctx-menu-stub") as any).__ctxMenuItems.filter((item: any) => item.visible !== false);
+    expect(items.map((item: any) => item.label)).toEqual(["Rename", "Duplicate", "Copy tab name", "Split", "", "Pin", "Save all tabs", "Reopen closed tab", "Close", "Close multiple tabs", "", "Full title", "Locate"]);
+    expect(items.find((item: any) => item.label === "Split").children.map((item: any) => item.label)).toEqual(["Split right", "Split down"]);
+    expect(
+      items
+        .find((item: any) => item.label === "Close multiple tabs")
+        .children.filter((item: any) => item.visible !== false)
+        .map((item: any) => item.label),
+    ).toEqual(["Close other tabs", "Close left tabs", "Close right tabs", "Close all tabs"]);
+    app.unmount();
+    host.remove();
+  });
+
   it("disables the split actions while only one tab exists, enabling them once a second tab joins", async () => {
     const store = useQueryStore();
     const onlyId = store.createTab("pg-1", "app", "Query 1", "query");
@@ -804,5 +911,115 @@ describe("EditorGroupTabBar behavior", () => {
 
     app.unmount();
     host.remove();
+  });
+
+  it("offers a close button on every tab in the collapsed vertical rail", async () => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    settings.editorSettings.tabPlacement = "left";
+    const firstId = store.createTab("pg-1", "app", "Query 1", "query");
+    const secondId = store.createTab("pg-1", "app", "Query 2", "query");
+    const { app, host } = mountBar(store.groups[0].id, [firstId, secondId], firstId, pinia, undefined, undefined, undefined, undefined, { tabBarCollapsed: true });
+    await settle();
+
+    // The rail is icon-only, so both a background tab and the active tab must
+    // expose a close affordance without the user switching to it first (#12942).
+    for (const tabId of [firstId, secondId]) {
+      const closeButtons = tabPill(host, tabId).querySelectorAll<HTMLButtonElement>("button[aria-label='Close']");
+      expect(closeButtons, tabId).toHaveLength(1);
+    }
+
+    tabPill(host, secondId).querySelector<HTMLButtonElement>("button[aria-label='Close']")!.click();
+    await settle();
+    expect(store.tabs.some((tab) => tab.id === secondId)).toBe(false);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("shows locate current file menu item for saved sql tab and emits locate-sql-library-file", async () => {
+    const store = useQueryStore();
+    const queryTabId = store.createTab("pg-1", "app", "Query 1", "query");
+    const savedSqlTabId = store.createTab("pg-1", "app", "Saved Query", "query");
+    store.tabs.find((tab) => tab.id === savedSqlTabId)!.savedSqlId = "saved-sql-1";
+    const mainGroup = store.groups[0];
+
+    const onLocateSqlLibraryFile = vi.fn();
+    const { app, host } = mountBar(mainGroup.id, [queryTabId, savedSqlTabId], queryTabId, pinia, undefined, undefined, undefined, undefined, { "onLocate-sql-library-file": onLocateSqlLibraryFile });
+    await settle();
+
+    const rawMenuFor = (tabId: string) => {
+      const pill = tabPill(host, tabId);
+      const stub = pill.closest<HTMLElement>(".ctx-menu-stub") as any;
+      return (stub?.__ctxMenuItems ?? []) as Array<{ label: string; action?: () => void; visible?: boolean }>;
+    };
+
+    const regularLocateItem = rawMenuFor(queryTabId).find((item) => item.label === "Locate current file");
+    expect(regularLocateItem?.visible).toBe(false);
+
+    const savedSqlLocateItem = rawMenuFor(savedSqlTabId).find((item) => item.label === "Locate current file");
+    expect(savedSqlLocateItem?.visible).toBe(true);
+
+    savedSqlLocateItem?.action?.();
+    expect(onLocateSqlLibraryFile).toHaveBeenCalledTimes(1);
+    expect(onLocateSqlLibraryFile).toHaveBeenCalledWith(expect.objectContaining({ id: savedSqlTabId, savedSqlId: "saved-sql-1" }));
+
+    app.unmount();
+    host.remove();
+  });
+});
+
+describe("active tab reveal scrolling (issue #12010)", () => {
+  // The Settings / Driver Manager / Plugin Center tabs live in the same
+  // scrollable row as regular query tabs. Centering every newly activated tab
+  // re-centered tabs that were already fully visible, which shoved those
+  // trailing special tabs out of the viewport as soon as the user switched back
+  // to the tab before Settings.
+  it("reveals an activated tab without recentering it", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    settings.editorSettings.tabGroupMode = "none";
+    const tabIds = Array.from({ length: 8 }, (_, index) => store.createTab("pg-1", "app", `Query ${index}`, "query"));
+    const mainGroup = store.groups[0]!;
+    const activeTabId = ref(tabIds[0]!);
+    const host = createHost();
+
+    const scrollIntoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(() => {});
+    try {
+      const Root = defineComponent({
+        setup() {
+          return () =>
+            h(EditorGroupTabBar, {
+              groupId: mainGroup.id,
+              tabs: store.tabs.slice(),
+              activeTabId: activeTabId.value,
+            });
+        },
+      });
+      const app = createApp(Root);
+      app.use(pinia);
+      app.use(
+        createI18n({
+          legacy: false,
+          locale: "en",
+          messages: { en: { common: { close: "Close" }, contextMenu: { closeTab: "Close" }, sidebar: { locateActiveTab: "Locate" } } },
+        }),
+      );
+      app.mount(host);
+      await settle();
+
+      scrollIntoView.mockClear();
+      activeTabId.value = tabIds[tabIds.length - 2]!;
+      await settle();
+
+      expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ inline: "nearest" }));
+
+      app.unmount();
+    } finally {
+      scrollIntoView.mockRestore();
+      host.remove();
+    }
   });
 });

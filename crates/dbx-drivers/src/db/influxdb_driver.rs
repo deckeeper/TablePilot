@@ -187,6 +187,11 @@ struct InfluxQueryResult {
     #[serde(default)]
     #[allow(dead_code)]
     statement_id: usize,
+    /// InfluxDB 2.x answers InfluxQL requests for buckets without a DBRP
+    /// mapping with HTTP 200 and a per-statement `error` in the body.
+    #[serde(default)]
+    #[allow(dead_code)]
+    error: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     series: Vec<InfluxSeries>,
@@ -297,8 +302,37 @@ async fn influx_query(client: &InfluxdbClient, sql: &str, database: Option<&str>
         return handle_influx_error(resp).await;
     }
     let response_text = resp.text().await.unwrap_or_default();
-    serde_json::from_str::<InfluxJsonResult>(&response_text)
-        .map_err(|e| format!("InfluxDB parse error: {e}; response: {response_text}"))
+    let json = serde_json::from_str::<InfluxJsonResult>(&response_text)
+        .map_err(|e| format!("InfluxDB parse error: {e}; response: {response_text}"))?;
+    if let Some(message) = influx_query_error_message(client, &json.results) {
+        log::warn!("[influxdb] query failed: {message}");
+        return Err(message);
+    }
+    Ok(json)
+}
+
+/// InfluxDB reports statement-level failures (a rejected InfluxQL query, an
+/// unmapped bucket in 2.x) with HTTP 200 and an `error` field on the result
+/// entry. Dropping that field made the grid report "query executed successfully"
+/// with zero rows, so a real failure looked like a healthy empty table (#14622).
+fn influx_query_error_message(client: &InfluxdbClient, results: &[InfluxQueryResult]) -> Option<String> {
+    let error = results
+        .iter()
+        .find_map(|result| result.error.as_deref().map(str::trim).filter(|message| !message.is_empty()))?;
+    // A multi-statement script can fail one statement while another still
+    // returns rows. Prefer the rows over a hard error so a working query never
+    // turns into a false failure; the statement failure stays in the log.
+    if results.iter().any(|result| !result.series.is_empty()) {
+        log::warn!("[influxdb] statement error alongside returned rows: {error}");
+        return None;
+    }
+    let mut message = format!("InfluxDB query error: {error}");
+    if client.version == InfluxdbApiVersion::V2 && error.to_ascii_lowercase().contains("database not found") {
+        message.push_str(
+            ". InfluxDB 2.x may require a DBRP mapping to serve InfluxQL for a bucket; map the bucket to a database and retention policy, or run a Flux query instead.",
+        );
+    }
+    Some(message)
 }
 
 async fn influx_v2_buckets(client: &InfluxdbClient, timeout: Duration) -> Result<Vec<InfluxBucket>, String> {
@@ -459,6 +493,111 @@ pub async fn get_columns(client: &InfluxdbClient, database: &str, table: &str) -
     Ok(influx_v1_columns(tag_series, field_series))
 }
 
+/// InfluxQL has no DDL, so "view DDL" for a 1.x measurement is a read-only,
+/// comment-only description of its schema (tag keys and typed field keys).
+/// Every line is an InfluxQL `--` comment so it can never be executed by accident.
+pub async fn table_ddl(client: &InfluxdbClient, database: &str, table: &str) -> Result<String, String> {
+    if client.version == InfluxdbApiVersion::V2 {
+        return Err("Viewing DDL is not supported for InfluxDB 2.x measurements".to_string());
+    }
+    let measurement = quote_influx_identifier(table);
+    let tag_result = influx_query(client, &format!("SHOW TAG KEYS FROM {measurement}"), Some(database))
+        .await
+        .map_err(|e| format!("Failed to read tag keys of measurement {table}: {e}"))?;
+    let field_result = influx_query(client, &format!("SHOW FIELD KEYS FROM {measurement}"), Some(database))
+        .await
+        .map_err(|e| format!("Failed to read field keys of measurement {table}: {e}"))?;
+    // The default retention policy is informational only; do not fail the whole DDL without it.
+    let default_rp =
+        match influx_query(client, &format!("SHOW RETENTION POLICIES ON {}", quote_influx_identifier(database)), None)
+            .await
+        {
+            Ok(result) => default_retention_policy(result.results.iter().flat_map(|r| &r.series)),
+            Err(_) => None,
+        };
+    Ok(render_v1_measurement_description(
+        database,
+        default_rp.as_deref(),
+        table,
+        tag_result.results.iter().flat_map(|r| &r.series),
+        field_result.results.iter().flat_map(|r| &r.series),
+    ))
+}
+
+fn default_retention_policy<'a>(mut series: impl Iterator<Item = &'a InfluxSeries>) -> Option<String> {
+    series.find_map(|series| {
+        let name_idx = series.columns.iter().position(|c| c == "name")?;
+        let default_idx = series.columns.iter().position(|c| c == "default")?;
+        series.values.iter().find_map(|row| {
+            if row.get(default_idx).and_then(serde_json::Value::as_bool) == Some(true) {
+                row.get(name_idx).and_then(serde_json::Value::as_str).map(str::to_string)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn render_v1_measurement_description<'a>(
+    database: &str,
+    default_rp: Option<&str>,
+    measurement: &str,
+    tag_series: impl Iterator<Item = &'a InfluxSeries>,
+    field_series: impl Iterator<Item = &'a InfluxSeries>,
+) -> String {
+    let mut tags: Vec<String> = Vec::new();
+    for name in tag_series
+        .flat_map(|series| &series.values)
+        .filter_map(|row| row.first().and_then(serde_json::Value::as_str))
+        .filter(|name| !name.is_empty())
+    {
+        if !tags.iter().any(|t| t == name) {
+            tags.push(name.to_string());
+        }
+    }
+    // A field key can carry several types across shards; keep each distinct type.
+    let mut fields: Vec<(String, Vec<String>)> = Vec::new();
+    for row in field_series.flat_map(|series| &series.values) {
+        let Some(name) = row.first().and_then(serde_json::Value::as_str).filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let field_type = row.get(1).and_then(serde_json::Value::as_str).unwrap_or("unknown").to_string();
+        match fields.iter_mut().find(|(n, _)| n == name) {
+            Some((_, types)) => {
+                if !types.contains(&field_type) {
+                    types.push(field_type);
+                }
+            }
+            None => fields.push((name.to_string(), vec![field_type])),
+        }
+    }
+
+    let mut lines = vec![
+        "-- InfluxDB 1.x measurement (read-only description; InfluxQL has no CREATE TABLE)".to_string(),
+        format!("-- database: {}", quote_influx_identifier(database)),
+    ];
+    if let Some(rp) = default_rp {
+        lines.push(format!("-- default retention policy: {}", quote_influx_identifier(rp)));
+    }
+    lines.push(format!("-- measurement: {}", quote_influx_identifier(measurement)));
+    lines.push("--".to_string());
+    if tags.is_empty() {
+        lines.push("-- tag keys: (none)".to_string());
+    } else {
+        lines.push("-- tag keys (indexed, string):".to_string());
+        lines.extend(tags.iter().map(|t| format!("--   {}", quote_influx_identifier(t))));
+    }
+    if fields.is_empty() {
+        lines.push("-- field keys: (none)".to_string());
+    } else {
+        lines.push("-- field keys:".to_string());
+        lines.extend(
+            fields.iter().map(|(name, types)| format!("--   {} {}", quote_influx_identifier(name), types.join(", "))),
+        );
+    }
+    lines.join("\n")
+}
+
 fn influx_v1_column(name: String, data_type: String, is_primary_key: bool, role: &str) -> ColumnInfo {
     ColumnInfo {
         name,
@@ -539,10 +678,12 @@ pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -
     if !series.is_empty() {
         let (columns, rows) = merge_v1_series(&series);
         return Ok(QueryResult {
+            deferred_large_value_cells: Vec::new(),
             column_sortables: columns.iter().map(|_| false).collect(),
             columns,
             column_types: vec![],
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             affected_rows: rows.len() as u64,
             rows,
@@ -559,8 +700,10 @@ pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -
     Ok(QueryResult {
         columns: vec![],
         column_types: vec![],
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
+        raw_key_cells: Vec::new(),
         spatial_values: vec![],
         rows: vec![],
         affected_rows: 0,
@@ -758,8 +901,10 @@ fn parse_flux_csv(text: &str, start: Instant) -> Result<QueryResult, String> {
     }
     let columns = headers.unwrap_or_default();
     Ok(QueryResult {
+        deferred_large_value_cells: Vec::new(),
         column_sortables: columns.iter().map(|_| false).collect(),
         spatial_columns: vec![],
+        raw_key_cells: Vec::new(),
         spatial_values: vec![],
         columns,
         column_types: vec![],
@@ -836,6 +981,98 @@ mod tests {
             version: InfluxdbApiVersion::V1,
             org: None,
         }
+    }
+
+    fn series(columns: &[&str], values: Vec<Vec<serde_json::Value>>) -> InfluxSeries {
+        InfluxSeries {
+            name: "m".to_string(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            values,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    fn v2_client() -> InfluxdbClient {
+        InfluxdbClient {
+            http: reqwest::Client::new(),
+            base_url: "http://localhost:8086".to_string(),
+            username: None,
+            password: Some("token-value".to_string()),
+            url_params: None,
+            default_database: None,
+            version: InfluxdbApiVersion::V2,
+            org: Some("DBX Org".to_string()),
+        }
+    }
+
+    #[test]
+    fn describes_measurement_with_tags_and_fields() {
+        let tags = [series(&["tagKey"], vec![vec![json!("host")], vec![json!("region")]])];
+        let fields = [series(
+            &["fieldKey", "fieldType"],
+            vec![vec![json!("usage"), json!("float")], vec![json!("count"), json!("integer")]],
+        )];
+        let ddl = render_v1_measurement_description("telegraf", Some("autogen"), "cpu", tags.iter(), fields.iter());
+        assert_eq!(
+            ddl,
+            "-- InfluxDB 1.x measurement (read-only description; InfluxQL has no CREATE TABLE)\n\
+-- database: \"telegraf\"\n\
+-- default retention policy: \"autogen\"\n\
+-- measurement: \"cpu\"\n\
+--\n\
+-- tag keys (indexed, string):\n\
+--   \"host\"\n\
+--   \"region\"\n\
+-- field keys:\n\
+--   \"usage\" float\n\
+--   \"count\" integer"
+        );
+    }
+
+    #[test]
+    fn describes_field_only_measurement_and_mixed_field_types() {
+        let fields = [series(
+            &["fieldKey", "fieldType"],
+            vec![
+                vec![json!("v"), json!("float")],
+                vec![json!("v"), json!("integer")],
+                vec![json!("v"), json!("float")],
+            ],
+        )];
+        let ddl = render_v1_measurement_description("db", None, "m", std::iter::empty(), fields.iter());
+        assert!(ddl.contains("-- tag keys: (none)"));
+        assert!(ddl.contains("--   \"v\" float, integer"));
+        assert!(!ddl.contains("retention policy"));
+    }
+
+    #[test]
+    fn description_escapes_special_measurement_names_and_stays_comment_only() {
+        let tags = [series(&["tagKey"], vec![vec![json!("主机 \"a\"")]])];
+        let ddl = render_v1_measurement_description(
+            "my db",
+            None,
+            "cpu load\n\"x\"\\y 温度",
+            tags.iter(),
+            std::iter::empty(),
+        );
+        assert!(ddl.contains("-- database: \"my db\""));
+        assert!(ddl.contains("-- measurement: \"cpu load\\n\\\"x\\\"\\\\y 温度\""));
+        assert!(ddl.contains("--   \"主机 \\\"a\\\"\""));
+        assert!(ddl.contains("-- field keys: (none)"));
+        assert!(ddl.lines().all(|line| line.starts_with("--")));
+    }
+
+    #[test]
+    fn finds_default_retention_policy() {
+        let rps = [series(
+            &["name", "duration", "shardGroupDuration", "replicaN", "default"],
+            vec![
+                vec![json!("short"), json!("1h0m0s"), json!("1h0m0s"), json!(1), json!(false)],
+                vec![json!("autogen"), json!("0s"), json!("168h0m0s"), json!(1), json!(true)],
+            ],
+        )];
+        assert_eq!(default_retention_policy(rps.iter()).as_deref(), Some("autogen"));
+        assert_eq!(default_retention_policy(std::iter::empty()), None);
     }
 
     #[test]
@@ -975,6 +1212,47 @@ mod tests {
 
         assert_eq!(client.version, InfluxdbApiVersion::V2);
         assert_eq!(client.org.as_deref(), Some("alias-org"));
+    }
+
+    #[test]
+    fn surfaces_per_statement_errors_from_a_two_hundred_response() {
+        let body = r#"{"results":[{"statement_id":0,"error":"database not found: \"wpg-表计\""}]}"#;
+        let json: InfluxJsonResult = serde_json::from_str(body).unwrap();
+        let message = influx_query_error_message(&v2_client(), &json.results).expect("statement error must surface");
+        assert!(message.contains("database not found"));
+        assert!(message.contains("DBRP mapping"));
+    }
+
+    #[test]
+    fn accepts_responses_that_carry_no_statement_error() {
+        let with_empty_series: InfluxJsonResult =
+            serde_json::from_str(r#"{"results":[{"statement_id":0,"series":[]}]}"#).unwrap();
+        assert_eq!(influx_query_error_message(&v1_client(), &with_empty_series.results), None);
+        let without_results: InfluxJsonResult = serde_json::from_str(r#"{"results":[]}"#).unwrap();
+        assert_eq!(influx_query_error_message(&v1_client(), &without_results.results), None);
+    }
+
+    #[test]
+    fn keeps_v1_error_messages_free_of_the_v2_mapping_hint() {
+        let json: InfluxJsonResult =
+            serde_json::from_str(r#"{"results":[{"statement_id":0,"error":"  database not found  "}]}"#).unwrap();
+        assert_eq!(
+            influx_query_error_message(&v1_client(), &json.results).as_deref(),
+            Some("InfluxDB query error: database not found")
+        );
+    }
+
+    #[test]
+    fn prefers_returned_rows_over_a_statement_error_in_a_script() {
+        let body = r#"{"results":[{"statement_id":0,"error":"boom"},{"statement_id":1,"series":[{"name":"m","columns":["time"],"values":[["2026-01-01T00:00:00Z"]]}]}]}"#;
+        let json: InfluxJsonResult = serde_json::from_str(body).unwrap();
+        assert_eq!(influx_query_error_message(&v2_client(), &json.results), None);
+    }
+
+    #[test]
+    fn ignores_blank_statement_errors() {
+        let json: InfluxJsonResult = serde_json::from_str(r#"{"results":[{"statement_id":0,"error":"   "}]}"#).unwrap();
+        assert_eq!(influx_query_error_message(&v1_client(), &json.results), None);
     }
 
     #[test]
