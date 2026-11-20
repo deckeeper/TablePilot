@@ -24,7 +24,7 @@ export const deleteConnectionsWithGroup = ref(false);
 export const showTableVGroupDialog = ref(false);
 export const tableVGroupName = ref("");
 /** Scope snapshot + creation payload for the table vgroup naming dialog. */
-export const tableVGroupDialogScope = shallowRef<TreeNode | null>(null);
+export const tableVGroupDialogScope = shallowRef<(TreeNode & TableVGroupScope) | null>(null);
 export const tableVGroupDialogParentGroupId = ref<string | null>(null);
 export const tableVGroupDialogTableNames = ref<string[]>([]);
 export const showTableVGroupDeleteConfirm = ref(false);
@@ -120,6 +120,8 @@ export const showDropDatabaseConfirm = ref(false);
 export const dropDatabaseLoading = ref(false);
 export const showDropMongoCollectionConfirm = ref(false);
 export const dropMongoCollectionLoading = ref(false);
+export const showClearMongoCollectionConfirm = ref(false);
+export const clearMongoCollectionLoading = ref(false);
 export const showRenameMongoCollectionDialog = ref(false);
 export const renameMongoCollectionName = ref("");
 export const renameMongoCollectionError = ref("");
