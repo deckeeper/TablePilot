@@ -5,6 +5,7 @@ import { buildGetDatabaseCommentSql } from "@/lib/database/dbAdminSql";
 import {
   defaultAutoCommitForDbType,
   isSchemaAware,
+  pagesTablePartitionsWithRootPage,
   supportsConnectionQueryActions,
   supportsConnectionScopedQueryExecution,
   supportsConnectionDatabaseBrowser,
@@ -17,6 +18,8 @@ import {
   supportsQueryExecution,
   supportsQueryTargetDatabaseListing,
   supportsQueryEditorBlockComments,
+  supportsShowSystemDatabases,
+  supportsShowSystemObjectsSetting,
   supportsSqlInListPaste,
   supportsTableImport,
   supportsTableVacuum,
@@ -32,6 +35,21 @@ import {
 describe("schema awareness", () => {
   it("keeps SQLite database aliases separate from schema-capable databases", () => {
     expect(isSchemaAware("sqlite")).toBe(false);
+  });
+
+  it("offers the show-system-objects setting on both levels", () => {
+    // MySQL-family engines keep information_schema/performance_schema/mysql/sys
+    // as databases, so the setting has to be reachable without schemaAware.
+    expect(supportsShowSystemObjectsSetting("mysql")).toBe(true);
+    expect(supportsShowSystemDatabases("mysql")).toBe(true);
+    expect(supportsShowSystemDatabases("doris")).toBe(true);
+    expect(supportsShowSystemDatabases("starrocks")).toBe(true);
+    expect(supportsShowSystemDatabases("goldendb")).toBe(true);
+    // Schema-aware engines still get the setting, but through the schema level:
+    // their database list stays blacklist-filtered (template0/template1).
+    expect(supportsShowSystemObjectsSetting("postgres")).toBe(true);
+    expect(supportsShowSystemDatabases("postgres")).toBe(false);
+    expect(supportsShowSystemObjectsSetting("manticoresearch")).toBe(false);
   });
 
   it("puts Cloud Spanner in both schema sets because they gate different surfaces", () => {
@@ -139,6 +157,11 @@ describe("connection query actions", () => {
 });
 
 describe("message queue query capabilities", () => {
+  it("advertises DynamoDB PartiQL execution and query entry points", () => {
+    expect(supportsQueryExecution("dynamodb")).toBe(true);
+    expect(supportsConnectionQueryActions("dynamodb")).toBe(true);
+    expect(supportsTransaction("dynamodb")).toBe(false);
+  });
   it("does not advertise query execution for broker surfaces", () => {
     expect(supportsQueryExecution("mq")).toBe(false);
     expect(supportsQueryExecution("mqtt")).toBe(false);
@@ -260,11 +283,11 @@ describe("usesProvenReadOnlyStickyTransactionState", () => {
     expect(usesProvenReadOnlyStickyTransactionState("postgres")).toBe(true);
     expect(usesProvenReadOnlyStickyTransactionState("gaussdb")).toBe(true);
     expect(usesProvenReadOnlyStickyTransactionState("opengauss")).toBe(true);
+    expect(usesProvenReadOnlyStickyTransactionState("kingbase")).toBe(true);
   });
 
   it("keeps databases without manual-transaction support on the legacy toolbar", () => {
     expect(usesProvenReadOnlyStickyTransactionState("doris")).toBe(false);
-    expect(usesProvenReadOnlyStickyTransactionState("kingbase")).toBe(false);
     expect(usesProvenReadOnlyStickyTransactionState("jdbc")).toBe(false);
     expect(usesProvenReadOnlyStickyTransactionState("redis")).toBe(false);
     expect(usesProvenReadOnlyStickyTransactionState(undefined)).toBe(false);
@@ -273,7 +296,7 @@ describe("usesProvenReadOnlyStickyTransactionState", () => {
   it("only enables sticky state where manual mode is reachable", () => {
     // The sticky UX gates commit/rollback in manual mode; a member without
     // transaction support could never reach it. Guards against drift.
-    for (const dbType of ["oracle", "oceanbase-oracle", "mysql", "postgres", "gaussdb", "opengauss"]) {
+    for (const dbType of ["oracle", "oceanbase-oracle", "mysql", "postgres", "gaussdb", "opengauss", "kingbase"]) {
       expect(supportsTransaction(dbType)).toBe(true);
     }
   });
@@ -354,6 +377,14 @@ describe("supportsTableImport", () => {
 
   it("keeps Xugu table import available", () => {
     expect(supportsTableImport("xugu")).toBe(true);
+  });
+
+  it("enables openGauss table import", () => {
+    expect(supportsTableImport("opengauss")).toBe(true);
+  });
+
+  it("enables SAP HANA table import", () => {
+    expect(supportsTableImport("saphana")).toBe(true);
   });
 });
 
@@ -446,5 +477,23 @@ describe("database namespace creation", () => {
     expect(databaseNodeNamespaceCreationTarget({ db_type: "goldendb" }, { type: "database", database: "app" })).toBeNull();
     expect(databaseNodeNamespaceCreationTarget({ db_type: "duckdb" }, { type: "database", database: "main" })).toBeNull();
     expect(databaseNodeNamespaceCreationTarget({ db_type: "jdbc" }, { type: "database", database: "main" })).toBeNull();
+  });
+});
+
+describe("root-paged table partitions", () => {
+  it("enables root paging only for native PostgreSQL-protocol drivers", () => {
+    for (const dbType of ["postgres", "redshift", "gaussdb", "kwdb", "opengauss"] as const) {
+      expect(pagesTablePartitionsWithRootPage({ db_type: dbType })).toBe(true);
+    }
+    expect(pagesTablePartitionsWithRootPage({ db_type: "postgres", driver_profile: "cloudberry" })).toBe(true);
+    expect(pagesTablePartitionsWithRootPage({ db_type: "mysql" })).toBe(false);
+    expect(pagesTablePartitionsWithRootPage({ db_type: "kingbase" })).toBe(false);
+    expect(pagesTablePartitionsWithRootPage(undefined)).toBe(false);
+  });
+
+  it("keeps GaussDB's external M/JDBC driver on row-based paging", () => {
+    expect(pagesTablePartitionsWithRootPage({ db_type: "gaussdb", driver_profile: "gaussdb-m" })).toBe(false);
+    expect(pagesTablePartitionsWithRootPage({ db_type: "gaussdb", driver_profile: "GAUSSDB-M" })).toBe(false);
+    expect(pagesTablePartitionsWithRootPage({ db_type: "gaussdb", driver_profile: "gaussdb" })).toBe(true);
   });
 });

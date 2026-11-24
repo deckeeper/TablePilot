@@ -1,29 +1,87 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted } from "vue";
+import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch, useId } from "vue";
 import { useI18n } from "vue-i18n";
-import { FolderOpen, FolderClosed, FileCode, FolderPlus, ChevronRight, ChevronDown, X, Trash2, RefreshCw, FolderSearch, Copy, Play, ChevronsUpDown, ChevronsDownUp, Settings, FilePlus, Pencil, LocateFixed } from "@lucide/vue";
+import {
+  FolderOpen,
+  FolderClosed,
+  FileCode,
+  FileSpreadsheet,
+  FileText,
+  ExternalLink,
+  FolderPlus,
+  ChevronRight,
+  ChevronDown,
+  X,
+  Trash2,
+  RefreshCw,
+  FolderSearch,
+  Copy,
+  Play,
+  ChevronsUpDown,
+  ChevronsDownUp,
+  Settings,
+  FilePlus,
+  Pencil,
+  ArrowDownAZ,
+  ArrowUpAZ,
+  GripVertical,
+  Check,
+  Database,
+} from "@lucide/vue";
+
 import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import ConnectionTreeSelect from "@/components/connection/ConnectionTreeSelect.vue";
 import { Label } from "@/components/ui/label";
+import { useSqlPanelSearchMode } from "@/composables/useSqlPanelSearchMode";
+import SqlPanelSearch from "@/components/layout/SqlPanelSearch.vue";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import HelpTooltip from "@/components/ui/tooltip/HelpTooltip.vue";
+import SidebarLocateButton from "@/components/sidebar/SidebarLocateButton.vue";
+import SqlSearchMatchSnippet from "@/components/layout/SqlSearchMatchSnippet.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { useQueryStore } from "@/stores/queryStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
+import { useSqlFileContentSearch } from "@/composables/useSqlFileContentSearch";
+import type { SavedSqlLineMatch } from "@/lib/savedSql/savedSqlSearch";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { forgetExternalSqlFileTarget, forgetExternalSqlFolderTargets, moveExternalSqlFileTarget, moveExternalSqlFolderTargets, resolveExternalSqlFileTargetForActiveTab } from "@/lib/sql/externalSqlFileTarget";
-import { externalSqlFileOpenErrorMessage, externalSqlEditorMaxBytes, formatSqlFileSize, isExternalSqlFileTooLargeError, isSqlFilePath, normalizeExternalSqlPath, relocateExternalSqlPathWithinFolder } from "@/lib/sql/sqlFileOpen";
+import {
+  forgetExternalSqlFileTarget,
+  forgetExternalSqlFolderTargets,
+  MAX_EXTERNAL_SQL_FILE_TARGETS,
+  moveExternalSqlFileTarget,
+  moveExternalSqlFolderTargets,
+  rememberExternalSqlFileTargets,
+  resolveExternalSqlFileTarget,
+  resolveExternalSqlFileTargetForActiveTab,
+  unassociatedExternalSqlFileTarget,
+} from "@/lib/sql/externalSqlFileTarget";
+import { externalSqlFileOpenErrorMessage, externalSqlEditorMaxBytes, formatSqlFileSize, isExternalSqlFileTooLargeError, isSqlFilePath, isSqlOrScriptFilePath, isSpreadsheetFilePath, normalizeExternalSqlPath, queryTabExternalFilePath, relocateExternalSqlPathWithinFolder } from "@/lib/sql/sqlFileOpen";
+
+import { supportsSqlFileExecution } from "@/lib/database/databaseFeatureSupport";
+import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import * as api from "@/lib/backend/api";
 import type { SqlFileEntry } from "@/lib/backend/api";
 import { getSqlFileFilter, getSqlFileFolderPaths, saveSqlFileFilter, saveSqlFileFolderPaths, notifySqlFileFoldersChanged } from "@/lib/sqlFile/sqlFileFolders";
-import { orderedListRangeAnchorIndex, orderedListSelectionIntent, type OrderedListSelectionItem } from "@/lib/selection/orderedListSelection";
+import { getSqlFileDisplayMode, getSqlFileExpandedConnectionIds, getSqlFileFoldersUiState, saveSqlFileDisplayMode, saveSqlFileExpandedConnectionIds, saveSqlFileFoldersUiState, type SqlFileDisplayMode, type SqlFileFolderUiState } from "@/lib/sqlFile/sqlFileUiState";
+import { filterAndSortSqlFileEntries, getSqlFileSortOrder, saveSqlFileSortOrder, type SqlFileSortOrder } from "@/lib/sql/sqlFileTreeFilter";
+import { orderedListSelectionIntent, type OrderedListSelectionItem } from "@/lib/selection/orderedListSelection";
+import { saveSqlFileOpenMode, useSqlFileOpenMode, type SqlFileOpenMode } from "@/lib/sqlFile/sqlFileInteraction";
+import { getSqlFileOrder, saveSqlFileOrder, reorderSqlFiles, remapSqlFileOrder, sqlFileParentPath, type SqlFileOrder } from "@/lib/sqlFile/sqlFileOrder";
+import { useSqlFileReorder } from "@/composables/useSqlFileReorder";
+import { useSqlFileWatch } from "@/composables/useSqlFileWatch";
+import SqlFileInteractionSettingsDialog from "@/components/layout/SqlFileInteractionSettingsDialog.vue";
+
+const props = defineProps<{ locateRequest?: { id: number; path: string } | null }>();
 
 const emit = defineEmits<{
+  "locate-handled": [id: number];
   close: [];
 }>();
 
@@ -38,13 +96,122 @@ interface FolderState {
   entries: SqlFileEntry[];
   expanded: Set<string>;
   loading: boolean;
+  refreshing: boolean;
   collapsed: boolean;
 }
 
 const folders = ref<FolderState[]>([]);
+let uiStateInitialized = false;
+const displayMode = ref<SqlFileDisplayMode>(getSqlFileDisplayMode());
+const displayModeDraft = ref<SqlFileDisplayMode>(displayMode.value);
+const expandedConnections = ref<Set<string>>(getSqlFileExpandedConnectionIds());
+
+function saveExpandedConnectionsState() {
+  saveSqlFileExpandedConnectionIds(expandedConnections.value);
+}
+
+function persistFoldersUiState() {
+  if (!uiStateInitialized) return;
+  const state: Record<string, SqlFileFolderUiState> = {};
+  for (const f of folders.value) {
+    state[f.path] = {
+      collapsed: f.collapsed,
+      expanded: [...f.expanded],
+    };
+  }
+  saveSqlFileFoldersUiState(state);
+}
+const fileTree = ref<HTMLElement | null>(null);
+const locatingFile = ref(false);
+const currentFilePath = computed(() => {
+  const tab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+  return queryTabExternalFilePath(tab);
+});
 const filterSettingsOpen = ref(false);
 const fileFilterDraft = ref(getSqlFileFilter());
+const openMode = useSqlFileOpenMode();
+const openModeDraft = ref<SqlFileOpenMode>(openMode.value);
+const foldersRevision = ref(0);
+const treeId = useId();
+let lastClickedKey: string | null = null;
 const fileFilterRegexExample = "(?i)[.](sql|ddl|sh|py)$";
+
+const searchInput = ref<InstanceType<typeof SqlPanelSearch> | null>(null);
+const searchInputPending = ref(false);
+const searchMode = useSqlPanelSearchMode("file");
+const searchQuery = ref("");
+const {
+  searching: scanning,
+  error: searchError,
+  matchesByPath,
+  matchingPaths,
+  incomplete: searchIncomplete,
+  skippedCount,
+  skippedFiles,
+  truncated: searchTruncated,
+} = useSqlFileContentSearch(
+  () => (searchMode.value === "content" ? searchQuery.value : ""),
+  () => folders.value,
+  () => searchInputPending.value,
+);
+const searching = computed(() => searchInputPending.value || scanning.value);
+const searchIncompleteHelp = computed(() => {
+  const reasonKeys: Record<string, string> = {
+    tooLarge: "sqlFileTree.searchSkippedTooLarge",
+    unreadable: "sqlFileTree.searchSkippedUnreadable",
+    invalidEncoding: "sqlFileTree.searchSkippedInvalidEncoding",
+    outsideRoot: "sqlFileTree.searchSkippedOutsideRoot",
+    notRegularFile: "sqlFileTree.searchSkippedNotRegularFile",
+  };
+  const counts = new Map<string, number>();
+  for (const file of skippedFiles.value) {
+    const key = Object.prototype.hasOwnProperty.call(reasonKeys, file.reason) ? reasonKeys[file.reason] : "sqlFileTree.searchSkippedOther";
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const details = [...counts].map(([key, count]) => t(key, { count }));
+  if (searchTruncated.value) details.push(t("sqlFileTree.searchPreviewLimits", { perFile: 100, total: 1000 }));
+  return [t("sqlFileTree.searchIncompleteHelp"), ...details].join("\n");
+});
+const sortOrder = ref<SqlFileSortOrder>(getSqlFileSortOrder ? getSqlFileSortOrder() : "asc");
+const manualOrder = ref<SqlFileOrder>(getSqlFileOrder());
+const sortOptions = computed(() => [
+  { order: "manual" as const, label: t("sqlFileTree.sortManual"), icon: GripVertical },
+  { order: "asc" as const, label: t("sqlLibrary.sortNameAsc"), icon: ArrowDownAZ },
+  { order: "desc" as const, label: t("sqlLibrary.sortNameDesc"), icon: ArrowUpAZ },
+]);
+const currentSortOption = computed(() => sortOptions.value.find((option) => option.order === sortOrder.value)!);
+const userCollapsedDuringSearch = ref<Set<string>>(new Set());
+
+watch([searchQuery, searchMode], () => {
+  userCollapsedDuringSearch.value.clear();
+  lastClickedKey = null;
+});
+
+function setSortOrder(order: SqlFileSortOrder) {
+  if (!saveSqlFileSortOrder(order)) {
+    toast(t("sqlFileTree.sortSaveFailed"), 5000);
+    return;
+  }
+  cancelFileDrag();
+  sortOrder.value = order;
+}
+
+function persistManualOrder(next: SqlFileOrder): boolean {
+  if (!saveSqlFileOrder(next)) {
+    toast(t("sqlFileTree.sortSaveFailed"), 5000);
+    return false;
+  }
+  manualOrder.value = next;
+  return true;
+}
+
+function remapManualOrder(previousPath: string, nextPath?: string, directory = false) {
+  const next = remapSqlFileOrder(manualOrder.value, previousPath, nextPath, directory);
+  if (next === manualOrder.value) return;
+  // The filesystem mutation has already succeeded: keep this session consistent
+  // even if persisting the updated preference fails.
+  if (!persistManualOrder(next)) manualOrder.value = next;
+}
 
 // Right-click target. `kind` discriminates between a folder header, a tree
 // directory entry, and a tree file entry. `folderPath` is the owning top-level
@@ -66,10 +233,9 @@ const showRenameFolderDialog = ref(false);
 const showDeleteDialog = ref(false);
 const showDeleteFolderDialog = ref(false);
 
-const selectedPaths = ref<Set<string>>(new Set());
-const activePath = ref<string | null>(null);
-const selectionAnchorIndex = ref<number | null>(null);
-const fileTree = ref<HTMLElement | null>(null);
+const selectedKeys = ref<Set<string>>(new Set());
+const activeKey = ref<string | null>(null);
+const selectionAnchorKey = ref<string | null>(null);
 
 function findFileAncestors(entries: SqlFileEntry[], path: string): string[] | null {
   for (const entry of entries) {
@@ -82,42 +248,84 @@ function findFileAncestors(entries: SqlFileEntry[], path: string): string[] | nu
   return null;
 }
 
-const activeFileTarget = computed(() => {
-  const tab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
-  if (!tab?.externalSqlPath) return null;
-  const path = normalizeExternalSqlPath(tab.externalSqlPath);
+function findFileTarget(filePath: string) {
+  const path = normalizeExternalSqlPath(filePath);
   for (const folder of folders.value) {
     if (folder.loading) continue;
     const ancestors = findFileAncestors(folder.entries, path);
     if (ancestors) return { folder, path, ancestors };
   }
   return null;
-});
+}
 
-async function locateActiveFile() {
-  const target = activeFileTarget.value;
+async function locateFileTarget(path: string) {
+  lastClickedKey = null;
+  if (disposed) return;
+  const target = findFileTarget(path);
   if (!target) return;
+  if (searchInput.value?.text) {
+    const isVisibleNow =
+      displayMode.value === "connection"
+        ? expandedConnectionRows.value.some((item) => item.folder === target.folder && normalizeExternalSqlPath(item.entry.path) === target.path)
+        : visibleItems.value.some((item) => item.folder === target.folder && item.type === "file" && normalizeExternalSqlPath(item.path) === target.path);
+    if (searchInputPending.value || !isVisibleNow) {
+      searchInput.value?.clear();
+      await nextTick();
+    }
+  }
   target.folder.collapsed = false;
   target.folder.expanded = new Set([...target.folder.expanded, ...target.ancestors]);
-  const itemIndex = visibleItems.value.findIndex((item) => item.type === "file" && normalizeExternalSqlPath(item.id) === target.path);
+  persistFoldersUiState();
+  if (displayMode.value === "connection") {
+    const targetScope = resolveExternalSqlFileTarget(path, (connectionId) => !!connectionStore.getConfig(connectionId), unassociatedExternalSqlFileTarget());
+    expandedConnections.value = new Set([...expandedConnections.value, targetScope.connectionId]);
+    saveExpandedConnectionsState();
+    selectedKeys.value = new Set();
+    activeKey.value = nodeKey(target.folder.path, "file", target.path);
+    selectionAnchorKey.value = activeKey.value;
+    await nextTick();
+    document.getElementById(`${treeId}-connection-row-${activeKey.value}`)?.scrollIntoView({ block: "center", inline: "nearest" });
+    return;
+  }
+  const itemIndex = visibleItems.value.findIndex((item) => item.folder === target.folder && item.type === "file" && normalizeExternalSqlPath(item.path) === target.path);
   const item = visibleItems.value[itemIndex];
   if (!item) return;
-  selectedPaths.value = new Set();
-  activePath.value = item.id;
-  selectionAnchorIndex.value = itemIndex;
+  selectedKeys.value = new Set();
+  activeKey.value = item.id;
+  selectionAnchorKey.value = item.id;
   await nextTick();
-  const row = Array.from(fileTree.value?.querySelectorAll<HTMLElement>("[data-sql-file-path]") ?? []).find((row) => normalizeExternalSqlPath(row.dataset.sqlFilePath!) === target.path);
+  const row = document.getElementById(`${treeId}-row-${activeItemIndex.value}`);
   row?.scrollIntoView({ block: "center", inline: "nearest" });
 }
 
 function clearSelection() {
-  selectedPaths.value = new Set();
-  activePath.value = null;
-  selectionAnchorIndex.value = null;
+  selectedKeys.value = new Set();
+  activeKey.value = null;
+  selectionAnchorKey.value = null;
 }
 
-function isPathHighlighted(path: string) {
-  return activePath.value === path || selectedPaths.value.has(path);
+type NodeKind = "folderHeader" | "dir" | "file";
+
+function nodeKey(rootPath: string, kind: NodeKind, path: string): string {
+  // A path may appear under multiple opened roots, or as both a root and a child.
+  return JSON.stringify([normalizeExternalSqlPath(rootPath), kind, normalizeExternalSqlPath(path)]);
+}
+
+function isPathHighlighted(rootPath: string, kind: NodeKind, path: string) {
+  const key = nodeKey(rootPath, kind, path);
+  return activeKey.value === key || selectedKeys.value.has(key);
+}
+
+function remapSelectionPaths(mapPath: (path: string) => string | null) {
+  const remapKey = (key: string): string | null => {
+    const [rootPath, kind, path] = JSON.parse(key) as [string, NodeKind, string];
+    const root = mapPath(rootPath);
+    const mapped = mapPath(path);
+    return root !== null && mapped !== null ? nodeKey(root, kind, mapped) : null;
+  };
+  selectedKeys.value = new Set([...selectedKeys.value].map(remapKey).filter((key): key is string => key !== null));
+  activeKey.value = activeKey.value ? remapKey(activeKey.value) : null;
+  selectionAnchorKey.value = selectionAnchorKey.value ? remapKey(selectionAnchorKey.value) : null;
 }
 
 function loadSavedFolders(): string[] {
@@ -127,6 +335,7 @@ function loadSavedFolders(): string[] {
 function saveFolders() {
   const paths = folders.value.map((f) => f.path);
   saveSqlFileFolderPaths(paths);
+  persistFoldersUiState();
 }
 
 async function pickFolder() {
@@ -155,20 +364,69 @@ async function addFolder(folderPath: string) {
     entries: [],
     expanded: new Set(),
     loading: true,
+    refreshing: false,
     collapsed: false,
   };
   folders.value.push(folder);
   saveFolders();
-  await loadFolderEntries(folderPath);
+  return loadFolderEntries(folderPath);
+}
+
+async function locateCurrentFile() {
+  const path = currentFilePath.value;
+  if (path) await enqueueFileLocate(path);
+}
+
+async function locateFile(path: string) {
+  lastClickedKey = null;
+  if (disposed) return;
+  if (findFileTarget(path)) {
+    await locateFileTarget(path);
+    return;
+  }
+  if (!isTauriRuntime()) {
+    toast(t("sqlFileTree.desktopOnly"), 3000);
+    return;
+  }
+  locatingFile.value = true;
+  try {
+    const normalizedPath = normalizeExternalSqlPath(path);
+    const folder = folders.value.find((folder) => normalizedPath.startsWith(`${normalizeExternalSqlPath(folder.path).replace(/\/$/, "")}/`));
+    if (folder) {
+      if (await loadFolderEntries(folder.path)) return;
+    } else {
+      const slashedPath = path.replace(/\\/g, "/");
+      const parentPath = slashedPath.slice(0, slashedPath.lastIndexOf("/") + 1);
+      if (!parentPath) return;
+      if (await addFolder(parentPath)) return;
+    }
+    if (disposed) return;
+    if (!findFileTarget(path)) {
+      toast(t("sqlFileTree.activeFileNotFound"), 5000);
+      return;
+    }
+    await locateFileTarget(path);
+  } finally {
+    locatingFile.value = false;
+  }
 }
 
 // Re-scan a single top-level folder and replace its entries. Mutated via the
 // reactive proxy (folders.value[idx]) so Vue tracks the change — see the note
 // in addFolder above.
+//
+// `loading` only goes true when the folder has nothing to show yet, because it
+// swaps the row list for a "loading" line and the list lives inside the panel's
+// only scroll container: tearing the rows down resets `scrollTop` to 0, which is
+// what made the panel jump back to the top after every add/rename/refresh
+// (#13038). A folder that already has entries stays rendered and is swapped in
+// place, so the scroll offset survives; `refreshing` only drives the spinner.
 async function loadFolderEntries(folderPath: string): Promise<string | null> {
+  cancelFileDrag();
   const idx = folders.value.findIndex((f) => f.path === folderPath);
   if (idx === -1) return null;
-  folders.value[idx].loading = true;
+  folders.value[idx].loading = folders.value[idx].entries.length === 0;
+  folders.value[idx].refreshing = true;
   try {
     const entries = await api.listSqlFilesInFolder(folderPath, getSqlFileFilter(), true);
     const target = folders.value.findIndex((f) => f.path === folderPath);
@@ -187,8 +445,8 @@ async function loadFolderEntries(folderPath: string): Promise<string | null> {
         if (displayPath && stillPresent.has(displayPath)) nextExpanded.add(displayPath);
       }
       folders.value[target].expanded = nextExpanded;
-      selectedPaths.value = new Set([...selectedPaths.value].map((path) => displayPaths.get(normalizeExternalSqlPath(path)) ?? path));
-      if (activePath.value) activePath.value = displayPaths.get(normalizeExternalSqlPath(activePath.value)) ?? activePath.value;
+      persistFoldersUiState();
+      // Selection keys already normalize both root and entry paths.
     }
   } catch (e: any) {
     const message = e?.message || String(e);
@@ -198,7 +456,9 @@ async function loadFolderEntries(folderPath: string): Promise<string | null> {
     const target = folders.value.findIndex((f) => f.path === folderPath);
     if (target !== -1) {
       folders.value[target].loading = false;
+      folders.value[target].refreshing = false;
     }
+    foldersRevision.value++;
   }
   return null;
 }
@@ -224,6 +484,10 @@ async function refreshAll() {
 
 async function saveFileFilter() {
   const previousFilter = getSqlFileFilter();
+  if (fileFilterDraft.value.trim() === previousFilter) {
+    commitInteractionSettings();
+    return;
+  }
   saveSqlFileFilter(fileFilterDraft.value);
   const errors = await Promise.all(folders.value.map((f) => loadFolderEntries(f.path)));
   // An unparsable pattern must not survive in localStorage: it would fail
@@ -235,9 +499,17 @@ async function saveFileFilter() {
     toast(t("sqlFileTree.filterInvalid", { message: invalidFilter }), 5000);
     return;
   }
-  filterSettingsOpen.value = false;
+  commitInteractionSettings();
   notifySqlFileFoldersChanged();
   toast(t("sqlFileTree.refreshed"), 1500);
+}
+
+function commitInteractionSettings() {
+  openMode.value = openModeDraft.value;
+  saveSqlFileOpenMode(openMode.value);
+  displayMode.value = displayModeDraft.value;
+  saveSqlFileDisplayMode(displayMode.value);
+  filterSettingsOpen.value = false;
 }
 
 async function reloadFolderAfterMutation(folderPath: string) {
@@ -246,8 +518,10 @@ async function reloadFolderAfterMutation(folderPath: string) {
 }
 
 async function removeFolder(index: number) {
+  cancelFileDrag();
   folders.value.splice(index, 1);
   saveFolders();
+  foldersRevision.value++;
 }
 
 async function revealInFileManager(path: string) {
@@ -271,18 +545,92 @@ async function copyPath(path: string) {
   }
 }
 
-function toggleExpand(folder: FolderState, path: string) {
-  const next = new Set(folder.expanded);
-  if (next.has(path)) {
-    next.delete(path);
-  } else {
-    next.add(path);
+interface ProcessedFolder {
+  entries: SqlFileEntry[];
+  autoExpanded: Set<string>;
+  hasMatches: boolean;
+}
+
+const folderProcessedMap = computed<Map<string, ProcessedFolder>>(() => {
+  const map = new Map<string, ProcessedFolder>();
+  for (const folder of folders.value) {
+    const res = filterAndSortSqlFileEntries(folder.entries, searchQuery.value, sortOrder.value, matchingPaths.value, searchMode.value, manualOrder.value);
+    map.set(folder.path, {
+      entries: res.entries,
+      autoExpanded: res.autoExpanded,
+      hasMatches: res.matchCount > 0,
+    });
   }
-  folder.expanded = next;
+  return map;
+});
+
+function getProcessedEntries(folderPath: string): SqlFileEntry[] {
+  return folderProcessedMap.value.get(folderPath)?.entries ?? [];
+}
+
+function isFolderContentVisible(folder: FolderState): boolean {
+  if (userCollapsedDuringSearch.value.has(folder.path)) {
+    return false;
+  }
+  if (searchQuery.value) {
+    const processed = folderProcessedMap.value.get(folder.path);
+    if (processed?.hasMatches) {
+      return true;
+    }
+  }
+  return !folder.collapsed;
+}
+
+function getEffectiveExpanded(folder: FolderState): Set<string> {
+  if (!searchQuery.value) {
+    return folder.expanded;
+  }
+  const processed = folderProcessedMap.value.get(folder.path);
+  const auto = processed?.autoExpanded ?? new Set<string>();
+  const combined = new Set<string>();
+  for (const p of folder.expanded) {
+    if (!userCollapsedDuringSearch.value.has(p)) combined.add(p);
+  }
+  for (const p of auto) {
+    if (!userCollapsedDuringSearch.value.has(p)) combined.add(p);
+  }
+  return combined;
+}
+
+function toggleExpand(folder: FolderState, path: string) {
+  const effective = getEffectiveExpanded(folder);
+  const isExpanded = effective.has(path);
+  if (isExpanded) {
+    if (searchQuery.value) {
+      userCollapsedDuringSearch.value.add(path);
+    }
+    const next = new Set(folder.expanded);
+    next.delete(path);
+    folder.expanded = next;
+  } else {
+    if (searchQuery.value) {
+      userCollapsedDuringSearch.value.delete(path);
+    }
+    const next = new Set(folder.expanded);
+    next.add(path);
+    folder.expanded = next;
+  }
+  persistFoldersUiState();
 }
 
 function toggleFolderCollapse(folder: FolderState) {
-  folder.collapsed = !folder.collapsed;
+  if (searchQuery.value) {
+    const currentlyVisible = isFolderContentVisible(folder);
+    if (currentlyVisible) {
+      userCollapsedDuringSearch.value.add(folder.path);
+    } else {
+      userCollapsedDuringSearch.value.delete(folder.path);
+      folder.collapsed = false;
+    }
+  } else {
+    folder.collapsed = !folder.collapsed;
+  }
+  persistFoldersUiState();
 }
 
 // Expand/collapse every directory beneath the given top-level folder.
@@ -294,6 +642,7 @@ function setAllExpanded(folder: FolderState, expanded: boolean) {
   } else {
     folder.expanded = new Set();
   }
+  persistFoldersUiState();
 }
 
 function collectDirPaths(entries: SqlFileEntry[], into: Set<string>) {
@@ -305,20 +654,49 @@ function collectDirPaths(entries: SqlFileEntry[], into: Set<string>) {
   }
 }
 
-async function openFile(path: string) {
-  if (!isTauriRuntime()) return;
+async function openFileWithDefaultApp(path: string) {
+  if (!isTauriRuntime()) {
+    toast(t("sqlFileTree.desktopOnly"), 3000);
+    return;
+  }
+  try {
+    await api.openPathWithDefaultApp(path);
+  } catch (e: any) {
+    toast(t("sqlFileTree.openWithDefaultAppFailed", { message: translateBackendError(t, e) }), 5000);
+  }
+}
+
+async function openFile(path: string, reveal?: { line: number; column: number }) {
+  if (!isTauriRuntime()) {
+    toast(t("sqlFileTree.desktopOnly"), 3000);
+    return;
+  }
+  if (!isSqlOrScriptFilePath(path)) {
+    await openFileWithDefaultApp(path);
+    return;
+  }
+
   try {
     const snapshot = await api.readExternalSqlFileSnapshot(path, externalSqlEditorMaxBytes(settingsStore.editorSettings.externalSqlEditorMaxMb));
     const target = resolveExternalSqlFileTargetForActiveTab(path, queryStore.tabs, queryStore.activeTabId, (connectionId) => connectionStore.getConfig(connectionId));
-    queryStore.openExternalSqlFile(target.connectionId, target.database, path, snapshot.content, snapshot.version, target.catalog, target.schema, undefined, snapshot.encoding);
+    queryStore.openExternalSqlFile(target.connectionId, target.database, path, snapshot.content, snapshot.version, target.catalog, target.schema, reveal, snapshot.encoding);
   } catch (e: any) {
-    if (isExternalSqlFileTooLargeError(e) && isSqlFilePath(path)) {
+    if (!reveal && isExternalSqlFileTooLargeError(e) && isSqlFilePath(path)) {
       executeFile(path);
       toast(t("sqlFile.largeFileExecutionOpened", { size: formatSqlFileSize(e.sizeBytes) }), 6000);
       return;
     }
     toast(t("toolbar.sqlOpenFailed", { message: externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)) }), 5000);
   }
+}
+
+function handleSearchMatch(rootPath: string, path: string, match: SavedSqlLineMatch) {
+  lastClickedKey = null;
+  const key = nodeKey(rootPath, "file", path);
+  selectedKeys.value = new Set();
+  activeKey.value = key;
+  selectionAnchorKey.value = key;
+  void openFile(path, { line: match.lineNumber, column: match.column });
 }
 
 // Open the App-level SQL file execution dialog with this file pre-selected so
@@ -339,11 +717,97 @@ function folderName(path: string): string {
   return parts.pop() || path;
 }
 
+let disposed = false;
+const foldersInitialized = ref(false);
+let locateQueue: Promise<void> = Promise.resolve();
+
+function enqueueFileLocate(path: string): Promise<void> {
+  // Keep scans serialized, while retaining the requested path across focus changes.
+  locateQueue = locateQueue
+    .then(() => locateFile(path))
+    .catch((error) => {
+      if (!disposed) toast(t("sqlFileTree.loadFailed", { message: translateBackendError(t, error) }), 5000);
+    });
+  return locateQueue;
+}
+
+watch([foldersInitialized, () => props.locateRequest], async ([initialized, request]) => {
+  if (!initialized || !request) return;
+  await enqueueFileLocate(request.path);
+  if (!disposed) emit("locate-handled", request.id);
+});
+
+onBeforeUnmount(() => {
+  disposed = true;
+  persistFoldersUiState();
+});
+
+useSqlFileWatch(
+  () =>
+    folders.value.map(({ path, entries }) => {
+      const directories: string[] = [];
+      const collect = (items: SqlFileEntry[]) => {
+        for (const entry of items)
+          if (entry.is_dir) {
+            directories.push(entry.path);
+            collect(entry.children);
+          }
+      };
+      collect(entries);
+      return { path, recursive: true, revision: JSON.stringify(directories.sort()) };
+    }),
+  async (path) => {
+    if (!folderMutationPending.value && !disposed) {
+      await loadFolderEntries(path);
+      notifySqlFileFoldersChanged();
+    }
+  },
+);
+
+async function refreshOnFocus() {
+  if (!disposed && foldersInitialized.value && !folderMutationPending.value) await refreshMutationFolders();
+}
+onMounted(() => window.addEventListener("focus", refreshOnFocus));
+onBeforeUnmount(() => window.removeEventListener("focus", refreshOnFocus));
+let unlistenFilePanelFocus: (() => void) | undefined;
+onMounted(() => {
+  if (!isTauriRuntime()) return;
+  void import("@tauri-apps/api/window")
+    .then(({ getCurrentWindow }) =>
+      getCurrentWindow().onFocusChanged(({ payload }) => {
+        if (payload) void refreshOnFocus();
+      }),
+    )
+    .then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenFilePanelFocus = unlisten;
+    })
+    .catch(() => {});
+});
+onBeforeUnmount(() => unlistenFilePanelFocus?.());
+
 onMounted(async () => {
+  // Restoring folders must not persist a partially loaded list. Register all
+  // roots before scanning so closing the panel cannot discard saved roots.
   const saved = loadSavedFolders();
+  const uiStates = getSqlFileFoldersUiState();
+  folders.value = saved.map((path) => {
+    const ui = uiStates[path];
+    return {
+      path,
+      entries: [],
+      expanded: new Set<string>(ui?.expanded ?? []),
+      loading: true,
+      refreshing: false,
+      collapsed: ui?.collapsed === true,
+    };
+  });
+  uiStateInitialized = true;
   for (const path of saved) {
-    await addFolder(path);
+    if (disposed) return;
+    await loadFolderEntries(path);
   }
+  if (!disposed) foldersInitialized.value = true;
 });
 
 type TreeEntry = { entry: SqlFileEntry; depth: number };
@@ -361,46 +825,342 @@ function flatTree(entries: SqlFileEntry[], expanded: Set<string>): TreeEntry[] {
   return result;
 }
 
-const visibleItems = computed<OrderedListSelectionItem[]>(() => {
-  const items: OrderedListSelectionItem[] = [];
+type VisibleItem = OrderedListSelectionItem & { type: NodeKind; path: string; folder: FolderState; entry?: SqlFileEntry };
+const visibleItems = computed<VisibleItem[]>(() => {
+  const items: VisibleItem[] = [];
   for (const folder of folders.value) {
-    items.push({ type: "folderHeader", id: folder.path });
-    if (folder.collapsed) continue;
-    for (const { entry } of flatTree(folder.entries, folder.expanded)) {
-      items.push({ type: entry.is_dir ? "dir" : "file", id: entry.path });
+    items.push({ type: "folderHeader", id: nodeKey(folder.path, "folderHeader", folder.path), path: folder.path, folder });
+    if (folder.loading || !isFolderContentVisible(folder)) continue;
+    for (const { entry } of flatTree(getProcessedEntries(folder.path), getEffectiveExpanded(folder))) {
+      const type = entry.is_dir ? "dir" : "file";
+      items.push({ type, id: nodeKey(folder.path, type, entry.path), path: entry.path, folder, entry });
     }
   }
   return items;
 });
 
+type ConnectionFileRow = {
+  id: string;
+  connectionId: string;
+  folder: FolderState;
+  entry: SqlFileEntry;
+};
+
+type ConnectionFileGroup = {
+  key: string;
+  connectionId: string;
+  label: string;
+  rows: ConnectionFileRow[];
+};
+
+function connectionFileLabel(connectionId: string) {
+  if (!connectionId) return t("sqlFileTree.unassociated");
+  return connectionStore.getConfig(connectionId)?.name || t("sqlFileTree.deletedConnection");
+}
+
+function collectFileEntries(entries: SqlFileEntry[], folder: FolderState, rows: ConnectionFileRow[]) {
+  for (const entry of entries) {
+    if (entry.is_dir) collectFileEntries(entry.children, folder, rows);
+    else {
+      const target = resolveExternalSqlFileTarget(entry.path, (connectionId) => !!connectionStore.getConfig(connectionId), unassociatedExternalSqlFileTarget());
+      rows.push({
+        id: nodeKey(folder.path, "file", entry.path),
+        connectionId: target.connectionId,
+        folder,
+        entry,
+      });
+    }
+  }
+}
+
+const fileTargetsRevision = ref(0);
+const connectionFileGroups = computed<ConnectionFileGroup[]>(() => {
+  void fileTargetsRevision.value;
+  const rows: ConnectionFileRow[] = [];
+  for (const folder of folders.value) {
+    if (folder.loading) continue;
+    collectFileEntries(getProcessedEntries(folder.path), folder, rows);
+  }
+
+  const byConnection = new Map<string, ConnectionFileRow[]>();
+  for (const row of rows) {
+    const group = byConnection.get(row.connectionId) ?? [];
+    group.push(row);
+    byConnection.set(row.connectionId, group);
+  }
+
+  const knownIds = new Set(connectionStore.connections.map((connection) => connection.id));
+  const orderedIds = [
+    ...connectionStore.connections.map((connection) => connection.id).filter((id) => byConnection.has(id)),
+    ...[...byConnection.keys()].filter((id) => !knownIds.has(id)).sort((left, right) => connectionFileLabel(left).localeCompare(connectionFileLabel(right), undefined, { numeric: true, sensitivity: "base" })),
+  ];
+  return orderedIds.map((connectionId) => ({
+    key: `connection:${connectionId || "unassociated"}`,
+    connectionId,
+    label: connectionFileLabel(connectionId),
+    rows: [...byConnection.get(connectionId)!].sort(compareConnectionFileRows),
+  }));
+});
+
+const expandedConnectionRows = computed(() => connectionFileGroups.value.flatMap((group) => (isConnectionExpanded(group.connectionId) ? group.rows : [])));
+
+function isConnectionExpanded(connectionId: string) {
+  return expandedConnections.value.has(connectionId);
+}
+
+function toggleConnection(connectionId: string) {
+  const next = new Set(expandedConnections.value);
+  if (next.has(connectionId)) next.delete(connectionId);
+  else next.add(connectionId);
+  expandedConnections.value = next;
+  saveExpandedConnectionsState();
+}
+
+function compareConnectionFileRows(left: ConnectionFileRow, right: ConnectionFileRow) {
+  if (sortOrder.value === "manual") {
+    const leftRoot = normalizeExternalSqlPath(left.folder.path);
+    const rightRoot = normalizeExternalSqlPath(right.folder.path);
+    if (leftRoot !== rightRoot) return leftRoot.localeCompare(rightRoot, undefined, { numeric: true, sensitivity: "base" });
+    const leftRank = (manualOrder.value[leftRoot] ?? []).indexOf(normalizeExternalSqlPath(left.entry.path));
+    const rightRank = (manualOrder.value[rightRoot] ?? []).indexOf(normalizeExternalSqlPath(right.entry.path));
+    const rankComparison = (leftRank < 0 ? Number.MAX_SAFE_INTEGER : leftRank) - (rightRank < 0 ? Number.MAX_SAFE_INTEGER : rightRank);
+    if (rankComparison !== 0) return rankComparison;
+  }
+
+  const nameComparison = left.entry.name.localeCompare(right.entry.name, undefined, { numeric: true, sensitivity: "base" });
+  if (nameComparison !== 0) return sortOrder.value === "desc" ? -nameComparison : nameComparison;
+  return left.entry.path.localeCompare(right.entry.path);
+}
+
+const {
+  source: draggedFile,
+  target: fileDropTarget,
+  start: startFileDrag,
+  cancel: cancelFileDrag,
+} = useSqlFileReorder({
+  tree: fileTree,
+  enabled: () =>
+    !searchQuery.value &&
+    selectedKeys.value.size === 0 &&
+    !folders.value.some((folder) => folder.loading || folder.refreshing) &&
+    !folderMutationPending.value &&
+    !contextTarget.value &&
+    !filterSettingsOpen.value &&
+    !showCreateDialog.value &&
+    !showCreateFolderDialog.value &&
+    !showRenameDialog.value &&
+    !showRenameFolderDialog.value &&
+    !showDeleteDialog.value &&
+    !showDeleteFolderDialog.value,
+  files: () => visibleItems.value.filter((item) => item.type === "file").map((item) => ({ root: item.folder.path, path: item.path, name: item.entry!.name })),
+  directories: () => visibleItems.value.filter((item) => item.type !== "file").map((item) => ({ root: item.folder.path, path: item.path, name: item.entry?.name ?? folderName(item.path) })),
+  drop: (source, target) => {
+    if (target.position === "inside") {
+      void moveSqlFile(source, target);
+      return;
+    }
+    // Re-check the current tree; a refresh or mutation may have removed a node.
+    const siblings = visibleItems.value.filter((item) => item.type === "file" && item.folder.path === source.root && sqlFileParentPath(item.path) === sqlFileParentPath(source.path));
+    const next = reorderSqlFiles(
+      manualOrder.value,
+      siblings.map((item) => item.path),
+      source.path,
+      target.path,
+      target.position,
+    );
+    if (!next) return;
+    if (!saveSqlFileOrder(next)) {
+      toast(t("sqlFileTree.sortSaveFailed"), 5000);
+      return;
+    }
+    // A completed drag selects manual ordering; a click or cancelled drag must
+    // leave the current name sort and saved manual order untouched.
+    if (sortOrder.value !== "manual" && !saveSqlFileSortOrder("manual")) {
+      saveSqlFileOrder(manualOrder.value);
+      toast(t("sqlFileTree.sortSaveFailed"), 5000);
+      return;
+    }
+    manualOrder.value = next;
+    sortOrder.value = "manual";
+    activeKey.value = nodeKey(source.root, "file", source.path);
+    selectionAnchorKey.value = activeKey.value;
+    focusTree();
+  },
+});
+
+async function moveSqlFile(source: { root: string; path: string }, target: { root: string; path: string }) {
+  if (folderMutationPending.value || !visibleItems.value.some((item) => item.type === "file" && item.folder.path === source.root && item.path === source.path) || !visibleItems.value.some((item) => item.type !== "file" && item.folder.path === target.root && item.path === target.path)) return;
+  folderMutationPending.value = true;
+  try {
+    const nextPath = await api.moveSqlFileInFolder(source.root, source.path, target.root, target.path);
+    queryStore.relocateExternalSqlFilePath(source.path, nextPath);
+    moveExternalSqlFileTarget(source.path, nextPath);
+    remapManualOrder(source.path, nextPath);
+    const folder = folders.value.find((item) => item.path === target.root);
+    if (folder) {
+      folder.collapsed = false;
+      if (target.path !== folder.path) folder.expanded.add(target.path);
+    }
+    selectedKeys.value = new Set();
+    activeKey.value = nodeKey(target.root, "file", nextPath);
+    selectionAnchorKey.value = activeKey.value;
+    await refreshMutationFolders();
+    focusTree();
+  } catch (error) {
+    toast(t("sqlFileTree.moveFailed", { message: translateBackendError(t, error) }), 5000);
+  } finally {
+    folderMutationPending.value = false;
+  }
+}
+
+watch(visibleItems, () => cancelFileDrag());
+
+const visibleRowIds = computed(() => {
+  const ids = new Map<FolderState, Map<string, string>>();
+  visibleItems.value.forEach((item, index) => {
+    let folderIds = ids.get(item.folder);
+    if (!folderIds) {
+      folderIds = new Map();
+      ids.set(item.folder, folderIds);
+    }
+    folderIds.set(item.path, `${treeId}-row-${index}`);
+  });
+  return ids;
+});
+
+const activeItemIndex = computed(() => visibleItems.value.findIndex((item) => item.id === activeKey.value));
+
+function focusTree() {
+  fileTree.value?.focus({ preventScroll: true });
+}
+
+function restoreTreeFocus(event: Event) {
+  event.preventDefault();
+  focusTree();
+}
+
+async function scrollActiveRow() {
+  await nextTick();
+  document.getElementById(`${treeId}-row-${activeItemIndex.value}`)?.scrollIntoView({ block: "nearest" });
+}
+
+// Preserve selection while content-only hits temporarily disappear during a
+// scan. Watching the pending flags also reconciles selection after an error.
+watch([visibleItems, searching, () => folders.value.some((folder) => folder.loading || folder.refreshing)], ([items, searchPending, foldersPending], [previous]) => {
+  if (searchPending || foldersPending) return;
+  const ids = new Set(items.map((item) => item.id));
+  selectedKeys.value = new Set([...selectedKeys.value].filter((key) => ids.has(key)));
+  if (activeKey.value && !ids.has(activeKey.value)) {
+    const oldIndex = previous.findIndex((item) => item.id === activeKey.value);
+    activeKey.value = items[Math.min(Math.max(oldIndex, 0), items.length - 1)]?.id ?? null;
+  }
+  // Resolve the anchor by identity: callers may have already selected a node
+  // in the new list before this watcher runs (for example, Locate Current File).
+  if (selectionAnchorKey.value && !ids.has(selectionAnchorKey.value)) {
+    selectionAnchorKey.value = activeKey.value;
+  }
+  if (document.activeElement === fileTree.value) void scrollActiveRow();
+});
+
+function activateItem(item: VisibleItem) {
+  if (item.folder.loading) return;
+  if (item.type === "folderHeader") toggleFolderCollapse(item.folder);
+  else if (item.type === "dir") toggleExpand(item.folder, item.path);
+  else void openFile(item.path);
+}
+
+function handleTreeKeydown(event: KeyboardEvent) {
+  if (event.target !== fileTree.value || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+  if (contextTarget.value || filterSettingsOpen.value || showCreateDialog.value || showCreateFolderDialog.value || showRenameDialog.value || showRenameFolderDialog.value || showDeleteDialog.value || showDeleteFolderDialog.value) return;
+  if (displayMode.value === "connection") {
+    const items = expandedConnectionRows.value;
+    if (!items.length) return;
+    const index = items.findIndex((item) => item.id === activeKey.value);
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      const nextIndex = index < 0 ? (event.key === "ArrowDown" ? 0 : items.length - 1) : Math.max(0, Math.min(items.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)));
+      activeKey.value = items[nextIndex].id;
+      selectedKeys.value = new Set();
+      selectionAnchorKey.value = items[nextIndex].id;
+      document.getElementById(`${treeId}-connection-row-${items[nextIndex].id}`)?.scrollIntoView({ block: "nearest" });
+      event.preventDefault();
+      event.stopPropagation();
+    } else if ((event.key === "Enter" || event.key === " ") && !event.repeat) {
+      const item = items[index];
+      if (item) {
+        activeKey.value = item.id;
+        void openFile(item.entry.path);
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    }
+    return;
+  }
+  const items = visibleItems.value;
+  if (!items.length) return;
+  const index = activeItemIndex.value;
+  if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+    const nextIndex = index < 0 ? (event.key === "ArrowDown" ? 0 : items.length - 1) : Math.max(0, Math.min(items.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)));
+    activeKey.value = items[nextIndex].id;
+    selectedKeys.value = new Set();
+    selectionAnchorKey.value = items[nextIndex].id;
+    void scrollActiveRow();
+  } else if (event.key === "Enter" || event.key === " " || event.key === "F2") {
+    const item = items[index];
+    if (!item || [...selectedKeys.value].some((key) => key !== item.id)) return;
+    if (event.key === "F2") {
+      if (!item.entry || item.folder.loading) return;
+      if (!event.repeat) {
+        if (item.type === "dir") openRenameFolderDialog({ kind: "dir", folderPath: item.folder.path, entry: item.entry });
+        else openRenameDialog({ kind: "file", folderPath: item.folder.path, entry: item.entry });
+      }
+    } else if (!event.repeat) activateItem(item);
+  } else return;
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function handlePathDoubleClick(rootPath: string, path: string, type: NodeKind, event: MouseEvent) {
+  event.stopPropagation();
+  if ((event.target as HTMLElement | null)?.closest("button, input, select, textarea, [contenteditable='true']")) return;
+  if (openMode.value !== "double" || orderedListSelectionIntent(event) !== "single" || event.altKey) return;
+  const key = nodeKey(rootPath, type, path);
+  const item = visibleItems.value.find((item) => item.id === key);
+  if (item) activateItem(item);
+}
+
 function selectedRangeAnchorIndex() {
-  const activeItem = activePath.value ? (visibleItems.value.find((item) => item.id === activePath.value) ?? null) : null;
-  return orderedListRangeAnchorIndex(visibleItems.value, selectionAnchorIndex.value, activeItem);
+  const anchorIndex = visibleItems.value.findIndex((item) => item.id === selectionAnchorKey.value);
+  if (anchorIndex >= 0) return anchorIndex;
+  return activeItemIndex.value >= 0 ? activeItemIndex.value : null;
 }
 
 function selectRangeTo(currentIndex: number) {
   const anchorIndex = selectedRangeAnchorIndex();
   if (anchorIndex === null) {
     const current = visibleItems.value[currentIndex];
-    selectedPaths.value = new Set(current ? [current.id] : []);
-    selectionAnchorIndex.value = currentIndex;
+    selectedKeys.value = new Set(current ? [current.id] : []);
+    selectionAnchorKey.value = current?.id ?? null;
     return;
   }
 
   const start = Math.min(anchorIndex, currentIndex);
   const end = Math.max(anchorIndex, currentIndex);
-  const next = new Set(selectedPaths.value);
+  const next = new Set(selectedKeys.value);
   for (let i = start; i <= end; i++) {
     const item = visibleItems.value[i];
     if (item) next.add(item.id);
   }
-  selectedPaths.value = next;
+  selectedKeys.value = next;
 }
 
-function handlePathClick(path: string, type: OrderedListSelectionItem["type"], event: MouseEvent, activate: () => void) {
-  const currentIndex = visibleItems.value.findIndex((item) => item.id === path && item.type === type);
+function handlePathClick(rootPath: string, path: string, type: NodeKind, event: MouseEvent) {
+  const key = nodeKey(rootPath, type, path);
+  const currentIndex = visibleItems.value.findIndex((item) => item.id === key);
   if (currentIndex < 0) return;
 
+  focusTree();
+  const repeatedClick = event.detail > 1 && lastClickedKey === key;
+  lastClickedKey = key;
   const selectionIntent = orderedListSelectionIntent(event);
   if (selectionIntent === "range") {
     event.preventDefault();
@@ -411,23 +1171,65 @@ function handlePathClick(path: string, type: OrderedListSelectionItem["type"], e
   if (selectionIntent === "toggle") {
     event.preventDefault();
     event.stopPropagation();
-    const next = new Set(selectedPaths.value);
-    if (next.has(path)) next.delete(path);
-    else next.add(path);
-    selectedPaths.value = next;
-    selectionAnchorIndex.value = currentIndex;
+    const next = new Set(selectedKeys.value);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    selectedKeys.value = next;
+    selectionAnchorKey.value = key;
     return;
   }
 
-  selectedPaths.value = new Set();
-  activePath.value = path;
-  selectionAnchorIndex.value = currentIndex;
-  activate();
+  selectedKeys.value = new Set();
+  activeKey.value = key;
+  selectionAnchorKey.value = key;
+  if (openMode.value === "single" && !repeatedClick) activateItem(visibleItems.value[currentIndex]);
+}
+
+function handleGroupedFileClick(row: ConnectionFileRow, event: MouseEvent) {
+  const key = row.id;
+  const repeatedClick = event.detail > 1 && lastClickedKey === key;
+  lastClickedKey = key;
+  const selectionIntent = orderedListSelectionIntent(event);
+  const currentIndex = expandedConnectionRows.value.findIndex((candidate) => candidate.id === key);
+  if (selectionIntent === "range" && currentIndex >= 0) {
+    event.preventDefault();
+    event.stopPropagation();
+    const anchorIndex = expandedConnectionRows.value.findIndex((candidate) => candidate.id === selectionAnchorKey.value);
+    const start = Math.min(anchorIndex >= 0 ? anchorIndex : currentIndex, currentIndex);
+    const end = Math.max(anchorIndex >= 0 ? anchorIndex : currentIndex, currentIndex);
+    selectedKeys.value = new Set(expandedConnectionRows.value.slice(start, end + 1).map((candidate) => candidate.id));
+    selectionAnchorKey.value = expandedConnectionRows.value[anchorIndex >= 0 ? anchorIndex : currentIndex]?.id ?? key;
+    return;
+  }
+  if (selectionIntent === "toggle") {
+    event.preventDefault();
+    event.stopPropagation();
+    const next = new Set(selectedKeys.value);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    selectedKeys.value = next;
+    selectionAnchorKey.value = key;
+    return;
+  }
+  selectedKeys.value = new Set();
+  activeKey.value = key;
+  selectionAnchorKey.value = key;
+  if (openMode.value === "single" && !repeatedClick) void openFile(row.entry.path);
+}
+
+function handleGroupedFileDoubleClick(row: ConnectionFileRow, event: MouseEvent) {
+  event.stopPropagation();
+  if ((event.target as HTMLElement | null)?.closest("button, input, select, textarea, [contenteditable='true']")) return;
+  if (openMode.value !== "double" || orderedListSelectionIntent(event) !== "single" || event.altKey) return;
+  void openFile(row.entry.path);
 }
 
 function handlePanelClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null;
-  if (!target?.closest("[data-sql-file-row='true']")) clearSelection();
+  if (!target?.closest("[data-sql-file-row='true']")) {
+    clearSelection();
+    lastClickedKey = null;
+  }
 }
 
 function normalizedSqlFileName(name: string) {
@@ -466,9 +1268,7 @@ function updateFolderPaths(previousPath: string, nextPath?: string) {
     folder.expanded = mapSet(folder.expanded);
     return true;
   });
-  selectedPaths.value = mapSet(selectedPaths.value);
-  activePath.value = activePath.value ? mapPath(activePath.value) : null;
-  selectionAnchorIndex.value = null;
+  remapSelectionPaths(mapPath);
   saveFolders();
 }
 
@@ -496,14 +1296,12 @@ async function createSqlFolder() {
     if (folder) {
       folder.collapsed = false;
       folder.expanded = new Set([...folder.expanded, target.directoryPath, path]);
+      persistFoldersUiState();
     }
-    activePath.value = path;
-    selectedPaths.value = new Set();
-    selectionAnchorIndex.value = null;
-    await nextTick();
-    Array.from(fileTree.value?.querySelectorAll<HTMLElement>("[data-sql-file-path]") ?? [])
-      .find((row) => row.dataset.sqlFilePath === path)
-      ?.scrollIntoView({ block: "nearest" });
+    activeKey.value = nodeKey(target.rootPath, "dir", path);
+    selectedKeys.value = new Set();
+    selectionAnchorKey.value = activeKey.value;
+    await scrollActiveRow();
     toast(t("sqlFileTree.folderCreated"), 1500);
   } catch (e: any) {
     toast(t("sqlFileTree.createFolderFailed", { message: translateBackendError(t, e) }), 5000);
@@ -547,6 +1345,7 @@ async function renameSqlFolder() {
     const nextPath = await api.renameSqlFolderInFolder(target.folderPath, target.entry.path, fileNameInput.value.trim());
     queryStore.relocateExternalSqlFolderPath(target.entry.path, nextPath);
     moveExternalSqlFolderTargets(target.entry.path, nextPath);
+    remapManualOrder(target.entry.path, nextPath, true);
     updateFolderPaths(target.entry.path, nextPath);
     showRenameFolderDialog.value = false;
     await refreshMutationFolders();
@@ -567,6 +1366,8 @@ async function renameSqlFile() {
     // successful rename appear to fail for files too large for the editor.
     queryStore.relocateExternalSqlFilePath(target.entry.path, nextPath);
     moveExternalSqlFileTarget(target.entry.path, nextPath);
+    remapManualOrder(target.entry.path, nextPath);
+    remapSelectionPaths((path) => (normalizeExternalSqlPath(path) === normalizeExternalSqlPath(target.entry.path) ? nextPath : path));
     showRenameDialog.value = false;
     await reloadFolderAfterMutation(target.folderPath);
     toast(t("sqlFileTree.fileRenamed"), 1500);
@@ -594,6 +1395,7 @@ async function deleteSqlFolder() {
     await api.deleteSqlFolderInFolder(target.folderPath, target.entry.path);
     queryStore.markExternalSqlFolderMissingForPath(target.entry.path);
     forgetExternalSqlFolderTargets(target.entry.path);
+    remapManualOrder(target.entry.path, undefined, true);
     updateFolderPaths(target.entry.path);
     showDeleteFolderDialog.value = false;
     await refreshMutationFolders();
@@ -631,6 +1433,7 @@ async function deleteSqlFile() {
   if (!target) return;
   try {
     await api.deleteSqlFileInFolder(target.folderPath, target.entry.path);
+    remapManualOrder(target.entry.path);
     queryStore.markExternalSqlFileMissingForPath(target.entry.path);
     forgetExternalSqlFileTarget(target.entry.path);
     showDeleteDialog.value = false;
@@ -641,6 +1444,52 @@ async function deleteSqlFile() {
   }
 }
 
+const showChangeFileConnection = ref(false);
+const changeConnectionPaths = ref<string[]>([]);
+const newFileConnectionId = ref("");
+const fileTargetConnections = computed(() => connectionStore.connections.filter((connection) => supportsSqlFileExecution(connection.db_type)));
+const newFileConnection = computed(() => fileTargetConnections.value.find((connection) => connection.id === newFileConnectionId.value));
+const hasOpenTargetFiles = computed(() => {
+  const paths = new Set(changeConnectionPaths.value);
+  return queryStore.tabs.some((tab) => {
+    const path = queryTabExternalFilePath(tab);
+    return path !== undefined && paths.has(normalizeExternalSqlPath(path));
+  });
+});
+
+function selectedSqlFilePaths(target: Extract<ContextTarget, { kind: "file" }>): string[] {
+  if (!selectedKeys.value.has(nodeKey(target.folderPath, "file", target.entry.path))) return [];
+  const visibleFiles = displayMode.value === "connection" ? expandedConnectionRows.value.map((row) => ({ id: row.id, path: row.entry.path })) : visibleItems.value.filter((item) => item.type === "file");
+  return [...new Set(visibleFiles.filter((file) => selectedKeys.value.has(file.id) && isSqlFilePath(file.path)).map((file) => normalizeExternalSqlPath(file.path)))];
+}
+
+function openChangeFileConnection(paths: string[]) {
+  changeConnectionPaths.value = paths;
+  newFileConnectionId.value = "";
+  showChangeFileConnection.value = true;
+}
+
+function changeFileConnection() {
+  const connection = newFileConnection.value;
+  const paths = changeConnectionPaths.value;
+  if (!connection || paths.length < 2 || hasOpenTargetFiles.value) return;
+  const database = resolveDefaultDatabase(connection, []);
+  const saved = rememberExternalSqlFileTargets(paths, { connectionId: connection.id, database, schema: connection.default_schema || undefined });
+  if (saved !== "saved") {
+    const message = saved === "capacity" ? t("sqlFileTree.changeConnectionCapacity", { count: MAX_EXTERNAL_SQL_FILE_TARGETS }) : t("sqlFileTree.changeConnectionSaveFailed");
+    toast(message, 5000);
+    return;
+  }
+  fileTargetsRevision.value++;
+  if (displayMode.value === "connection") {
+    expandedConnections.value = new Set([...expandedConnections.value, connection.id]);
+    saveExpandedConnectionsState();
+  }
+  showChangeFileConnection.value = false;
+  clearSelection();
+  toast(t("sqlLibrary.changeTargetSuccess", { count: paths.length }), 2500);
+}
+
 // ---- context menu ----
 const contextMenuItems = computed<ContextMenuItem[]>(() => {
   const target = contextTarget.value;
@@ -649,6 +1498,16 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
   if (target.kind === "panel") {
     const items: ContextMenuItem[] = [{ label: t("sqlFileTree.openFolder"), action: pickFolder, icon: FolderOpen }];
     if (folders.value.length > 0) {
+      items.push({ label: "", separator: true });
+      items.push({
+        label: t("sqlLibrary.sortFiles"),
+        icon: ArrowDownAZ,
+        children: [
+          { label: t("sqlFileTree.sortManual"), action: () => setSortOrder("manual"), icon: GripVertical },
+          { label: t("sqlLibrary.sortNameAsc"), action: () => setSortOrder("asc"), icon: ArrowDownAZ },
+          { label: t("sqlLibrary.sortNameDesc"), action: () => setSortOrder("desc"), icon: ArrowUpAZ },
+        ],
+      });
       items.push({ label: "", separator: true });
       items.push({ label: t("sqlFileTree.refreshAll"), action: refreshAll, icon: RefreshCw });
     }
@@ -668,6 +1527,16 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
       { label: t("sqlFileTree.expandAll"), action: () => folder && setAllExpanded(folder, true), icon: ChevronsUpDown, disabled: !folder },
       { label: t("sqlFileTree.collapseAll"), action: () => folder && setAllExpanded(folder, false), icon: ChevronsDownUp, disabled: !folder },
       { label: "", separator: true },
+      {
+        label: t("sqlLibrary.sortFiles"),
+        icon: ArrowDownAZ,
+        children: [
+          { label: t("sqlFileTree.sortManual"), action: () => setSortOrder("manual"), icon: GripVertical },
+          { label: t("sqlLibrary.sortNameAsc"), action: () => setSortOrder("asc"), icon: ArrowDownAZ },
+          { label: t("sqlLibrary.sortNameDesc"), action: () => setSortOrder("desc"), icon: ArrowUpAZ },
+        ],
+      },
+      { label: "", separator: true },
       { label: t("sqlFileTree.refreshFolder"), action: () => refreshFolder(target.folderPath), icon: RefreshCw },
       { label: "", separator: true },
       { label: t("sqlFileTree.removeFolder"), action: () => folderIdx !== -1 && removeFolder(folderIdx), icon: Trash2, variant: "destructive" },
@@ -685,15 +1554,37 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
       { label: t("sqlFileTree.expandAll"), action: () => expandSubtree(target), icon: ChevronsUpDown },
       { label: t("sqlFileTree.collapseAll"), action: () => collapseSubtree(target), icon: ChevronsDownUp },
       { label: "", separator: true },
+      {
+        label: t("sqlLibrary.sortFiles"),
+        icon: ArrowDownAZ,
+        children: [
+          { label: t("sqlFileTree.sortManual"), action: () => setSortOrder("manual"), icon: GripVertical },
+          { label: t("sqlLibrary.sortNameAsc"), action: () => setSortOrder("asc"), icon: ArrowDownAZ },
+          { label: t("sqlLibrary.sortNameDesc"), action: () => setSortOrder("desc"), icon: ArrowUpAZ },
+        ],
+      },
+      { label: "", separator: true },
       { label: t("sqlFileTree.renameFolder"), action: () => openRenameFolderDialog(target), icon: Pencil },
       { label: t("sqlFileTree.deleteFolder"), action: () => openDeleteFolderDialog(target), icon: Trash2, variant: "destructive" },
     ];
   }
 
   // file
-  const items: ContextMenuItem[] = [{ label: t("sqlFileTree.openFile"), action: () => openFile(target.entry.path), icon: FileCode }];
-  if (isSqlFilePath(target.entry.name)) {
-    items.push({ label: t("sqlFileTree.executeSqlFile"), action: () => executeFile(target.entry.path), icon: Play });
+  const isScript = isSqlOrScriptFilePath(target.entry.name);
+  const items: ContextMenuItem[] = isScript
+    ? [
+        { label: t("sqlFileTree.openFile"), action: () => openFile(target.entry.path), icon: FileCode },
+        ...(isSqlFilePath(target.entry.name) ? [{ label: t("sqlFileTree.executeSqlFile"), action: () => executeFile(target.entry.path), icon: Play }] : []),
+        { label: t("sqlFileTree.openWithDefaultApp"), action: () => openFileWithDefaultApp(target.entry.path), icon: ExternalLink },
+      ]
+    : [{ label: t("sqlFileTree.openWithDefaultApp"), action: () => openFileWithDefaultApp(target.entry.path), icon: ExternalLink }];
+  const selectedPaths = selectedSqlFilePaths(target);
+  if (selectedPaths.length > 1 && fileTargetConnections.value.length) {
+    items.push({
+      label: `${t("sqlFileTree.changeConnectionForFiles", { count: selectedPaths.length })}…`,
+      action: () => openChangeFileConnection(selectedPaths),
+      icon: Database,
+    });
   }
   items.push(
     { label: "", separator: true },
@@ -714,6 +1605,7 @@ function expandSubtree(target: Extract<ContextTarget, { kind: "dir" }>) {
   next.add(target.entry.path);
   collectDirPaths(target.entry.children, next);
   folder.expanded = next;
+  persistFoldersUiState();
 }
 
 function collapseSubtree(target: Extract<ContextTarget, { kind: "dir" }>) {
@@ -727,6 +1619,7 @@ function collapseSubtree(target: Extract<ContextTarget, { kind: "dir" }>) {
     if (!subtree.has(p)) next.add(p);
   }
   folder.expanded = next;
+  persistFoldersUiState();
 }
 
 function clearContextTarget() {
@@ -735,31 +1628,47 @@ function clearContextTarget() {
 </script>
 
 <template>
-  <div class="h-full flex flex-col overflow-hidden">
+  <div class="h-full flex flex-col overflow-hidden isolate">
     <div class="h-9 flex items-center gap-1 px-2 border-b shrink-0 bg-muted/20">
       <span class="text-[13px] font-medium">{{ t("sqlFileTree.title") }}</span>
       <HelpTooltip :label="t('sqlFileTree.storageHelp')" side="bottom" :side-offset="4" trigger-class="h-4 w-4" content-class="max-w-[320px] whitespace-pre-line">
         {{ t("sqlFileTree.storageHelp") }}
       </HelpTooltip>
       <span class="flex-1" />
-      <LightTooltip :text="t('sidebar.locateActiveTab')" side="bottom" :delay="0" :close-delay="0" nowrap>
-        <Button variant="ghost" size="icon" class="h-5 w-5" :aria-label="t('sidebar.locateActiveTab')" :disabled="!activeFileTarget" @click="locateActiveFile">
-          <LocateFixed class="h-3 w-3" />
-        </Button>
+      <LightTooltip :text="t('sqlFileTree.locateActiveFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
+        <SidebarLocateButton class="disabled:pointer-events-none disabled:opacity-50" :label="t('sqlFileTree.locateActiveFile')" :disabled="!currentFilePath || locatingFile || folders.some((folder) => folder.loading || folder.refreshing)" @locate="locateCurrentFile" />
       </LightTooltip>
-      <LightTooltip :text="t('sqlFileTree.filterSettings')" side="bottom" :delay="0" :close-delay="0" nowrap>
+      <LightTooltip :text="t('sqlFileTree.panelSettings')" side="bottom" :delay="0" :close-delay="0" nowrap>
         <Button
           variant="ghost"
           size="icon"
           class="h-5 w-5"
           @click="
             fileFilterDraft = getSqlFileFilter();
+            openModeDraft = openMode;
+            displayModeDraft = displayMode;
             filterSettingsOpen = true;
           "
         >
           <Settings class="h-3 w-3" />
         </Button>
       </LightTooltip>
+      <DropdownMenu>
+        <LightTooltip :text="sortOrder === 'manual' ? t('sqlFileTree.sortManualHint') : currentSortOption.label" side="bottom" :delay="0" :close-delay="0" nowrap>
+          <DropdownMenuTrigger as-child>
+            <Button data-sql-file-sort-btn variant="ghost" size="icon" class="h-5 w-5" :aria-label="currentSortOption.label">
+              <component :is="currentSortOption.icon" class="h-3 w-3" />
+            </Button>
+          </DropdownMenuTrigger>
+        </LightTooltip>
+        <DropdownMenuContent align="end" @close-auto-focus="restoreTreeFocus">
+          <DropdownMenuItem v-for="option in sortOptions" :key="option.order" class="gap-2" @select="setSortOrder(option.order)">
+            <component :is="option.icon" class="h-3.5 w-3.5" />
+            {{ option.label }}
+            <Check v-if="sortOrder === option.order" class="ml-auto h-3.5 w-3.5" />
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <LightTooltip v-if="folders.length > 0" :text="t('sqlFileTree.refreshAll')" side="bottom" :delay="0" :close-delay="0" nowrap>
         <Button variant="ghost" size="icon" class="h-5 w-5" @click="refreshAll">
           <RefreshCw class="h-3 w-3" />
@@ -777,16 +1686,32 @@ function clearContextTarget() {
       </LightTooltip>
     </div>
 
+    <div v-if="folders.length > 0" class="border-b shrink-0 px-2 py-1">
+      <SqlPanelSearch ref="searchInput" v-model:mode="searchMode" panel="file" @query="searchQuery = $event" @pending="searchInputPending = $event" />
+      <p v-if="searching" class="mt-1 text-xs text-muted-foreground" role="status" aria-live="polite">{{ t("sqlFileTree.searching") }}</p>
+      <p v-else-if="searchError" class="mt-1 text-xs text-destructive" role="status">{{ t("sqlFileTree.searchFailed", { message: translateBackendError(t, searchError) }) }}</p>
+      <p v-else-if="searchIncomplete" class="mt-1 text-xs text-muted-foreground" role="status">
+        {{ t("sqlFileTree.searchIncomplete", { skipped: skippedCount }) }}
+        <HelpTooltip :label="searchIncompleteHelp" side="bottom" :side-offset="4" trigger-class="ml-1 align-middle" content-class="max-w-[320px] whitespace-pre-line" />
+      </p>
+    </div>
+
     <CustomContextMenu :items="contextMenuItems" @close="clearContextTarget">
       <template #default="{ onContextMenu }">
         <div
           ref="fileTree"
-          class="flex-1 overflow-y-auto"
+          class="flex-1 overflow-y-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
+          tabindex="0"
+          role="tree"
+          :aria-label="t('sqlFileTree.title')"
+          aria-multiselectable="true"
+          :aria-activedescendant="activeItemIndex >= 0 ? `${treeId}-row-${activeItemIndex}` : undefined"
+          @keydown="handleTreeKeydown"
           @click="handlePanelClick"
           @contextmenu.capture="contextTarget = { kind: 'panel' }"
           @contextmenu.prevent="
             contextTarget = { kind: 'panel' };
-            onContextMenu($event);
+            onContextMenu($event, contextMenuItems);
           "
         >
           <div v-if="folders.length === 0" class="flex-1 flex flex-col items-center justify-center gap-2 p-4 text-xs text-muted-foreground">
@@ -795,31 +1720,116 @@ function clearContextTarget() {
             <Button variant="outline" size="sm" class="h-7 text-xs" @click="pickFolder"> <FolderOpen class="h-3.5 w-3.5 mr-1" />{{ t("sqlFileTree.openFolder") }} </Button>
           </div>
 
+          <div v-else-if="displayMode === 'connection'">
+            <div v-if="!foldersInitialized || folders.some((folder) => folder.loading || folder.refreshing)" class="flex items-center justify-center gap-2 px-3 py-8 text-xs text-muted-foreground" role="status">
+              <RefreshCw class="h-3.5 w-3.5 animate-spin" />
+              {{ t("sqlFileTree.loading") }}
+            </div>
+            <div v-else-if="connectionFileGroups.length === 0" class="flex items-center justify-center px-3 py-8 text-xs text-muted-foreground" role="status">
+              {{ searchQuery ? t("grid.noSearchResults") : t("sqlFileTree.noSqlFiles") }}
+            </div>
+            <div v-else v-for="group in connectionFileGroups" :key="group.key" class="border-b last:border-b-0">
+              <button
+                type="button"
+                data-sql-file-row="true"
+                class="flex w-full items-center gap-1 px-2 py-1.5 text-left text-[11px] font-medium text-muted-foreground bg-[color-mix(in_oklab,var(--muted)_10%,var(--background))] select-none focus-visible:outline focus-visible:-outline-offset-2 focus-visible:outline-ring"
+                :data-sql-file-connection="group.connectionId || 'unassociated'"
+                :aria-expanded="isConnectionExpanded(group.connectionId)"
+                @click.stop="toggleConnection(group.connectionId)"
+              >
+                <ChevronRight v-if="!isConnectionExpanded(group.connectionId)" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <ChevronDown v-else class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <FolderOpen class="h-3.5 w-3.5 shrink-0 text-amber-500" :style="{ color: connectionStore.getConfig(group.connectionId)?.color }" />
+                <span class="truncate flex-1">{{ group.label }}</span>
+                <span class="shrink-0 text-muted-foreground">({{ group.rows.length }})</span>
+              </button>
+              <div v-if="isConnectionExpanded(group.connectionId)">
+                <template v-for="row in group.rows" :key="row.id">
+                  <div
+                    data-sql-file-row="true"
+                    :data-sql-file-path="row.entry.path"
+                    :data-sql-file-root="row.folder.path"
+                    class="relative flex cursor-default select-none items-center gap-1 px-2 py-1 text-sm hover:bg-accent/40"
+                    :class="isPathHighlighted(row.folder.path, 'file', row.entry.path) ? 'bg-accent text-accent-foreground' : ''"
+                    :id="`${treeId}-connection-row-${row.id}`"
+                    @click.stop="handleGroupedFileClick(row, $event)"
+                    @dblclick.stop="handleGroupedFileDoubleClick(row, $event)"
+                    @contextmenu.capture="
+                      contextTarget = { kind: 'file', folderPath: row.folder.path, entry: row.entry };
+                      activeKey = row.id;
+                    "
+                    @contextmenu.prevent.stop="
+                      contextTarget = { kind: 'file', folderPath: row.folder.path, entry: row.entry };
+                      activeKey = row.id;
+                      onContextMenu($event, contextMenuItems);
+                    "
+                  >
+                    <span class="w-3.5 shrink-0" />
+                    <FileCode class="h-4 w-4 shrink-0 text-blue-500" />
+                    <span class="truncate ml-1 flex-1" :title="row.entry.path">{{ row.entry.name }}</span>
+                    <span class="max-w-[45%] truncate text-[10px] text-muted-foreground" :title="row.folder.path">{{ row.folder.path }}</span>
+                    <LightTooltip :text="t('sqlFileTree.renameFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                      <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openRenameDialog({ kind: 'file', folderPath: row.folder.path, entry: row.entry })">
+                        <Pencil class="h-3 w-3" />
+                      </Button>
+                    </LightTooltip>
+                    <LightTooltip :text="t('sqlFileTree.deleteFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                      <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-destructive" @click.stop="openDeleteDialog({ kind: 'file', folderPath: row.folder.path, entry: row.entry })">
+                        <Trash2 class="h-3 w-3" />
+                      </Button>
+                    </LightTooltip>
+                  </div>
+                  <SqlSearchMatchSnippet
+                    v-if="searchMode === 'content' && matchesByPath.has(normalizeExternalSqlPath(row.entry.path))"
+                    :data-sql-file-content-snippet="row.entry.path"
+                    :matches="matchesByPath.get(normalizeExternalSqlPath(row.entry.path))!.matches"
+                    :total-matches="matchesByPath.get(normalizeExternalSqlPath(row.entry.path))!.totalMatches"
+                    :preview-limit="matchesByPath.get(normalizeExternalSqlPath(row.entry.path))!.matches.length"
+                    :query="searchQuery"
+                    :depth="1"
+                    @select-match="handleSearchMatch(row.folder.path, row.entry.path, $event)"
+                  />
+                </template>
+              </div>
+            </div>
+          </div>
+
           <div v-else>
             <div v-for="(folder, fi) in folders" :key="folder.path" class="border-b last:border-b-0">
               <div
                 data-sql-file-row="true"
-                class="flex cursor-default items-center gap-1 px-2 py-1.5 text-[11px] font-medium text-muted-foreground bg-[color-mix(in_oklab,var(--muted)_10%,var(--background))] sticky top-0 select-none"
-                :class="isPathHighlighted(folder.path) ? 'bg-accent text-accent-foreground' : 'hover:bg-[color-mix(in_oklab,var(--accent)_40%,var(--background))]'"
-                @click.stop="handlePathClick(folder.path, 'folderHeader', $event, () => toggleFolderCollapse(folder))"
+                :data-sql-file-drop-path="folder.path"
+                :data-sql-file-drop-root="folder.path"
+                class="flex cursor-default items-center gap-1 px-2 py-1.5 text-[11px] font-medium text-muted-foreground bg-[color-mix(in_oklab,var(--muted)_10%,var(--background))] sticky top-0 z-10 select-none"
+                :class="[
+                  fileDropTarget?.root === folder.path && fileDropTarget.path === folder.path && fileDropTarget.position === 'inside' ? 'ring-2 ring-inset ring-primary' : '',
+                  isPathHighlighted(folder.path, 'folderHeader', folder.path) ? 'bg-accent text-accent-foreground' : 'hover:bg-[color-mix(in_oklab,var(--accent)_40%,var(--background))]',
+                ]"
+                role="treeitem"
+                :id="visibleRowIds.get(folder)?.get(folder.path)"
+                :aria-level="1"
+                :aria-selected="isPathHighlighted(folder.path, 'folderHeader', folder.path)"
+                :aria-expanded="isFolderContentVisible(folder)"
+                @click.stop="handlePathClick(folder.path, folder.path, 'folderHeader', $event)"
+                @dblclick.stop="handlePathDoubleClick(folder.path, folder.path, 'folderHeader', $event)"
                 @contextmenu.capture="
                   contextTarget = { kind: 'folderHeader', folderPath: folder.path };
-                  activePath = folder.path;
+                  activeKey = nodeKey(folder.path, 'folderHeader', folder.path);
                 "
-                @contextmenu.prevent="
+                @contextmenu.prevent.stop="
                   contextTarget = { kind: 'folderHeader', folderPath: folder.path };
-                  activePath = folder.path;
-                  onContextMenu($event);
+                  activeKey = nodeKey(folder.path, 'folderHeader', folder.path);
+                  onContextMenu($event, contextMenuItems);
                 "
               >
-                <ChevronRight v-if="folder.collapsed" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <ChevronRight v-if="!isFolderContentVisible(folder)" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <ChevronDown v-else class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <FolderOpen class="h-3.5 w-3.5 shrink-0 text-amber-500" />
                 <span class="truncate shrink-0" :title="folder.path">{{ folderName(folder.path) }}</span>
                 <span class="truncate flex-1 text-[10px] text-muted-foreground/50" :title="folder.path">{{ folder.path }}</span>
                 <LightTooltip :text="t('sqlFileTree.refreshFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
                   <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="refreshFolder(folder.path)">
-                    <RefreshCw class="h-3 w-3" :class="folder.loading ? 'animate-spin' : ''" />
+                    <RefreshCw class="h-3 w-3" :class="folder.loading || folder.refreshing ? 'animate-spin' : ''" />
                   </Button>
                 </LightTooltip>
                 <LightTooltip :text="t('sqlFileTree.newSqlFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
@@ -843,79 +1853,114 @@ function clearContextTarget() {
                   </Button>
                 </LightTooltip>
               </div>
-              <div v-show="!folder.collapsed">
+              <div v-show="isFolderContentVisible(folder)">
                 <div v-if="folder.loading" class="px-3 py-2 text-xs text-muted-foreground">
                   {{ t("sqlFileTree.loading") }}
                 </div>
                 <div v-else-if="folder.entries.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
                   {{ t("sqlFileTree.noSqlFiles") }}
                 </div>
+                <div v-else-if="searchQuery && !searching && !searchError && !searchIncomplete && getProcessedEntries(folder.path).length === 0" data-sql-file-empty-search class="px-3 py-2 text-xs text-muted-foreground">
+                  {{ t("grid.noSearchResults") }}
+                </div>
                 <div v-else>
-                  <div
-                    data-sql-file-row="true"
-                    v-for="{ entry, depth } in flatTree(folder.entries, folder.expanded)"
-                    :key="entry.path"
-                    :data-sql-file-path="entry.path"
-                    class="flex cursor-default select-none items-center gap-1 px-2 py-1 text-sm"
-                    :class="[entry.is_dir ? 'rounded-sm' : 'rounded-none', isPathHighlighted(entry.path) ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/40']"
-                    :style="{ paddingLeft: depth * 16 + 8 + 'px' }"
-                    @click.stop="handlePathClick(entry.path, entry.is_dir ? 'dir' : 'file', $event, () => (entry.is_dir ? toggleExpand(folder, entry.path) : openFile(entry.path)))"
-                    @contextmenu.capture="
-                      contextTarget = entry.is_dir ? { kind: 'dir', folderPath: folder.path, entry } : { kind: 'file', folderPath: folder.path, entry };
-                      activePath = entry.path;
-                    "
-                    @contextmenu.prevent="
-                      contextTarget = entry.is_dir ? { kind: 'dir', folderPath: folder.path, entry } : { kind: 'file', folderPath: folder.path, entry };
-                      activePath = entry.path;
-                      onContextMenu($event);
-                    "
-                  >
-                    <template v-if="entry.is_dir">
-                      <ChevronRight v-if="!folder.expanded.has(entry.path)" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      <ChevronDown v-else class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      <FolderClosed v-if="!folder.expanded.has(entry.path)" class="h-4 w-4 shrink-0 text-amber-500" />
-                      <FolderOpen v-else class="h-4 w-4 shrink-0 text-amber-500" />
-                    </template>
-                    <template v-else>
-                      <span class="w-3.5 shrink-0" />
-                      <FileCode class="h-4 w-4 shrink-0 text-blue-500" />
-                    </template>
-                    <span class="truncate ml-1 flex-1">{{ entry.name }}</span>
-                    <template v-if="entry.is_dir">
-                      <LightTooltip :text="t('sqlFileTree.newSqlFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
-                        <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openCreateDialog(folder.path, entry.path)">
-                          <FilePlus class="h-3 w-3" />
-                        </Button>
-                      </LightTooltip>
-                      <LightTooltip :text="t('sqlFileTree.newFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
-                        <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openCreateFolderDialog(folder.path, entry.path)">
-                          <FolderPlus class="h-3 w-3" />
-                        </Button>
-                      </LightTooltip>
-                      <LightTooltip :text="t('sqlFileTree.renameFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
-                        <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openRenameFolderDialog({ kind: 'dir', folderPath: folder.path, entry })">
-                          <Pencil class="h-3 w-3" />
-                        </Button>
-                      </LightTooltip>
-                      <LightTooltip :text="t('sqlFileTree.deleteFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
-                        <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-destructive" @click.stop="openDeleteFolderDialog({ kind: 'dir', folderPath: folder.path, entry })">
-                          <Trash2 class="h-3 w-3" />
-                        </Button>
-                      </LightTooltip>
-                    </template>
-                    <template v-else>
-                      <LightTooltip :text="t('sqlFileTree.renameFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
-                        <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openRenameDialog({ kind: 'file', folderPath: folder.path, entry })">
-                          <Pencil class="h-3 w-3" />
-                        </Button>
-                      </LightTooltip>
-                      <LightTooltip :text="t('sqlFileTree.deleteFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
-                        <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-destructive" @click.stop="openDeleteDialog({ kind: 'file', folderPath: folder.path, entry })">
-                          <Trash2 class="h-3 w-3" />
-                        </Button>
-                      </LightTooltip>
-                    </template>
-                  </div>
+                  <template v-for="{ entry, depth } in flatTree(getProcessedEntries(folder.path), getEffectiveExpanded(folder))" :key="entry.path">
+                    <div
+                      data-sql-file-row="true"
+                      :data-sql-file-path="entry.path"
+                      :data-sql-file-root="folder.path"
+                      :aria-current="activeKey === nodeKey(folder.path, entry.is_dir ? 'dir' : 'file', entry.path) ? 'true' : undefined"
+                      class="relative flex cursor-default select-none items-center gap-1 px-2 py-1 text-sm"
+                      :class="[
+                        draggedFile?.root === folder.path && draggedFile.path === entry.path ? 'opacity-50' : '',
+                        entry.is_dir ? 'rounded-sm' : 'rounded-none',
+                        fileDropTarget?.root === folder.path && fileDropTarget.path === entry.path && fileDropTarget.position === 'inside' ? 'ring-2 ring-inset ring-primary' : '',
+                        isPathHighlighted(folder.path, entry.is_dir ? 'dir' : 'file', entry.path) ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/40',
+                      ]"
+                      :style="{ paddingLeft: depth * 16 + 8 + 'px' }"
+                      role="treeitem"
+                      :id="visibleRowIds.get(folder)?.get(entry.path)"
+                      :aria-level="depth + 2"
+                      :aria-selected="isPathHighlighted(folder.path, entry.is_dir ? 'dir' : 'file', entry.path)"
+                      :aria-expanded="entry.is_dir ? getEffectiveExpanded(folder).has(entry.path) : undefined"
+                      @mousedown="startFileDrag($event, folder.path, entry.path)"
+                      @dragstart.prevent
+                      @click.stop="handlePathClick(folder.path, entry.path, entry.is_dir ? 'dir' : 'file', $event)"
+                      @dblclick.stop="handlePathDoubleClick(folder.path, entry.path, entry.is_dir ? 'dir' : 'file', $event)"
+                      @contextmenu.capture="
+                        contextTarget = entry.is_dir ? { kind: 'dir', folderPath: folder.path, entry } : { kind: 'file', folderPath: folder.path, entry };
+                        activeKey = nodeKey(folder.path, entry.is_dir ? 'dir' : 'file', entry.path);
+                      "
+                      @contextmenu.prevent="
+                        contextTarget = entry.is_dir ? { kind: 'dir', folderPath: folder.path, entry } : { kind: 'file', folderPath: folder.path, entry };
+                        activeKey = nodeKey(folder.path, entry.is_dir ? 'dir' : 'file', entry.path);
+                        onContextMenu($event, contextMenuItems);
+                      "
+                    >
+                      <div
+                        v-if="fileDropTarget?.root === folder.path && fileDropTarget.path === entry.path && fileDropTarget.position !== 'inside'"
+                        class="pointer-events-none absolute left-2 right-2 border-primary"
+                        :class="fileDropTarget.position === 'before' ? 'top-0 border-t-2' : 'bottom-0 border-b-2'"
+                      />
+                      <template v-if="entry.is_dir">
+                        <ChevronRight v-if="!getEffectiveExpanded(folder).has(entry.path)" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <ChevronDown v-else class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <FolderClosed v-if="!getEffectiveExpanded(folder).has(entry.path)" class="h-4 w-4 shrink-0 text-amber-500" />
+                        <FolderOpen v-else class="h-4 w-4 shrink-0 text-amber-500" />
+                      </template>
+                      <template v-else>
+                        <span class="w-3.5 shrink-0" />
+                        <FileSpreadsheet v-if="isSpreadsheetFilePath(entry.name)" class="h-4 w-4 shrink-0 text-emerald-500" />
+                        <FileCode v-else-if="isSqlOrScriptFilePath(entry.name)" class="h-4 w-4 shrink-0 text-blue-500" />
+                        <FileText v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+                      </template>
+                      <span class="truncate ml-1 flex-1">{{ entry.name }}</span>
+                      <template v-if="entry.is_dir">
+                        <LightTooltip :text="t('sqlFileTree.newSqlFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                          <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openCreateDialog(folder.path, entry.path)">
+                            <FilePlus class="h-3 w-3" />
+                          </Button>
+                        </LightTooltip>
+                        <LightTooltip :text="t('sqlFileTree.newFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                          <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openCreateFolderDialog(folder.path, entry.path)">
+                            <FolderPlus class="h-3 w-3" />
+                          </Button>
+                        </LightTooltip>
+                        <LightTooltip :text="t('sqlFileTree.renameFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                          <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openRenameFolderDialog({ kind: 'dir', folderPath: folder.path, entry })">
+                            <Pencil class="h-3 w-3" />
+                          </Button>
+                        </LightTooltip>
+                        <LightTooltip :text="t('sqlFileTree.deleteFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                          <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-destructive" @click.stop="openDeleteFolderDialog({ kind: 'dir', folderPath: folder.path, entry })">
+                            <Trash2 class="h-3 w-3" />
+                          </Button>
+                        </LightTooltip>
+                      </template>
+                      <template v-else>
+                        <LightTooltip :text="t('sqlFileTree.renameFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                          <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground" @click.stop="openRenameDialog({ kind: 'file', folderPath: folder.path, entry })">
+                            <Pencil class="h-3 w-3" />
+                          </Button>
+                        </LightTooltip>
+                        <LightTooltip :text="t('sqlFileTree.deleteFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
+                          <Button variant="ghost" size="icon" class="h-4 w-4 shrink-0 text-muted-foreground hover:text-destructive" @click.stop="openDeleteDialog({ kind: 'file', folderPath: folder.path, entry })">
+                            <Trash2 class="h-3 w-3" />
+                          </Button>
+                        </LightTooltip>
+                      </template>
+                    </div>
+                    <SqlSearchMatchSnippet
+                      v-if="searchMode === 'content' && !entry.is_dir && matchesByPath.has(normalizeExternalSqlPath(entry.path))"
+                      :data-sql-file-content-snippet="entry.path"
+                      :matches="matchesByPath.get(normalizeExternalSqlPath(entry.path))!.matches"
+                      :total-matches="matchesByPath.get(normalizeExternalSqlPath(entry.path))!.totalMatches"
+                      :preview-limit="matchesByPath.get(normalizeExternalSqlPath(entry.path))!.matches.length"
+                      :query="searchQuery"
+                      :depth="depth + 1"
+                      @select-match="handleSearchMatch(folder.path, entry.path, $event)"
+                    />
+                  </template>
                 </div>
               </div>
             </div>
@@ -924,19 +1969,43 @@ function clearContextTarget() {
       </template>
     </CustomContextMenu>
 
-    <Dialog v-model:open="filterSettingsOpen">
-      <DialogContent class="sm:max-w-md">
+    <SqlFileInteractionSettingsDialog
+      v-model:open="filterSettingsOpen"
+      v-model:open-mode="openModeDraft"
+      v-model:display-mode="displayModeDraft"
+      display-mode-id="sql-file-display-mode"
+      :display-mode-label="t('sqlFileTree.displayMode')"
+      :display-mode-folder-label="t('sqlFileTree.displayModeFolder')"
+      :display-mode-connection-label="t('sqlFileTree.displayModeConnection')"
+      @save="saveFileFilter"
+    >
+      <p class="text-xs text-muted-foreground">{{ t("sqlFileTree.keyboardHelp") }}</p>
+      <Label for="sql-file-filter">{{ t("sqlFileTree.fileFilter") }}</Label>
+      <Input id="sql-file-filter" v-model="fileFilterDraft" :placeholder="t('sqlFileTree.fileFilterPlaceholder')" @keydown.enter="saveFileFilter" />
+      <p class="text-xs text-muted-foreground">{{ t("sqlFileTree.fileFilterHint", { regex: fileFilterRegexExample }) }}</p>
+    </SqlFileInteractionSettingsDialog>
+
+    <Dialog v-model:open="showChangeFileConnection">
+      <DialogContent class="sm:max-w-[420px]" @close-auto-focus="restoreTreeFocus">
         <DialogHeader>
-          <DialogTitle>{{ t("sqlFileTree.filterSettings") }}</DialogTitle>
+          <DialogTitle>{{ t("sqlFileTree.changeConnectionForFiles", { count: changeConnectionPaths.length }) }}</DialogTitle>
+          <DialogDescription>{{ t("sqlFileTree.changeConnectionForFilesDescription") }}</DialogDescription>
         </DialogHeader>
-        <div class="grid gap-2 py-2">
-          <Label for="sql-file-filter">{{ t("sqlFileTree.fileFilter") }}</Label>
-          <Input id="sql-file-filter" v-model="fileFilterDraft" :placeholder="t('sqlFileTree.fileFilterPlaceholder')" @keydown.enter="saveFileFilter" />
-          <p class="text-xs text-muted-foreground">{{ t("sqlFileTree.fileFilterHint", { regex: fileFilterRegexExample }) }}</p>
-        </div>
+        <p v-if="changeConnectionPaths.length > MAX_EXTERNAL_SQL_FILE_TARGETS" class="text-sm text-muted-foreground">{{ t("sqlFileTree.changeConnectionLimit", { count: MAX_EXTERNAL_SQL_FILE_TARGETS }) }}</p>
+        <p v-if="hasOpenTargetFiles" class="text-sm text-muted-foreground">{{ t("sqlFileTree.changeConnectionCloseFiles") }}</p>
+        <ConnectionTreeSelect
+          v-model="newFileConnectionId"
+          :connections="fileTargetConnections"
+          :layout="connectionStore.sidebarLayout"
+          :placeholder="t('editor.selectConnection')"
+          :search-placeholder="t('editor.searchConnection')"
+          :empty-text="t('grid.noSearchResults')"
+          trigger-class="h-8 w-full max-w-none justify-between border border-input bg-background px-2.5 text-sm"
+          list-class="w-[360px] max-w-[calc(100vw-2rem)]"
+        />
         <DialogFooter>
-          <Button type="button" variant="outline" @click="filterSettingsOpen = false">{{ t("common.cancel") }}</Button>
-          <Button type="button" @click="saveFileFilter">{{ t("common.save") }}</Button>
+          <Button variant="outline" size="sm" @click="showChangeFileConnection = false">{{ t("dangerDialog.cancel") }}</Button>
+          <Button size="sm" :disabled="!newFileConnection || hasOpenTargetFiles || changeConnectionPaths.length > MAX_EXTERNAL_SQL_FILE_TARGETS" @click="changeFileConnection">{{ t("sqlLibrary.changeTargetConfirm") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -977,7 +2046,7 @@ function clearContextTarget() {
     </Dialog>
 
     <Dialog :open="showRenameDialog" @update:open="(open) => (showRenameDialog = open)">
-      <DialogContent class="sm:max-w-[380px]">
+      <DialogContent class="sm:max-w-[380px]" @close-auto-focus="restoreTreeFocus">
         <DialogHeader>
           <DialogTitle>{{ t("sqlFileTree.renameFile") }}</DialogTitle>
           <DialogDescription>{{ t("sqlFileTree.renameFileDescription") }}</DialogDescription>
@@ -998,7 +2067,7 @@ function clearContextTarget() {
         }
       "
     >
-      <DialogContent class="sm:max-w-[380px]">
+      <DialogContent class="sm:max-w-[380px]" @close-auto-focus="restoreTreeFocus">
         <DialogHeader>
           <DialogTitle>{{ t("sqlFileTree.renameFolder") }}</DialogTitle>
           <DialogDescription>{{ t("sqlFileTree.renameFolderDescription") }}</DialogDescription>
