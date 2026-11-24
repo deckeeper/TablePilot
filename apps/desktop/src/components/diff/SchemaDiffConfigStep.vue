@@ -19,18 +19,20 @@ import {
   reconcileSchemaDiffRoutineMappings,
   reconcileSchemaDiffSelectedRoutines,
   schemaDiffRoutineKey,
+  schemaDiffRoutineKeyFromFunction,
   SCHEMA_DIFF_UNRESTRICTED_ROUTINE_LIMIT,
   type SchemaDiffRoutineMatch,
 } from "@/lib/schema/schemaDiffRoutine";
 import { createSchemaDiffTableListCoordinator, reconcileSchemaDiffSelectedTables, shouldLoadSchemaDiffTableList, type SchemaDiffTableIdentity, type SchemaDiffTableListLoader, type SchemaDiffTableSide } from "@/lib/schema/schemaDiffTableList";
-import { schemaDiffRoutineObjectTypes, schemaDiffRoutineObjectTypesIntersection, supportsSchemaDiffRoutines } from "@/lib/database/databaseObjectCapabilities";
+import { schemaDiffRoutineObjectTypes, schemaDiffRoutineObjectTypesIntersection, supportsSchemaDiffRoutines, schemaDiffRoutineProductType } from "@/lib/database/databaseObjectCapabilities";
+import { schemaDiffEngineDatabaseType } from "@/lib/schema/schemaDiff";
 import { useConnectionStore } from "@/stores/connectionStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/backend/api";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import { fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { ArrowLeftRight, GitCompareArrows, Save, FolderOpen, Settings, Trash2, X } from "@lucide/vue";
-import type { SchemaDiffConfig, SchemaDiffCompareOptions, FieldMappingEntry, SchemaDiffTableMapping, SchemaDiffRoutineMapping } from "@/types/schemaDiff";
+import type { SchemaDiffConfig, SchemaDiffCompareOptions, FieldMappingEntry, SchemaDiffTableMapping, SchemaDiffRoutineMapping, OracleRoutineKind, OracleRoutineIdentity } from "@/types/schemaDiff";
 import type { DatabaseType } from "@/types/database";
 
 const { t } = useI18n();
@@ -49,6 +51,7 @@ const props = defineProps<{
   options: SchemaDiffCompareOptions;
   selectedTables?: string[];
   selectedRoutines?: string[];
+  additionalSchemas?: string[];
   tableListLoader: SchemaDiffTableListLoader;
   loading: boolean;
   recentConfigs: SchemaDiffConfig[];
@@ -75,7 +78,9 @@ const emit = defineEmits<{
   (e: "deleteHistoryConfig", configId: string): void;
   (e: "update:selectedTables", value?: string[]): void;
   (e: "update:selectedRoutines", value?: string[]): void;
+  (e: "update:routineSelection", value: { objectKinds: OracleRoutineKind[]; selectedObjects?: Pick<OracleRoutineIdentity, "name" | "kind">[] }): void;
   (e: "update:compareScope", value: { tables?: boolean; views?: boolean; functions?: boolean }): void;
+  (e: "update:additionalSchemas", value: string[]): void;
 }>();
 
 const sourceDatabases = ref<string[]>([]);
@@ -266,7 +271,12 @@ const tableListCoordinator = createSchemaDiffTableListCoordinator({
 const canConfigureTableSelection = computed(() => isTableIdentityReady("source"));
 const tablesCompareEnabled = computed(() => !!props.options.tables);
 const routinesCompareEnabled = computed(() => !!props.options.functions);
-const canEnableRoutinesCompare = computed(() => schemaDiffRoutineObjectTypesIntersection(sourceDbType.value as DatabaseType | undefined, targetDbType.value as DatabaseType | undefined).length > 0);
+const sourceRoutineType = computed(() => schemaDiffRoutineProductType(sourceDbType.value, schemaDiffEngineDatabaseType(sourceConfig.value)));
+const targetRoutineType = computed(() => schemaDiffRoutineProductType(targetDbType.value, schemaDiffEngineDatabaseType(targetConfig.value)));
+const availableRoutineKinds = computed(() => schemaDiffRoutineObjectTypesIntersection(sourceRoutineType.value, targetRoutineType.value, ["PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY"]));
+const routineKinds = computed(() => props.options.routineObjectKinds ?? schemaDiffRoutineObjectTypesIntersection(sourceRoutineType.value, targetRoutineType.value));
+const typedRoutines = computed(() => props.options.routineObjectKinds !== undefined);
+const canEnableRoutinesCompare = computed(() => availableRoutineKinds.value.length > 0);
 /** User preference AND supported pair — drives compare/canCompare/Switch display. */
 const effectiveRoutinesEnabled = computed(() => routinesCompareEnabled.value && canEnableRoutinesCompare.value);
 
@@ -293,10 +303,89 @@ const sourceRoutineList = ref<string[]>([]);
 const targetRoutineList = ref<string[]>([]);
 const targetRoutineListLoaded = ref(false);
 const restrictRoutines = ref(false);
+
+// Pairs are matched by name, and object selections and mappings belong to the
+// chosen schema, so applying them to another schema would pair the wrong objects.
+const additionalSchemaOptions = computed(() => {
+  if (!isSchemaAware(sourceConfig.value?.db_type) || !isSchemaAware(targetConfig.value?.db_type)) return [];
+  if (restrictTables.value || restrictRoutines.value || props.selectedTables !== undefined || props.selectedRoutines !== undefined || props.options.selectedRoutineObjects !== undefined) return [];
+  if (props.options.tableMappings?.length || props.options.routineMappings?.length || props.options.fieldMappings?.length) return [];
+  const targetNames = new Set(targetSchemas.value);
+  return sourceSchemas.value.filter((schema) => targetNames.has(schema) && schema !== props.sourceSchema && schema !== props.targetSchema);
+});
+
+function pruneAdditionalSchemas() {
+  const selected = props.additionalSchemas ?? [];
+  const kept = selected.filter((schema) => additionalSchemaOptions.value.includes(schema));
+  if (kept.length !== selected.length) emit("update:additionalSchemas", kept);
+}
+
+watch(additionalSchemaOptions, () => {
+  // An empty list on a schema-aware endpoint usually means it is reloading, so keep the selection for now.
+  const reloading = (isSchemaAware(sourceConfig.value?.db_type) && !sourceSchemas.value.length) || (isSchemaAware(targetConfig.value?.db_type) && !targetSchemas.value.length);
+  if (!reloading) pruneAdditionalSchemas();
+});
+
+// Comparing must never include a schema the picker no longer offers.
+function handleCompareClick() {
+  pruneAdditionalSchemas();
+  emit("compare");
+}
 const localSelectedRoutines = ref<string[]>([]);
 const loadingRoutines = ref(false);
+type ProgramSelection = Pick<OracleRoutineIdentity, "name" | "kind">;
+const routineIdentities = { source: ref<Record<string, ProgramSelection>>({}), target: ref<Record<string, ProgramSelection>>({}) };
+const routineRequests = { source: 0, target: 0 };
+for (const side of ["source", "target"] as const) {
+  watch(
+    () => [side === "source" ? props.sourceConnectionId : props.targetConnectionId, side === "source" ? props.sourceDatabase : props.targetDatabase, side === "source" ? props.sourceSchema : props.targetSchema, JSON.stringify(props.options.routineObjectKinds)],
+    () => {
+      routineRequests[side]++;
+      routineIdentities[side].value = {};
+      if (side === "source") sourceRoutineList.value = [];
+      else {
+        targetRoutineList.value = [];
+        targetRoutineListLoaded.value = false;
+      }
+    },
+    { flush: "sync" },
+  );
+}
+const exactRoutineKey = (identity: ProgramSelection) => schemaDiffRoutineKeyFromFunction({ name: identity.name, function_type: identity.kind, arguments: "" }, true);
+const selectedRoutineKeys = computed(() => (typedRoutines.value ? props.options.selectedRoutineObjects?.map(exactRoutineKey) : props.selectedRoutines));
+const routineLabels = computed<Record<string, string>>(() => {
+  if (!typedRoutines.value) return {};
+  const identities = { ...routineIdentities.target.value, ...routineIdentities.source.value };
+  for (const identity of props.options.selectedRoutineObjects ?? []) identities[exactRoutineKey(identity)] = identity;
+  return Object.fromEntries(Object.entries(identities).map(([key, identity]) => [key, `${identity.kind.replaceAll("_", " ")} ${identity.name}`]));
+});
 
-const canConfigureRoutineSelection = computed(() => isTableIdentityReady("source") && supportsSchemaDiffRoutines(sourceDbType.value as DatabaseType));
+function emitRoutineSelection(keys: string[] | undefined) {
+  if (!typedRoutines.value) {
+    emit("update:selectedRoutines", keys);
+    return;
+  }
+  emit("update:routineSelection", {
+    objectKinds: [...routineKinds.value],
+    selectedObjects: keys?.flatMap((key) => {
+      const identity = routineIdentities.source.value[key];
+      return identity ? [{ ...identity }] : [];
+    }),
+  });
+}
+
+function toggleRoutineKind(kind: OracleRoutineKind, enabled: boolean) {
+  const kinds = availableRoutineKinds.value.filter((candidate) => (candidate === kind ? enabled : routineKinds.value.includes(candidate)));
+  const selectedObjects = restrictRoutines.value
+    ? localSelectedRoutines.value.flatMap((key) => {
+        const identity = routineIdentities.source.value[key];
+        return identity && kinds.includes(identity.kind) ? [{ ...identity }] : [];
+      })
+    : undefined;
+  emit("update:routineSelection", { objectKinds: kinds, selectedObjects });
+}
+
+const canConfigureRoutineSelection = computed(() => isTableIdentityReady("source") && supportsSchemaDiffRoutines(sourceRoutineType.value));
 const activeRoutineMappings = computed(() => identitySchemaDiffRoutineMappings(props.options?.routineMappings ?? []));
 const routineMatches = computed<SchemaDiffRoutineMatch[]>(() => buildSchemaDiffRoutineMatches(localSelectedRoutines.value, targetRoutineList.value, activeRoutineMappings.value));
 const matchedRoutineCount = computed(() => routineMatches.value.filter((match) => match.targetRoutine).length);
@@ -313,7 +402,7 @@ function reconcileRoutineMappings(selectedRoutines: string[], targetRoutines = t
 }
 
 watch(
-  () => props.selectedRoutines,
+  () => selectedRoutineKeys.value,
   (value) => {
     restrictRoutines.value = Array.isArray(value);
     localSelectedRoutines.value = value && Array.isArray(value) ? [...value] : [];
@@ -333,7 +422,7 @@ watch(
 
 function handleToggleRestrictRoutines(enabled: boolean) {
   restrictRoutines.value = enabled;
-  emit("update:selectedRoutines", enabled ? [...localSelectedRoutines.value] : undefined);
+  emitRoutineSelection(enabled ? [...localSelectedRoutines.value] : undefined);
   if (!enabled) emitRoutineMappings([]);
   else reconcileRoutineMappings(localSelectedRoutines.value);
 }
@@ -341,7 +430,7 @@ function handleToggleRestrictRoutines(enabled: boolean) {
 function handleUpdateSelectedRoutines(value: string[]) {
   localSelectedRoutines.value = value;
   if (!restrictRoutines.value) return;
-  emit("update:selectedRoutines", [...value]);
+  emitRoutineSelection([...value]);
   reconcileRoutineMappings(value);
 }
 
@@ -350,24 +439,31 @@ function handleRemoveSelectedRoutine(sourceRoutine: string) {
 }
 
 function clearUnavailableRoutineSelection() {
+  routineRequests.source++;
+  routineRequests.target++;
+  routineIdentities.source.value = {};
+  routineIdentities.target.value = {};
   sourceRoutineList.value = [];
   targetRoutineList.value = [];
   targetRoutineListLoaded.value = false;
-  if (props.selectedRoutines === undefined && !restrictRoutines.value && localSelectedRoutines.value.length === 0) {
+  if (selectedRoutineKeys.value === undefined && !restrictRoutines.value && localSelectedRoutines.value.length === 0) {
     emitRoutineMappings([]);
     return;
   }
   restrictRoutines.value = false;
   localSelectedRoutines.value = [];
-  emit("update:selectedRoutines", undefined);
+  emitRoutineSelection(undefined);
   emitRoutineMappings([]);
 }
 
 async function loadRoutineList(side: "source" | "target") {
+  const request = ++routineRequests[side];
+  const exactKinds = typedRoutines.value;
+  const requestedKinds = exactKinds ? [...routineKinds.value] : undefined;
   const connectionId = side === "source" ? props.sourceConnectionId : props.targetConnectionId;
   const database = side === "source" ? props.sourceDatabase : props.targetDatabase;
   const schema = side === "source" ? props.sourceSchema : props.targetSchema;
-  const dbType = side === "source" ? sourceDbType.value : targetDbType.value;
+  const dbType = side === "source" ? sourceRoutineType.value : targetRoutineType.value;
   if (!isTableIdentityReady(side) || !supportsSchemaDiffRoutines(dbType as DatabaseType)) {
     if (side === "source") sourceRoutineList.value = [];
     else {
@@ -376,23 +472,32 @@ async function loadRoutineList(side: "source" | "target") {
     }
     return;
   }
-  const isCurrent = metadataRequestIsCurrent(side);
+  const endpointIsCurrent = metadataRequestIsCurrent(side);
+  const isCurrent = () => endpointIsCurrent() && request === routineRequests[side] && JSON.stringify(requestedKinds) === JSON.stringify(typedRoutines.value ? routineKinds.value : undefined);
   try {
     loadingRoutines.value = true;
     await store.ensureConnected(connectionId);
     if (!isCurrent()) return;
     // Names/signatures only — avoid listFunctions N+1 source fetch on the config step.
-    const kinds = schemaDiffRoutineObjectTypes(dbType as DatabaseType);
+    const kinds = schemaDiffRoutineObjectTypes(dbType as DatabaseType, requestedKinds);
     const objects = kinds.length === 0 ? [] : await api.listObjects(connectionId, database, schema, kinds);
     if (!isCurrent()) return;
-    const keys = objects.map((object) => schemaDiffRoutineKey(object.name, object.signature ?? ""));
+    const identities: Record<string, ProgramSelection> = {};
+    const keys = objects.map((object) => {
+      const kind = (object.object_type ?? "").replaceAll(" ", "_").toUpperCase() as OracleRoutineKind;
+      if (exactKinds && !kinds.includes(kind)) throw new Error("Program listing returned an unexpected object kind");
+      const key = exactKinds ? exactRoutineKey({ name: object.name, kind }) : schemaDiffRoutineKey(object.name, object.signature ?? "");
+      if (kinds.includes(kind)) identities[key] = { name: object.name, kind };
+      return key;
+    });
+    routineIdentities[side].value = identities;
     if (side === "source") {
       sourceRoutineList.value = keys;
       if (restrictRoutines.value) {
         const next = reconcileSchemaDiffSelectedRoutines(localSelectedRoutines.value, keys);
         if (next.length !== localSelectedRoutines.value.length || next.some((key, index) => key !== localSelectedRoutines.value[index])) {
           localSelectedRoutines.value = next;
-          emit("update:selectedRoutines", [...next]);
+          emitRoutineSelection([...next]);
         }
       }
     } else {
@@ -413,7 +518,7 @@ async function loadRoutineList(side: "source" | "target") {
 }
 
 watch(
-  () => [restrictRoutines.value, effectiveRoutinesEnabled.value, props.sourceConnectionId, props.sourceDatabase, props.sourceSchema, sourceDbType.value] as const,
+  () => [restrictRoutines.value, effectiveRoutinesEnabled.value, props.sourceConnectionId, props.sourceDatabase, props.sourceSchema, sourceRoutineType.value, JSON.stringify(props.options.routineObjectKinds)] as const,
   ([restrictEnabled, routinesEnabled]) => {
     if (!canConfigureRoutineSelection.value) {
       clearUnavailableRoutineSelection();
@@ -426,9 +531,9 @@ watch(
 );
 
 watch(
-  () => [restrictRoutines.value, localSelectedRoutines.value.length, props.targetConnectionId, props.targetDatabase, props.targetSchema, targetDbType.value] as const,
+  () => [restrictRoutines.value, localSelectedRoutines.value.length, props.targetConnectionId, props.targetDatabase, props.targetSchema, targetRoutineType.value, JSON.stringify(props.options.routineObjectKinds)] as const,
   ([enabled, selectedCount]) => {
-    if (!enabled || selectedCount === 0 || !isTableIdentityReady("target") || !supportsSchemaDiffRoutines(targetDbType.value as DatabaseType)) {
+    if (!enabled || selectedCount === 0 || !isTableIdentityReady("target") || !supportsSchemaDiffRoutines(targetRoutineType.value)) {
       if (!enabled) {
         targetRoutineList.value = [];
         targetRoutineListLoaded.value = false;
@@ -443,10 +548,10 @@ watch(
 watch(
   () => ({
     source: [props.sourceConnectionId, props.sourceDatabase, props.sourceSchema] as const,
-    selectedRoutines: props.selectedRoutines,
+    selectedRoutines: selectedRoutineKeys.value,
   }),
   (current, previous) => {
-    if (!isTableIdentityReady("source") || !supportsSchemaDiffRoutines(sourceDbType.value as DatabaseType)) {
+    if (!isTableIdentityReady("source") || !supportsSchemaDiffRoutines(sourceRoutineType.value)) {
       clearUnavailableRoutineSelection();
       return;
     }
@@ -471,7 +576,7 @@ function handleRoutinesCompareEnabled(enabled: boolean) {
 
 const unrestrictedRoutineLoadTooLarge = computed(() => {
   if (!effectiveRoutinesEnabled.value || restrictRoutines.value) return false;
-  return isSchemaDiffUnrestrictedRoutineLoadTooLarge(sourceRoutineList.value.length, props.selectedRoutines);
+  return isSchemaDiffUnrestrictedRoutineLoadTooLarge(sourceRoutineList.value.length, selectedRoutineKeys.value);
 });
 
 const canCompare = computed(() => {
@@ -480,7 +585,7 @@ const canCompare = computed(() => {
   if (!tablesEnabled && !routinesEnabled) return false;
   if (unrestrictedRoutineLoadTooLarge.value) return false;
   const hasSelectedTables = !tablesEnabled || props.selectedTables === undefined || props.selectedTables.length > 0;
-  const hasSelectedRoutines = !routinesEnabled || props.selectedRoutines === undefined || props.selectedRoutines.length > 0;
+  const hasSelectedRoutines = !routinesEnabled || (routineKinds.value.length > 0 && (selectedRoutineKeys.value === undefined || selectedRoutineKeys.value.length > 0));
   // Unmapped source tables are not a blocker: they flow through the comparison as
   // source-only tables (CREATE TABLE in the target), matching the pre-mapping behavior.
   const hasValidTableMappings = !tablesEnabled || !restrictTables.value || localSelectedTables.value.length === 0 || isTableIdentityReady("target");
@@ -854,6 +959,12 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
       </div>
     </div>
 
+    <!-- Additional Schemas -->
+    <div v-if="additionalSchemaOptions.length" class="space-y-1.5 rounded-lg border bg-muted/20 p-3">
+      <TableMultiSelect :tables="additionalSchemaOptions" :model-value="additionalSchemas ?? []" :title="t('diff.additionalSchemas')" @update:model-value="$emit('update:additionalSchemas', $event)" />
+      <p class="text-[11px] text-muted-foreground">{{ t("diff.additionalSchemasHint") }}</p>
+    </div>
+
     <!-- Comparison Scope -->
     <div class="space-y-3 rounded-lg border bg-muted/20 p-3">
       <div class="space-y-1.5">
@@ -945,7 +1056,13 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
       <div class="space-y-1.5 border-t border-border/60 pt-3">
         <div class="flex items-center justify-between gap-2">
           <div class="flex min-w-0 items-center gap-2">
-            <Switch size="sm" :model-value="effectiveRoutinesEnabled" :disabled="!canEnableRoutinesCompare" :aria-label="t('diff.compareRoutinesSwitch')" @update:model-value="handleRoutinesCompareEnabled(Boolean($event))" />
+            <Switch
+              size="sm"
+              :model-value="typedRoutines ? routinesCompareEnabled : effectiveRoutinesEnabled"
+              :disabled="!canEnableRoutinesCompare && !(typedRoutines && routinesCompareEnabled)"
+              :aria-label="t('diff.compareRoutinesSwitch')"
+              @update:model-value="handleRoutinesCompareEnabled(Boolean($event))"
+            />
             <Label class="text-xs font-medium" :class="!canEnableRoutinesCompare ? 'text-muted-foreground' : ''">{{ t("diff.routineSelection") }}</Label>
           </div>
           <Button v-if="effectiveRoutinesEnabled && (restrictRoutines || canConfigureRoutineSelection)" variant="ghost" size="sm" class="h-6 px-2 text-xs" :disabled="loadingRoutines" @click="handleToggleRestrictRoutines(!restrictRoutines)">
@@ -959,6 +1076,12 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
           {{ t("diff.routineCompareDisabled") }}
         </div>
         <template v-else>
+          <div v-if="availableRoutineKinds.includes('PACKAGE')" class="flex flex-wrap gap-x-4 gap-y-2">
+            <label v-for="kind in availableRoutineKinds" :key="kind" class="flex items-center gap-2 text-xs">
+              <input type="checkbox" class="accent-primary" :data-program-kind="kind" :checked="routineKinds.includes(kind)" :disabled="loadingRoutines" @change="toggleRoutineKind(kind, ($event.target as HTMLInputElement).checked)" />
+              {{ kind.replaceAll("_", " ") }}
+            </label>
+          </div>
           <div v-if="!restrictRoutines" class="text-[11px] text-muted-foreground">
             {{ !isTableIdentityReady("source") ? t("diff.routineSelectionNeedSource") : t("diff.routineSelectionUnrestricted") }}
           </div>
@@ -971,6 +1094,8 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
             :model-value="localSelectedRoutines"
             @update:model-value="handleUpdateSelectedRoutines"
             :tables="sourceRoutineList"
+            :disabled="loadingRoutines"
+            :labels="typedRoutines ? routineLabels : undefined"
             :title="t('diff.sourceRoutines')"
             :search-placeholder="t('diff.searchSourceRoutines')"
             :empty-text="t('diff.noRoutines')"
@@ -998,9 +1123,9 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
             </thead>
             <tbody>
               <tr v-for="match in routineMatches" :key="match.sourceRoutine" class="border-b last:border-b-0">
-                <td class="max-w-[220px] truncate px-2 py-1.5 font-mono" :title="match.sourceRoutine">{{ match.sourceRoutine }}</td>
-                <td class="max-w-[220px] truncate px-2 py-1.5 font-mono" :title="match.targetRoutine || undefined">
-                  <span v-if="match.targetRoutine">{{ match.targetRoutine }}</span>
+                <td class="max-w-[220px] truncate px-2 py-1.5 font-mono" :title="routineLabels[match.sourceRoutine] ?? match.sourceRoutine">{{ routineLabels[match.sourceRoutine] ?? match.sourceRoutine }}</td>
+                <td class="max-w-[220px] truncate px-2 py-1.5 font-mono" :title="match.targetRoutine ? (routineLabels[match.targetRoutine] ?? match.targetRoutine) : undefined">
+                  <span v-if="match.targetRoutine">{{ routineLabels[match.targetRoutine] ?? match.targetRoutine }}</span>
                   <span v-else class="text-muted-foreground">—</span>
                 </td>
                 <td class="px-2 py-1.5" :class="matchStatusClass(match.kind)">
@@ -1087,7 +1212,7 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
           <span v-if="activeFieldMappings.length > 0" class="ml-1 inline-flex items-center justify-center rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">{{ activeFieldMappings.length }}</span>
         </Button>
       </div>
-      <Button size="sm" :disabled="!canCompare || loading" @click="$emit('compare')">
+      <Button size="sm" :disabled="!canCompare || loading" @click="handleCompareClick">
         <GitCompareArrows class="w-3.5 h-3.5 mr-1" />
         {{ loading ? t("common.loading") : t("diff.compare") }}
       </Button>

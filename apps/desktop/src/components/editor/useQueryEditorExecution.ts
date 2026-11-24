@@ -12,6 +12,7 @@ interface RequestExecuteOptions {
   ignoreSelection?: boolean;
   bypassPicker?: boolean;
   openInNewResultTab?: boolean;
+  forceExecuteAll?: boolean;
 }
 
 interface QueryEditorExecutionOptions {
@@ -53,6 +54,7 @@ export function useQueryEditorExecution(options: QueryEditorExecutionOptions) {
   }
 
   function requestExecute(options: RequestExecuteOptions = {}) {
+    if (props.isExecuting) return false;
     executionViewportOwnership.cancelPendingRequest();
     const currentView = view.value;
     if (!currentView) return false;
@@ -61,48 +63,82 @@ export function useQueryEditorExecution(options: QueryEditorExecutionOptions) {
   }
 
   function requestExecuteInNewResultTab() {
+    if (props.isExecuting) return false;
     return requestExecute({ bypassPicker: true, openInNewResultTab: true });
+  }
+
+  function requestExecuteAll(options: Omit<RequestExecuteOptions, "forceExecuteAll"> = {}) {
+    if (props.isExecuting) return false;
+    return requestExecute({ ...options, ignoreSelection: true, forceExecuteAll: true, bypassPicker: true });
   }
 
   function requestExecuteFromView(currentView: EditorViewType, cursorPos: number, options: RequestExecuteOptions = {}) {
     const selection = currentView.state.selection.main;
-    if (!options.ignoreSelection && !selection.empty) {
+    if (!options.ignoreSelection && !options.forceExecuteAll && !selection.empty) {
       // Has manual selection → execute directly, skip picker.
       emitExecutionRequest(sqlExecutionSnapshotFromView(currentView), options.openInNewResultTab);
       return true;
     }
     if (!supportsExecutionTargetPicker(props.databaseType)) {
-      emitExecutionRequest(sqlExecutionSnapshotFromView(currentView), options.openInNewResultTab);
+      const snapshot = options.forceExecuteAll
+        ? sqlExecutionSnapshotForRange(currentView, {
+            sql: currentView.state.doc.toString(),
+            from: 0,
+            to: currentView.state.doc.length,
+          })
+        : sqlExecutionSnapshotFromView(currentView);
+      emitExecutionRequest(snapshot, options.openInNewResultTab);
       return true;
     }
     // No selection → resolve the execution target, optionally via the picker.
     const doc = currentView.state.doc.toString();
     const parameterOptions = sqlStatementParameterOptions();
     const candidates = buildExecutionCandidates(doc, cursorPos, props.databaseType, parameterOptions);
-    const executeMode = settingsStore.editorSettings.executeMode;
+    const executeMode = options.forceExecuteAll ? "all" : settingsStore.editorSettings.executeMode;
     if (candidates.length === 0) {
       if (executeMode === "current") toast(t("editor.noExecutableStatementAtCursor"), 3000);
+      else if (doc.trim()) {
+        emitExecutionRequest(sqlExecutionSnapshotForRange(currentView, { sql: doc, from: 0, to: doc.length }), options.openInNewResultTab);
+      }
       return true;
     }
-    const candidate = executionCandidateForMode(candidates, executeMode, {
-      executeAllOnBlankLine: settingsStore.editorSettings.executeAllOnBlankLine,
-    });
+    const candidate =
+      executionCandidateForMode(candidates, executeMode, {
+        executeAllOnBlankLine: settingsStore.editorSettings.executeAllOnBlankLine,
+      }) ??
+      (options.forceExecuteAll
+        ? {
+            kind: "all" as const,
+            supportedKinds: ["all" as const],
+            label: "allStatements",
+            sql: doc,
+            from: 0,
+            to: doc.length,
+          }
+        : null);
     if (!candidate) {
       toast(t("editor.noExecutableStatementAtCursor"), 3000);
       return true;
     }
     // The execution shortcut keeps executing the configured target (cursor/all) directly:
     // it stays keyboard-driven and never pops the picker, which is reserved for click entry points.
-    if (options.bypassPicker || !settingsStore.editorSettings.showExecutionTargetPicker || !hasMultipleExecutionTargets(doc, props.databaseType, parameterOptions)) {
+    // A nested query at the cursor (#15213) also opens the picker when it is
+    // enabled: one statement can now mean several executable depths, and the
+    // configured "current" target alone no longer describes them all.
+    const hasNestedCandidates = candidates.some((item) => item.kind === "nested");
+    if (options.bypassPicker || options.forceExecuteAll || !settingsStore.editorSettings.showExecutionTargetPicker || (!hasMultipleExecutionTargets(doc, props.databaseType, parameterOptions) && !hasNestedCandidates)) {
       emitExecutionRequest(sqlExecutionSnapshotForRange(currentView, candidate), options.openInNewResultTab);
       return true;
     }
     closePicker();
     pickerCandidates.value = candidates;
-    pickerActiveIndex.value = 0;
+    // Keep the configured execution target selected when nested fragments are
+    // offered. A nested query may depend on the enclosing statement's scope.
+    const defaultIndex = hasNestedCandidates ? Math.max(0, candidates.indexOf(candidate)) : 0;
+    pickerActiveIndex.value = defaultIndex;
     pickerAnchor.value = executionPickerAnchor(currentView, cursorPos, candidates.length);
     pickerVisible.value = true;
-    setPreviewRange({ from: candidates[0].from, to: candidates[0].to });
+    setPreviewRange({ from: candidates[defaultIndex].from, to: candidates[defaultIndex].to });
     return true;
   }
 
@@ -172,6 +208,7 @@ export function useQueryEditorExecution(options: QueryEditorExecutionOptions) {
     pickerAnchor,
     captureExecutionSnapshot,
     requestExecute,
+    requestExecuteAll,
     requestExecuteInNewResultTab,
     requestExecuteFromView,
     executionPickerAnchor,

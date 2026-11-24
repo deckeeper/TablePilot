@@ -45,7 +45,8 @@ function createHarness(doc = "SELECT  FROM users", mode: "select" | "insert" = "
     codeMirrorSnippetCompletion: snippetCompletion,
   };
   const accepted = vi.fn();
-  const batch = useQueryEditorBatchSelection({ view, runtime, settingsStore: { editorSettings: { sqlFormatter: { keywordCase: "upper" } } } as Options["settingsStore"], markCompletionAccepted: accepted });
+  const settingsStore = { editorSettings: { sqlFormatter: { keywordCase: "upper" }, batchColumnSelectionIncludeComments: true } } as Options["settingsStore"];
+  const batch = useQueryEditorBatchSelection({ view, runtime, settingsStore, markCompletionAccepted: accepted });
   const items: SqlCompletionItem[] = customItems ?? ["id", "name", "email"].map((label) => ({ label, apply: label, type: "column", batchSelectionMode: mode }));
   const from = customFrom ?? (mode === "select" ? 7 : doc.length);
   const session = batch.prepareBatchColumnSelectionSession(items, doc, from, from)!;
@@ -68,7 +69,7 @@ function createHarness(doc = "SELECT  FROM users", mode: "select" | "insert" = "
     parent.append(element);
     return { element, checkbox, label };
   }
-  return { batch, currentView, view, runtime, accepted, items, session, completion, row };
+  return { batch, currentView, view, runtime, settingsStore, accepted, items, session, completion, row };
 }
 
 describe("QueryEditor batch selection ownership", () => {
@@ -125,6 +126,22 @@ describe("QueryEditor batch selection ownership", () => {
     expect(batch.expandedRendering).toBe(false);
   });
 
+  it("lets a same-row double-click reach single-completion handling", () => {
+    const { session, row } = createHarness();
+    const { label } = row(1);
+    vi.spyOn(document, "elementFromPoint").mockReturnValue(label);
+
+    const firstMouseDown = new MouseEvent("mousedown", { button: 0, detail: 1, bubbles: true, cancelable: true });
+    label.dispatchEvent(firstMouseDown);
+    expect(firstMouseDown.defaultPrevented).toBe(true);
+    expect(session.selectedKeys).toEqual(new Set([session.candidates[1].key]));
+
+    const secondMouseDown = new MouseEvent("mousedown", { button: 0, detail: 2, bubbles: true, cancelable: true });
+    label.dispatchEvent(secondMouseDown);
+    expect(secondMouseDown.defaultPrevented).toBe(false);
+    expect(session.selectedKeys).toEqual(new Set([session.candidates[1].key]));
+  });
+
   it("uses the live selected completion and inserts fields in candidate order", () => {
     const { batch, session, runtime, currentView, completion } = createHarness();
     runtime.codeMirrorSelectedCompletion = () => completion(2);
@@ -162,6 +179,36 @@ describe("QueryEditor batch selection ownership", () => {
     expect(currentView.state.doc.toString()).toBe("SELECT t.id, -- 编号\n  t.name -- 名称\nFROM users");
   });
 
+  // #11330 / #15190: the repeated qualifier must be the text already in the
+  // document. Re-quoting an Oracle alias (`ap` -> `"ap"`) breaks the statement.
+  it("repeats an unquoted qualifier without adding quotes", () => {
+    const doc = "SELECT ap. FROM orders ap";
+    const from = "SELECT ap.".length;
+    const items: SqlCompletionItem[] = [
+      { label: "ID", apply: "ID", type: "column", batchSelectionMode: "select", batchSelectionQualifier: "ap" },
+      { label: "STATUS", apply: "STATUS", type: "column", batchSelectionMode: "select", batchSelectionQualifier: "ap" },
+    ];
+    const { batch, session, currentView, settingsStore } = createHarness(doc, "select", items, from);
+    settingsStore.editorSettings.batchColumnSelectionIncludeComments = false;
+    batch.toggleAllBatchColumnSelection(currentView, session.key);
+    expect(batch.applySelectedBatchColumnSelection(currentView)).toBe(true);
+    expect(currentView.state.doc.toString()).toBe("SELECT ap.ID, ap.STATUS FROM orders ap");
+  });
+
+  it("keeps the quotes of a quoted qualifier", () => {
+    const doc = 'SELECT "ap". FROM orders "ap"';
+    const from = 'SELECT "ap".'.length;
+    const items: SqlCompletionItem[] = [
+      { label: "ID", apply: "ID", type: "column", batchSelectionMode: "select", batchSelectionQualifier: '"ap"' },
+      { label: "STATUS", apply: "STATUS", type: "column", batchSelectionMode: "select", batchSelectionQualifier: '"ap"' },
+    ];
+    const { batch, session, currentView, settingsStore } = createHarness(doc, "select", items, from);
+    settingsStore.editorSettings.batchColumnSelectionIncludeComments = false;
+    batch.toggleAllBatchColumnSelection(currentView, session.key);
+    expect(batch.applySelectedBatchColumnSelection(currentView)).toBe(true);
+    expect(currentView.state.doc.toString()).toBe('SELECT "ap".ID, "ap".STATUS FROM orders "ap"');
+  });
+
   it("moves existing trailing comma before comment when inserting commented columns (#11354)", () => {
     const doc = "SELECT\n  t.,\n  other\nFROM users";
     const from = "SELECT\n  t.".length;
@@ -170,6 +217,23 @@ describe("QueryEditor batch selection ownership", () => {
     batch.toggleAllBatchColumnSelection(currentView, session.key);
     expect(batch.applySelectedBatchColumnSelection(currentView)).toBe(true);
     expect(currentView.state.doc.toString()).toBe("SELECT\n  t.id, -- 编号\n  other\nFROM users");
+  });
+
+  it.each([
+    ["SELECT t. FROM users", "SELECT t.id, t.name FROM users"],
+    ["SELECT t., other FROM users", "SELECT t.id, t.name, other FROM users"],
+    ["SELECT t.\nFROM users", "SELECT t.id, t.name\nFROM users"],
+  ])("omits disabled column comments without changing the SQL suffix: %s", (doc, expected) => {
+    const items: SqlCompletionItem[] = [
+      { label: "id", apply: "id", type: "column", batchSelectionMode: "select", batchSelectionQualifier: "t", comment: "编号\n主键" },
+      { label: "name", apply: "name", type: "column", batchSelectionMode: "select", batchSelectionQualifier: "t" },
+    ];
+    const { batch, session, currentView, settingsStore } = createHarness(doc, "select", items, "SELECT t.".length);
+    settingsStore.editorSettings.batchColumnSelectionIncludeComments = false;
+    batch.toggleAllBatchColumnSelection(currentView, session.key);
+    expect(batch.applySelectedBatchColumnSelection(currentView)).toBe(true);
+    expect(currentView.state.doc.toString()).toBe(expected);
+    expect(items[0].comment).toBe("编号\n主键");
   });
 
   it("rejects stale documents and pending completion without recording acceptance", () => {
