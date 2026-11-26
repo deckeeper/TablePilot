@@ -6,6 +6,7 @@ import { extractCteDefinitions, getSqlCompletionContext, getPostgresSequenceLite
 import { oracleDatabaseLinkCompletionContext } from "./oracleDatabaseLinkCompletion";
 import { resolveSqlServerUseDatabaseCompletion } from "./sqlCompletionLookupTarget";
 import { sqlCompletionContextFromSemantic } from "@/lib/sql/semantic/completion";
+import { buildSqlLocalSchemaOverlay, type SqlLocalSchemaOverlay } from "@/lib/sql/semantic/localSchema";
 import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import type { DatabaseType } from "@/types/database";
 import type { SqlSemanticBuildOptions } from "./semantic/types";
@@ -28,6 +29,7 @@ export interface SqlCompletionAnalysisResult {
   databaseLinkContext: ReturnType<typeof oracleDatabaseLinkCompletionContext>;
   useDatabaseCompletion: ReturnType<typeof resolveSqlServerUseDatabaseCompletion>;
   cteDefinitions: ReturnType<typeof extractCteDefinitions>;
+  localSchema: SqlLocalSchemaOverlay;
 }
 
 function minimalDocumentChange(previous: string, next: string): { from: number; to: number; insert: string } | null {
@@ -80,6 +82,7 @@ export function analyzeSqlCompletion(request: SqlCompletionAnalysisRequest, edit
   const options = {
     databaseType: request.databaseType,
     dialect: request.dialect,
+    driverProfile: request.driverProfile,
     editorState,
   };
   const legacyContext = getSqlCompletionContext(request.sql, request.cursor, options);
@@ -92,5 +95,6 @@ export function analyzeSqlCompletion(request: SqlCompletionAnalysisRequest, edit
     databaseLinkContext: oracleDatabaseLinkCompletionContext(request.sql, request.cursor, request.databaseType),
     useDatabaseCompletion: resolveSqlServerUseDatabaseCompletion({ sql: request.sql, cursor: request.cursor, databaseType: request.databaseType }),
     cteDefinitions: extractCteDefinitions(request.sql),
+    localSchema: buildSqlLocalSchemaOverlay(request.sql, options),
   };
 }

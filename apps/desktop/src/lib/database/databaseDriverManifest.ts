@@ -30,7 +30,7 @@ export const DATABASE_PRODUCT_CAPABILITY_KEYS = [
 export type DatabaseProductCapability = (typeof DATABASE_PRODUCT_CAPABILITY_KEYS)[number];
 export type DatabaseProductCapabilities = Record<DatabaseProductCapability, boolean>;
 
-export const DATABASE_BEHAVIOR_TRAIT_KEYS = ["schemaAware", "databaseSchemaQualified", "singleDatabase", "clearableQuerySchema", "fetchFirst", "treeSchema", "databaseObjectTree", "pgVacuum", "pgLikeStructure", "diagramSql"] as const;
+export const DATABASE_BEHAVIOR_TRAIT_KEYS = ["schemaAware", "databaseSchemaQualified", "singleDatabase", "clearableQuerySchema", "fetchFirst", "treeSchema", "databaseObjectTree", "pgVacuum", "pgLikeStructure", "diagramSql", "showSystemDatabases"] as const;
 
 export type DatabaseBehaviorTrait = (typeof DATABASE_BEHAVIOR_TRAIT_KEYS)[number];
 export type DatabaseBehaviorTraits = Partial<Record<DatabaseBehaviorTrait, boolean>>;
@@ -172,6 +172,8 @@ export function manifestDatabaseTypes(): DatabaseType[] {
 }
 
 export function usesAgentCursorForQuery(dbType?: DatabaseType, driverProfile?: string): boolean {
+  // DuckDB's native worker captures one bounded result for all subsequent pages.
+  if (dbType === "duckdb") return true;
   if (dbType === "sqlserver" && driverProfile?.trim().toLowerCase() === "sqlserver-legacy") return true;
   const runtimeMode = databaseRuntimeMode(dbType);
   return runtimeMode === "agent" || runtimeMode === "external";

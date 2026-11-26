@@ -1,6 +1,134 @@
 use super::*;
 use crate::models::connection::DatabaseType;
+use crate::table_structure_sql::dialect::StructureDialect;
 use crate::types::PgPartitionKind;
+
+fn foreign_create_options(server: &str) -> CreateTableDialectOptions {
+    CreateTableDialectOptions {
+        postgres_foreign_table: Some(PostgresForeignTableCreateOptions {
+            server: server.into(),
+            options: vec![
+                PostgresForeignTableOption { name: "schema_name".into(), value: "remote's schema".into() },
+                PostgresForeignTableOption { name: "table_name".into(), value: "source table".into() },
+            ],
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn postgres_foreign_table_create_quotes_server_options_and_comments() {
+    let mut options = structure_change_options(
+        DatabaseType::Postgres,
+        Some("local\"schema"),
+        "foreign table",
+        vec![column("remote\"column")],
+    );
+    options.table_comment = Some("foreign's comment".into());
+    options.columns[0].comment = "column's comment".into();
+    options.columns[0].is_nullable = false;
+    options.columns[0].default_value = "'fallback'".into();
+    let result = build_create_table_sql_with_dialect_options(options, None, foreign_create_options("server\"name"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements.len(), 3);
+    assert!(result.statements[0].starts_with("CREATE FOREIGN TABLE \"local\"\"schema\".\"foreign table\" ("));
+    assert!(result.statements[0].contains("\"remote\"\"column\""));
+    assert!(result.statements[0].contains("NOT NULL"));
+    assert!(result.statements[0].contains("DEFAULT 'fallback'"));
+    assert!(result.statements[0].ends_with(
+        "SERVER \"server\"\"name\" OPTIONS (\"schema_name\" 'remote''s schema', \"table_name\" 'source table');"
+    ));
+    assert_eq!(
+        result.statements[1],
+        "COMMENT ON FOREIGN TABLE \"local\"\"schema\".\"foreign table\" IS 'foreign''s comment';"
+    );
+    assert!(result.statements[2].contains("COMMENT ON COLUMN"));
+}
+
+#[test]
+fn postgres_foreign_table_create_validates_required_server_and_options() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    for server in ["", " ", "invalid\0server"] {
+        let result = build_create_table_sql_with_dialect_options(options.clone(), None, foreign_create_options(server));
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+    for option in [
+        PostgresForeignTableOption { name: "schema_name".into(), value: "duplicate".into() },
+        PostgresForeignTableOption { name: "".into(), value: "orphan".into() },
+        PostgresForeignTableOption { name: "bad\0name".into(), value: "value".into() },
+        PostgresForeignTableOption { name: "filename".into(), value: "bad\0value".into() },
+    ] {
+        let mut settings = foreign_create_options("server");
+        settings.postgres_foreign_table.as_mut().unwrap().options.push(option);
+        let result = build_create_table_sql_with_dialect_options(options.clone(), None, settings);
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn postgres_foreign_table_create_rejects_unsupported_dialects_and_constraints() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    for database_type in [DatabaseType::Mysql, DatabaseType::Sqlite, DatabaseType::OpenGauss, DatabaseType::Gaussdb] {
+        let mut request = options.clone();
+        request.database_type = Some(database_type);
+        assert!(build_create_table_sql_with_dialect_options(request, None, foreign_create_options("server"))
+            .statements
+            .is_empty());
+    }
+    let mut primary = options.clone();
+    primary.columns[0].is_primary_key = true;
+    let mut identity = options.clone();
+    identity.columns[0].extra =
+        Some(serde_json::from_value(serde_json::json!({"identity":{"generation":"ALWAYS"}})).unwrap());
+    let mut partition = options.clone();
+    partition.partitioned = true;
+    let mut redshift = options;
+    redshift.driver_profile = Some("redshift".into());
+    for request in [primary, identity, partition, redshift] {
+        let result = build_create_table_sql_with_dialect_options(request, None, foreign_create_options("server"));
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn postgres_foreign_table_options_are_optional_and_allow_empty_values() {
+    let mut options =
+        structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    options.foreign_table = true;
+    options.table_comment = Some("table comment".into());
+    let regular =
+        build_create_table_sql_with_dialect_options(options.clone(), None, CreateTableDialectOptions::default());
+    assert!(regular.statements[0].starts_with("CREATE TABLE "));
+    assert!(regular.statements[1].starts_with("COMMENT ON TABLE "));
+    let mut settings = foreign_create_options("server");
+    settings.postgres_foreign_table.as_mut().unwrap().options.clear();
+    let result = build_create_table_sql_with_dialect_options(options.clone(), None, settings.clone());
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("SERVER \"server\";"));
+    settings
+        .postgres_foreign_table
+        .as_mut()
+        .unwrap()
+        .options
+        .push(PostgresForeignTableOption { name: "custom_option".into(), value: "".into() });
+    let result = build_create_table_sql_with_dialect_options(options, None, settings);
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("OPTIONS (\"custom_option\" '');"));
+}
+
+#[test]
+fn postgres_foreign_table_create_allows_serial_types() {
+    let mut options =
+        structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    options.columns[0].data_type = "serial".into();
+    let result = build_create_table_sql_with_dialect_options(options, None, foreign_create_options("server"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].starts_with("CREATE FOREIGN TABLE"));
+    assert!(result.statements[0].to_ascii_lowercase().contains("serial"));
+}
 
 fn column(name: &str) -> EditableStructureColumn {
     EditableStructureColumn {
@@ -66,6 +194,7 @@ fn structure_change_options(
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -665,6 +794,7 @@ fn index_change_options(
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -693,6 +823,7 @@ fn trigger(name: &str, timing: &str, event: &str, statement: &str) -> EditableSt
     EditableStructureTrigger {
         id: name.to_string(),
         name: name.to_string(),
+        oracle_exact: None,
         timing: timing.to_string(),
         event: event.to_string(),
         statement: statement.to_string(),
@@ -758,6 +889,7 @@ fn builds_mysql_column_and_index_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -776,6 +908,141 @@ fn builds_mysql_column_and_index_changes() {
             "CREATE UNIQUE INDEX `uniq_users_email` ON `users` (`email`);",
         ]
     );
+}
+
+#[test]
+fn mysql_rebuild_index_uses_one_alter_table() {
+    let mut changed = existing_index("userId", &["userId", "cylId", "isClose"], false);
+    changed.columns.push("isEmpty".to_string());
+    changed.index_type = "BTREE".to_string();
+    changed.original.as_mut().unwrap().index_type = Some("BTREE".to_string());
+    let mut options = index_change_options(DatabaseType::Mysql, Some("dbx12441_native"), changed);
+    options.table_name = "ls_station_delivery_staff_stock_log".to_string();
+
+    let result = build_table_structure_change_sql(options);
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE `ls_station_delivery_staff_stock_log` DROP INDEX `userId`, ADD INDEX `userId` USING BTREE (`userId`, `cylId`, `isClose`, `isEmpty`);"
+    ]);
+}
+
+#[test]
+fn mysql_rebuild_index_preserves_definition_types() {
+    for (index_type, unique, definition) in [
+        ("", false, "INDEX `idx`"),
+        ("btree", false, "INDEX `idx` USING BTREE"),
+        ("HASH", false, "INDEX `idx` USING HASH"),
+        ("BTREE", true, "UNIQUE INDEX `idx` USING BTREE"),
+        ("", true, "UNIQUE INDEX `idx`"),
+        ("FULLTEXT", false, "FULLTEXT INDEX `idx`"),
+        ("SPATIAL", false, "SPATIAL INDEX `idx`"),
+        ("RTREE", false, "SPATIAL INDEX `idx`"),
+    ] {
+        let mut changed = existing_index("idx", &["old_key"], false);
+        changed.columns = vec!["second".to_string(), "first".to_string()];
+        changed.index_type = index_type.to_string();
+        changed.is_unique = unique;
+        changed.comment = "owner's index".to_string();
+        let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.statements,
+            vec![format!(
+                "ALTER TABLE `USERS` DROP INDEX `idx`, ADD {definition} (`second`, `first`) COMMENT 'owner''s index';"
+            )]
+        );
+    }
+}
+
+#[test]
+fn mysql_rebuild_index_preserves_quoted_names_and_functional_keys() {
+    let expression = "((lower(`email`)))";
+    let mut changed = existing_index("old`idx", &["email"], false);
+    changed.name = "new`idx".to_string();
+    // Parenthesized plain identifiers keep their existing quoting behavior;
+    // only wrapped functional key parts are treated as SQL expressions.
+    changed.columns = vec!["a`b".to_string(), "name(10)".to_string(), expression.to_string()];
+    let mut options = index_change_options(DatabaseType::Mysql, Some("db`name"), changed);
+    options.table_name = "table`name".to_string();
+    let result = build_table_structure_change_sql(options);
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec![format!(
+            "ALTER TABLE `table``name` DROP INDEX `old``idx`, ADD INDEX `new``idx` (`a``b`, `name(10)`, {expression});"
+        )]
+    );
+}
+
+#[test]
+fn mysql_rebuild_index_rejects_empty_replacement_without_drop() {
+    for (name, columns) in [(" ", vec!["email"]), ("idx", vec![]), ("idx", vec![" ", ""])] {
+        let mut changed = existing_index("idx", &["email"], false);
+        changed.name = name.to_string();
+        changed.columns = columns.into_iter().map(str::to_string).collect();
+        let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+        assert!(result.statements.is_empty(), "{:?}", result.statements);
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn mysql_rebuild_index_keeps_noop_primary_and_capability_guards() {
+    let unchanged = existing_index("idx", &["email"], false);
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, unchanged));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.is_empty());
+
+    let mut primary = existing_primary_index("PRIMARY", &["id"]);
+    primary.columns.push("email".to_string());
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, primary));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("cannot be edited")));
+
+    let mut changed = existing_index("idx", &["email"], false);
+    changed.columns.push("id".to_string());
+    let mut options = index_change_options(DatabaseType::Mysql, None, changed);
+    options.driver_profile = Some("starrocks".to_string());
+    let mut warnings = Vec::new();
+    assert!(super::indexes::build_index_sql(&options, &mut warnings).is_empty());
+    assert!(warnings.iter().any(|warning| warning.contains("Editing existing indexes is not supported")));
+    let result = build_table_structure_change_sql(options);
+    assert!(result.statements.is_empty());
+    assert!(!result.warnings.is_empty());
+}
+
+#[test]
+fn mysql_rebuild_index_ignores_stale_concurrently_flag_with_real_change() {
+    let mut changed = existing_index("idx", &["email"], false);
+    changed.concurrently = true;
+    changed.comment = "new comment".to_string();
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `USERS` DROP INDEX `idx`, ADD INDEX `idx` (`email`) COMMENT 'new comment';"]
+    );
+}
+
+#[test]
+fn mysql_dialect_other_engines_keep_standalone_rebuilds() {
+    for database_type in [DatabaseType::Goldendb, DatabaseType::Sundb, DatabaseType::Databend] {
+        let mut changed = existing_index("idx", &["email"], false);
+        changed.is_unique = true;
+        let result = build_table_structure_change_sql(index_change_options(database_type, None, changed));
+
+        assert!(result.warnings.is_empty(), "{database_type:?}: {:?}", result.warnings);
+        assert_eq!(
+            result.statements,
+            vec!["DROP INDEX `idx` ON `USERS`;", "CREATE UNIQUE INDEX `idx` ON `USERS` (`email`);",],
+            "{database_type:?}"
+        );
+    }
 }
 
 #[test]
@@ -1048,7 +1315,6 @@ fn dameng_new_and_dropped_indexes_do_not_use_or_replace() {
 #[test]
 fn non_dameng_index_rebuilds_do_not_use_or_replace() {
     for database_type in [
-        DatabaseType::Mysql,
         DatabaseType::Postgres,
         DatabaseType::Sqlite,
         DatabaseType::SqlServer,
@@ -1134,6 +1400,7 @@ fn builds_xugu_type_change_with_native_syntax() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1421,6 +1688,7 @@ fn builds_mysql_unsigned_integer_column_with_length_before_attribute() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1465,6 +1733,7 @@ fn doris_table_editor_renames_column_without_mysql_change_syntax() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1512,6 +1781,91 @@ fn doris_single_column_alter_renames_then_modifies_column_definition() {
 }
 
 #[test]
+fn doris_creates_index_with_create_index_on_table() {
+    let result = build_table_structure_change_sql(index_change_options(
+        DatabaseType::Doris,
+        None,
+        index("idx_course_id", &["course_id"]),
+    ));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["CREATE INDEX `idx_course_id` ON `USERS` (`course_id`);"]);
+}
+
+#[test]
+fn doris_drops_index_with_drop_index_on_table() {
+    let mut dropped = existing_index("idx_course_id", &["course_id"], false);
+    dropped.marked_for_drop = true;
+
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Doris, None, dropped));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["DROP INDEX `idx_course_id` ON `USERS`;"]);
+}
+
+#[test]
+fn doris_unique_index_is_refused_with_a_clear_message() {
+    let mut unique = index("idx_unique_email", &["email"]);
+    unique.is_unique = true;
+
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Doris, None, unique));
+
+    assert_eq!(result.warnings, vec!["Unique indexes are not supported for doris from this editor.".to_string()]);
+    assert!(result.statements.is_empty());
+}
+
+#[test]
+fn doris_composite_index_is_refused_because_create_index_takes_one_column() {
+    let result = build_table_structure_change_sql(index_change_options(
+        DatabaseType::Doris,
+        None,
+        index("idx_multi", &["first_name", "last_name"]),
+    ));
+
+    assert_eq!(result.warnings, vec!["Doris supports single-column indexes only from this editor.".to_string()]);
+    assert!(result.statements.is_empty());
+}
+
+#[test]
+fn doris_unique_index_is_refused_when_creating_a_table_too() {
+    let mut unique = index("idx_unique_email", &["email"]);
+    unique.is_unique = true;
+    let mut options = index_change_options(DatabaseType::Doris, None, unique);
+    options.columns = vec![column("email")];
+
+    let result = build_create_table_sql(options);
+
+    assert_eq!(result.warnings, vec!["Unique indexes are not supported for doris from this editor.".to_string()]);
+    assert!(!result.statements.iter().any(|statement| statement.contains("UNIQUE INDEX")));
+}
+
+#[test]
+fn doris_schema_qualified_table_still_emits_an_unqualified_create_index() {
+    let result = build_table_structure_change_sql(index_change_options(
+        DatabaseType::Doris,
+        Some("analytics"),
+        index("idx_course_id", &["course_id"]),
+    ));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["CREATE INDEX `idx_course_id` ON `USERS` (`course_id`);"]);
+}
+
+#[test]
+fn doris_key_index_from_the_table_model_is_not_droppable() {
+    let mut key_index = existing_index("UNIQUE KEY", &["email"], true);
+    key_index.marked_for_drop = true;
+
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Doris, None, key_index));
+
+    assert_eq!(
+        result.warnings,
+        vec!["The Doris key index \"UNIQUE KEY\" is part of the table's UNIQUE KEY and cannot be dropped from this editor.".to_string()]
+    );
+    assert!(result.statements.is_empty());
+}
+
+#[test]
 fn dameng_integer_column_omits_mysql_display_width() {
     let mut age = column("age");
     age.data_type = "integer(11)".to_string();
@@ -1534,6 +1888,7 @@ fn dameng_integer_column_omits_mysql_display_width() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1585,6 +1940,7 @@ fn builds_highgo_foreign_key_changes_with_postgres_syntax() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1670,6 +2026,7 @@ fn builds_informix_column_and_index_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1735,6 +2092,7 @@ fn oracle_does_not_generate_drop_sql_for_all_columns() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1816,6 +2174,7 @@ fn oracle_create_table_places_default_before_not_null() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1891,6 +2250,7 @@ fn oracle_create_table_preserves_character_length_units() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1935,6 +2295,7 @@ fn oracle_create_table_uses_unquoted_identifiers_for_new_objects() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -1980,6 +2341,7 @@ fn oracle_create_table_leaves_uppercase_regular_identifier_unquoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2024,6 +2386,7 @@ fn oracle_create_table_quotes_special_and_reserved_identifiers() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2071,6 +2434,7 @@ fn oracle_create_table_distinguishes_new_and_referenced_foreign_key_identifiers(
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2119,6 +2483,7 @@ fn oracle_create_table_extracts_single_line_trigger_source_into_the_body() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2159,6 +2524,7 @@ fn oracle_create_table_warns_instead_of_emitting_an_unparsed_trigger_declaration
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2203,6 +2569,7 @@ fn oracle_existing_quoted_identifiers_keep_exact_spelling() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2244,6 +2611,7 @@ fn oracle_new_identifier_formatting_does_not_change_other_dialects() {
             transwarp_create: None,
             partitioned: false,
             foreign_table: false,
+            table_type: None,
             is_gaussdb_m_mode: false,
             table_collation: None,
             primary_key_name: None,
@@ -2350,6 +2718,7 @@ fn iris_drop_index_includes_table_name() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2400,6 +2769,7 @@ fn iris_ignores_comment_changes_but_keeps_supported_column_alters() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2491,6 +2861,7 @@ fn oracle_compatible_databases_keep_comment_on_sql() {
             transwarp_create: None,
             partitioned: false,
             foreign_table: false,
+            table_type: None,
             is_gaussdb_m_mode: false,
             table_collation: None,
             primary_key_name: None,
@@ -2534,6 +2905,7 @@ fn mysql_create_index_with_comment() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2576,6 +2948,7 @@ fn manticoresearch_builds_create_table_sql_only() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2628,6 +3001,7 @@ fn manticoresearch_builds_add_and_drop_column_sql() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2708,6 +3082,7 @@ fn gbase8a_uses_limited_mysql_ddl() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2787,6 +3162,7 @@ fn gbase8a_allows_mysql_style_column_reorder() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2809,8 +3185,8 @@ fn gbase8a_allows_mysql_style_column_reorder() {
 #[test]
 fn gbase8s_uses_informix_ddl_not_mysql() {
     let result = build_create_table_sql(TableStructureSqlOptions {
-        database_type: Some(DatabaseType::Gbase),
-        driver_profile: Some("gbase8s".to_string()),
+        database_type: Some(DatabaseType::Gbase8s),
+        driver_profile: None,
         schema: Some("gbasedbt".to_string()),
         table_name: "issue8003_repro".to_string(),
         columns: vec![
@@ -2837,6 +3213,7 @@ fn gbase8s_uses_informix_ddl_not_mysql() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2879,6 +3256,7 @@ fn gbase_without_driver_profile_still_uses_mysql_ddl() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -2923,6 +3301,7 @@ fn manticoresearch_does_not_drop_id_column() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3000,6 +3379,7 @@ fn manticoresearch_warns_when_existing_column_properties_change() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3044,6 +3424,7 @@ fn manticoresearch_ignores_mysql_column_options() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3091,6 +3472,7 @@ fn manticoresearch_builds_text_column_properties() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3130,6 +3512,7 @@ fn manticoresearch_builds_json_secondary_index_property() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3165,6 +3548,7 @@ fn mysql_create_unique_index_with_comment_and_btree() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3202,6 +3586,7 @@ fn mysql_create_functional_index_preserves_key_part_syntax() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3239,6 +3624,7 @@ fn mysql_add_timestamp_column_drops_invalid_precision() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3276,6 +3662,7 @@ fn mysql_add_timestamp_column_preserves_valid_precision() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3320,6 +3707,7 @@ fn builds_postgres_create_table_with_comments_and_index() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3361,6 +3749,7 @@ fn quotes_expression_like_new_index_columns_without_provenance() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3442,6 +3831,7 @@ fn create_table_trims_table_name_whitespace_for_all_statements() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3488,6 +3878,7 @@ fn warns_for_sqlite_unsafe_column_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3543,6 +3934,7 @@ fn qualifies_attached_sqlite_table_and_index_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3621,6 +4013,7 @@ fn builds_rqlite_changes_with_sqlite_dialect() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3660,6 +4053,7 @@ fn builds_kingbase_add_column_without_column_keyword() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3734,6 +4128,7 @@ fn builds_mysql_column_reorder_statements() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3799,6 +4194,7 @@ fn mysql_add_column_before_existing_column_does_not_reorder_shifted_column() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3871,6 +4267,7 @@ fn mysql_existing_column_reorder_does_not_reorder_columns_shifted_by_prior_move(
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3955,6 +4352,7 @@ fn mysql_moving_first_column_to_end_uses_single_reorder_statement() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -3989,6 +4387,7 @@ fn builds_sql_server_quoted_column_and_index_statements() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4029,6 +4428,7 @@ fn sqlserver_strips_mysql_display_width_from_fixed_integer_types() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4063,6 +4463,7 @@ fn sqlserver_strips_scale_from_float() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4097,6 +4498,7 @@ fn sqlserver_preserves_float_mantissa_bits() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4156,6 +4558,7 @@ fn sqlserver_default_changes_drop_old_constraints_with_isolated_batches() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4382,6 +4785,7 @@ fn sqlserver_unchanged_foreign_key_does_not_warn_when_saving_other_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4421,6 +4825,7 @@ fn sqlserver_add_column_with_identity() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4461,6 +4866,7 @@ fn sqlserver_legacy_column_comment_change_uses_legacy_extended_properties() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4504,6 +4910,7 @@ fn dameng_add_column_with_identity() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4537,6 +4944,7 @@ fn dameng_uppercases_lowercase_column_type() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4577,6 +4985,7 @@ fn dameng_rejects_identity_on_incompatible_type() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4619,6 +5028,7 @@ fn sqlserver_rejects_identity_on_incompatible_type() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4635,9 +5045,11 @@ fn sqlserver_rejects_identity_on_incompatible_type() {
 }
 
 #[test]
-fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
+fn sqlserver_foreign_key_edits_generate_alter_statements() {
     let mut user_fk = foreign_key("fk_orders_user_id", "user_id", "accounts", "id");
     user_fk.ref_schema = "dbo".to_string();
+    user_fk.on_delete = "CASCADE".to_string();
+    user_fk.on_update = "RESTRICT".to_string();
     user_fk.original = Some(ForeignKeyInfo {
         name: "fk_orders_user_id".to_string(),
         column: "user_id".to_string(),
@@ -4664,6 +5076,7 @@ fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4672,8 +5085,14 @@ fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
         oracle_foreign_key_changes: None,
     });
 
-    assert_eq!(result.statements, Vec::<String>::new());
-    assert_eq!(result.warnings, vec!["Editing foreign keys is not supported for sqlserver from this editor."]);
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec![
+            "ALTER TABLE [dbo].[orders] DROP CONSTRAINT [fk_orders_user_id];",
+            "ALTER TABLE [dbo].[orders] ADD CONSTRAINT [fk_orders_user_id] FOREIGN KEY ([user_id]) REFERENCES [dbo].[accounts] ([id]) ON DELETE CASCADE ON UPDATE NO ACTION;"
+        ]
+    );
 }
 
 #[test]
@@ -4714,6 +5133,7 @@ fn sqlserver_unchanged_identity_extra_does_not_mark_existing_column_changed() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -4764,6 +5184,7 @@ fn dameng_unchanged_identity_extra_does_not_mark_existing_column_changed() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -5027,6 +5448,7 @@ fn dameng_rejects_adding_second_identity_column() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -5089,6 +5511,7 @@ fn sqlserver_existing_column_identity_change_warns_without_unchanged_foreign_key
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -5130,6 +5553,7 @@ fn builds_duckdb_create_table_statements() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -5260,6 +5684,7 @@ fn builds_clickhouse_nullable_comment_and_reorder_statements() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -5316,6 +5741,7 @@ fn builds_h2_schema_qualified_existing_column_statements() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -6262,8 +6688,7 @@ fn mysql_clears_auto_increment_when_the_only_covering_index_is_rebuilt_by_the_sa
         result.statements,
         vec![
             "ALTER TABLE `users` DROP PRIMARY KEY, MODIFY COLUMN `id` bigint NOT NULL, ADD PRIMARY KEY (`external_id`);",
-            "DROP INDEX `idx_users_id` ON `users`;",
-            "CREATE UNIQUE INDEX `idx_users_id` ON `users` (`id`);",
+            "ALTER TABLE `users` DROP INDEX `idx_users_id`, ADD UNIQUE INDEX `idx_users_id` (`id`);",
         ]
     );
 }
@@ -6502,6 +6927,7 @@ fn mysql_create_table_with_auto_increment() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -6539,6 +6965,7 @@ fn mysql_create_table_keeps_column_charset_collation_and_comment() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -6580,6 +7007,7 @@ fn mysql_compatible_databases_do_not_emit_mysql_column_charset_clauses() {
             transwarp_create: None,
             partitioned: false,
             foreign_table: false,
+            table_type: None,
             is_gaussdb_m_mode: false,
             table_collation: None,
             primary_key_name: None,
@@ -6618,6 +7046,7 @@ fn mysql_create_table_with_on_update_current_timestamp() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -6694,6 +7123,150 @@ fn mysql_single_column_alter_carries_temporal_precision_into_current_timestamp_c
     assert_eq!(
         result.statements,
         vec!["ALTER TABLE `users` MODIFY COLUMN `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3);"]
+    );
+}
+
+#[test]
+fn mysql_preset_default_with_on_update_clause_is_not_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_default_supports_a_literal_default() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "'2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime NOT NULL DEFAULT '2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_with_unknown_expression_stays_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE foo".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime NOT NULL DEFAULT 'CURRENT_TIMESTAMP ON UPDATE foo'\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_default_carries_temporal_precision() {
+    let mut col = column("update_time");
+    col.data_type = "datetime(3)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_default_does_not_duplicate_the_extra_clause() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements[0].matches("ON UPDATE").count(), 1, "{}", result.statements[0]);
+}
+
+#[test]
+fn mysql_add_column_preset_default_with_on_update_clause_is_not_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result =
+        build_table_structure_change_sql(structure_change_options(DatabaseType::Mysql, None, "sys_student", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `sys_student` ADD COLUMN `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;"]
+    );
+}
+
+#[test]
+fn mysql_modify_column_preset_default_with_on_update_clause_is_not_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+    col.original = Some(ColumnInfo {
+        name: "update_time".to_string(),
+        data_type: "datetime".to_string(),
+        is_nullable: false,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        driver_profile: None,
+        schema: None,
+        table_name: "sys_student".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `sys_student` MODIFY COLUMN `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;"]
+    );
+}
+
+#[test]
+fn non_mysql_targets_keep_quoting_an_on_update_default_text() {
+    let mut col = column("update_time");
+    col.data_type = "timestamp".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Postgres, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert!(
+        result.statements[0].contains("DEFAULT 'CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'"),
+        "{}",
+        result.statements[0]
     );
 }
 
@@ -6788,6 +7361,7 @@ fn postgres_create_table_with_identity() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7026,6 +7600,7 @@ fn dameng_create_table_with_identity() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7062,6 +7637,7 @@ fn dameng_create_table_preserves_character_length_units() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7106,6 +7682,7 @@ fn dameng_alter_column_preserves_character_length_unit() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7116,6 +7693,54 @@ fn dameng_alter_column_preserves_character_length_unit() {
 
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements, vec!["ALTER TABLE \"SYSDBA\".\"USERS\" MODIFY (\"NAME\" VARCHAR2(64 BYTE));"]);
+}
+
+#[test]
+fn dameng_rename_column_uses_alter_column_rename_to() {
+    let mut renamed = column("NAME");
+    renamed.name = "NEW_NAME".to_string();
+    renamed.data_type = "VARCHAR2(64)".to_string();
+    renamed.original = Some(ColumnInfo {
+        name: "NAME".to_string(),
+        data_type: "VARCHAR2(64)".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Dameng),
+        driver_profile: None,
+        schema: Some("SYSDBA".to_string()),
+        table_name: "USERS".to_string(),
+        columns: vec![renamed],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+        mysql_engine: None,
+        mysql_auto_increment_value: None,
+        transwarp_create: None,
+        partitioned: false,
+        foreign_table: false,
+        table_type: None,
+        is_gaussdb_m_mode: false,
+        table_collation: None,
+        primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE \"SYSDBA\".\"USERS\" ALTER COLUMN \"NAME\" RENAME TO \"NEW_NAME\";"]
+    );
 }
 
 #[test]
@@ -7151,6 +7776,7 @@ fn dameng_rejects_multiple_identity_columns() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7189,6 +7815,7 @@ fn dameng_rejects_zero_identity_increment() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7228,6 +7855,7 @@ fn sqlserver_create_table_with_identity() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7262,6 +7890,7 @@ fn mysql_quotes_datetime_literal_default() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7296,6 +7925,7 @@ fn mysql_does_not_quote_current_timestamp() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7331,6 +7961,7 @@ fn mysql_does_not_quote_temporal_function_with_parens() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7365,6 +7996,7 @@ fn mysql_date_literal_default_is_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7399,6 +8031,7 @@ fn mysql_time_literal_default_is_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7433,6 +8066,7 @@ fn non_temporal_types_are_not_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7571,6 +8205,7 @@ fn builds_mysql_foreign_key_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7610,6 +8245,7 @@ fn builds_mysql_composite_foreign_key() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7652,6 +8288,7 @@ fn builds_oracle_foreign_key_with_supported_actions() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7698,6 +8335,7 @@ fn builds_oracle_foreign_key_replacement() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7744,6 +8382,7 @@ fn builds_mysql_trigger_changes() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7780,6 +8419,7 @@ fn builds_sqlserver_trigger_with_multiple_events() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7833,6 +8473,7 @@ fn rebuilds_changed_sqlserver_trigger_from_complete_metadata_source() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7880,6 +8521,7 @@ fn sqlserver_trigger_edit_restores_disabled_state() {
         mysql_engine: None,
         mysql_auto_increment_value: None,
         transwarp_create: None,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7933,6 +8575,7 @@ fn unchanged_postgres_trigger_does_not_block_column_rename() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -7973,6 +8616,7 @@ fn changed_postgres_trigger_remains_unsupported() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8007,6 +8651,7 @@ fn trigger_change_sql(
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8244,6 +8889,7 @@ fn allows_editing_existing_oracle_trigger() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8279,6 +8925,7 @@ fn builds_oracle_statement_trigger_without_row_clause() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8325,6 +8972,7 @@ fn drops_existing_oracle_trigger_without_reconstructing_it() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8355,6 +9003,7 @@ fn rejects_unsupported_oracle_compound_trigger_shape() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8389,6 +9038,7 @@ fn mysql_varchar_default_is_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8424,6 +9074,7 @@ fn mysql_char_default_is_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8460,6 +9111,7 @@ fn mysql_text_default_is_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8494,6 +9146,7 @@ fn mysql_enum_default_is_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8528,6 +9181,7 @@ fn mysql_int_default_is_not_quoted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8672,6 +9326,7 @@ fn mysql_character_column_add_with_charset_collation() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8796,6 +9451,7 @@ fn mysql_numeric_column_omits_charset_collation_in_column_definition() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8848,6 +9504,7 @@ fn mysql_numeric_column_ignores_charset_collation_in_change_detection() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8895,6 +9552,7 @@ fn mysql_character_column_detects_charset_collation_change() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -8947,6 +9605,7 @@ fn mysql_character_column_preserves_charset_collation_on_other_change() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -9032,6 +9691,7 @@ fn mysql_inherited_column_charset_is_omitted_from_generated_ddl() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
@@ -9085,6 +9745,7 @@ fn mysql_explicit_column_charset_survives_the_table_default_comparison() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
@@ -9139,6 +9800,7 @@ fn mysql_inherited_column_charset_does_not_register_as_a_change() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
@@ -9186,6 +9848,7 @@ fn mysql_collation_switched_away_from_the_table_default_is_emitted() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
@@ -9238,6 +9901,7 @@ fn mysql_column_charset_switched_to_the_table_default_drops_the_clause() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
@@ -9287,6 +9951,7 @@ fn mysql_column_charset_is_kept_when_the_table_default_is_unknown() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -9331,6 +9996,7 @@ fn mysql_create_table_omits_inherited_column_charset() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
@@ -10044,6 +10710,7 @@ fn mysql_create_table_with_generated_column() {
         mysql_auto_increment_value: None,
         transwarp_create: None,
         partitioned: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10094,6 +10761,7 @@ fn oscar_create_table_with_primary_key_and_comments() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10301,6 +10969,7 @@ fn oscar_drop_index_with_schema_qualifier() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10331,6 +11000,7 @@ fn oscar_table_comment_uses_comment_on_table() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10423,6 +11093,7 @@ fn postgres_partitioned_parent_concurrent_request_rejected() {
         transwarp_create: None,
         partitioned: true,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10463,6 +11134,7 @@ fn postgres_partitioned_parent_plain_index_unchanged() {
         transwarp_create: None,
         partitioned: true,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10515,6 +11187,7 @@ fn postgres_create_table_partitioned_concurrent_request_rejected() {
         transwarp_create: None,
         partitioned: true,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10651,6 +11324,7 @@ fn postgres_create_table_concurrent_index() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -10741,6 +11415,19 @@ fn pg_family_concurrent_flag_is_ignored() {
 }
 
 #[test]
+fn firebird_column_default_precedes_not_null() {
+    let mut col = column("raiz");
+    col.data_type = "varchar(20)".to_string();
+    col.is_nullable = false;
+    col.default_value = "'ECF'".to_string();
+
+    assert_eq!(
+        super::column_format::column_definition(StructureDialect::Postgres, &col, Some(DatabaseType::Firebird)),
+        "\"raiz\" varchar(20) DEFAULT 'ECF' NOT NULL"
+    );
+}
+
+#[test]
 fn non_postgres_concurrent_flag_is_ignored() {
     for database_type in [DatabaseType::Mysql, DatabaseType::Sqlite, DatabaseType::SqlServer] {
         let mut idx = index("idx_users_email", &["email"]);
@@ -10776,6 +11463,7 @@ fn gaussdb_m_options(columns: Vec<EditableStructureColumn>) -> TableStructureSql
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: true,
         table_collation: None,
         primary_key_name: None,
@@ -11023,6 +11711,7 @@ fn gaussdb_m_rebuild_index_unchanged_type_does_not_rebuild() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: true,
         table_collation: None,
         primary_key_name: None,
@@ -11079,6 +11768,7 @@ fn mysql_create_table_nullable_timestamp_without_default_gets_explicit_null() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -11117,6 +11807,7 @@ fn mysql_create_table_nullable_timestamp_with_default_still_gets_explicit_null()
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -11153,6 +11844,7 @@ fn mysql_create_table_nullable_datetime_does_not_gain_null_keyword() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -11189,6 +11881,7 @@ fn mysql_add_column_nullable_timestamp_without_default_gets_explicit_null() {
         transwarp_create: None,
         partitioned: false,
         foreign_table: false,
+        table_type: None,
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
@@ -11899,6 +12592,8 @@ fn starrocks_places_primary_keys_before_value_columns() {
 
 fn starrocks_layout_options(granularity: StarRocksTimeGranularity) -> CreateTableDialectOptions {
     CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: None,
             time_partition: Some(StarRocksTimePartition {
@@ -11998,6 +12693,8 @@ fn starrocks_validates_hash_keys_and_bucket_count() {
 #[test]
 fn starrocks_random_distribution_requires_duplicate_table_and_supported_version() {
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions { distribution: StarRocksDistribution::Random, ..Default::default() }),
     };
     let mut options = starrocks_partitioned_table_options();
@@ -12033,6 +12730,8 @@ fn starrocks_builds_multicolumn_value_and_list_partitions() {
     let options =
         structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city"), column("channel")]);
     let values = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Values { column_ids: vec!["city".into(), "channel".into()] }),
             ..Default::default()
@@ -12042,6 +12741,8 @@ fn starrocks_builds_multicolumn_value_and_list_partitions() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert!(result.statements[0].contains("PARTITION BY (`city`, `channel`) DISTRIBUTED BY RANDOM"));
     let list = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::List {
                 column_ids: vec!["city".into(), "channel".into()],
@@ -12064,6 +12765,8 @@ fn starrocks_builds_range_bounds_and_validates_arity() {
     // Intentionally interleaved primary and value columns: SQL reorders without changing membership.
     options.columns.insert(1, column("payload"));
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Range {
                 column_ids: vec!["ts".into(), "id".into()],
@@ -12115,6 +12818,8 @@ fn starrocks_time_slice_and_mixed_partitions_are_version_and_type_checked() {
 fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
     let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city")]);
     let list = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::List {
                 column_ids: vec!["city".into()],
@@ -12128,6 +12833,8 @@ fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
     };
     assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), list).statements.is_empty());
     let range = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Range {
                 column_ids: vec!["city".into()],
@@ -12149,6 +12856,8 @@ fn starrocks_sort_columns_preserve_priority_and_allow_non_primary_columns() {
     options.columns[1].is_primary_key = false;
     options.columns[1].name = "event`time".into();
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             sort_column_ids: vec!["ts".into(), "id".into()],
             ..Default::default()
@@ -12180,6 +12889,8 @@ fn starrocks_sort_validates_version_identity_and_primary_table_types() {
             _ => {}
         }
         let settings = CreateTableDialectOptions {
+            postgres_foreign_table: None,
+            mysql_table_charset: None,
             starrocks: Some(StarRocksCreateOptions { sort_column_ids: ids, ..Default::default() }),
         };
         let result = build_create_table_sql_with_dialect_options(options, version, settings);
@@ -12196,6 +12907,8 @@ fn starrocks_duplicate_sort_requires_33_and_allows_decimal() {
     }
     options.columns[1].data_type = "decimal(10,2)".into();
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions { sort_column_ids: vec!["ts".into()], ..Default::default() }),
     };
     let old = build_create_table_sql_with_dialect_options(options.clone(), Some("3.2.0"), settings.clone());
