@@ -1,9 +1,48 @@
-import type { InstalledPlugin, PluginMarketplaceArtifact, PluginMarketplacePlugin, PluginRepository, PluginRepositoryCatalogResult } from "@/types/database";
+import type { InstalledPlugin, PluginMarketplaceArtifact, PluginMarketplacePlugin, PluginMarketplaceVersion, PluginRepository, PluginRepositoryCatalogResult, PluginVersionCompatibility } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
 
-export type MarketplacePluginStatus = "install" | "installed" | "update" | "unsupported";
+// "requires-newer-dbx": the catalog (or a rejected install) says this version needs a newer DBX or
+// host API than the running build. It is deliberately NOT "update": the update badge, the batch
+// selector, and the automatic update pass all key off status === "update", and offering an install
+// that the package manifest is guaranteed to reject is what this status exists to prevent.
+// "incompatible": same, except upgrading DBX cannot satisfy the requirement (upper bound such as
+// `<0.7.0`, an exact older version, or a host API range this build does not advertise), so the UI
+// must not offer an "Upgrade DBX" action.
+export type MarketplacePluginStatus = "install" | "installed" | "update" | "unsupported" | "requires-newer-dbx" | "incompatible";
 
-export type MarketplacePluginSortMode = "name" | "recently-updated" | "recently-listed" | "updates-first";
+/** Statuses that mean "engine-blocked": never an update, never auto-installed. */
+export function isEngineBlockedStatus(status: MarketplacePluginStatus): status is "requires-newer-dbx" | "incompatible" {
+  return status === "requires-newer-dbx" || status === "incompatible";
+}
+
+export type MarketplacePluginSortMode = "name" | "installs" | "recently-updated" | "recently-listed" | "updates-first";
+
+const PLUGIN_STATS_URL = "https://dbxio.com/api/plugins/stats";
+const PLUGIN_STATS_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+export type PluginInstallCounts = Record<string, number>;
+
+// Public install counters from the marketplace stats worker (install beacons,
+// not raw artifact downloads). Failure is decorative: the store still renders.
+export async function fetchPluginInstallCounts(init?: RequestInit): Promise<PluginInstallCounts | null> {
+  try {
+    const response = await fetch(PLUGIN_STATS_URL, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(8000),
+      ...init,
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as { installs?: unknown };
+    if (typeof payload !== "object" || payload === null || typeof payload.installs !== "object" || payload.installs === null) return null;
+    const installs: PluginInstallCounts = {};
+    for (const [id, value] of Object.entries(payload.installs as Record<string, unknown>)) {
+      if (PLUGIN_STATS_ID_PATTERN.test(id) && typeof value === "number" && Number.isFinite(value) && value > 0) installs[id] = value;
+    }
+    return installs;
+  } catch {
+    return null;
+  }
+}
 
 export const UNIVERSAL_PLUGIN_TARGET = "universal";
 
@@ -22,6 +61,8 @@ export interface MarketplacePluginListing {
   // releasedAt of the catalog's latestVersion entry, when provided; shown on the card
   // next to the version badge so time-based sort modes have a visible key.
   latestVersionReleasedAt?: string;
+  /** Engine requirement that makes latestVersion uninstallable on this build, when known. */
+  requiredEngine?: string;
 }
 
 /**
@@ -36,6 +77,99 @@ export function marketplaceHomepageUrl(source?: string, homepage?: string): stri
   return homepage?.trim() || undefined;
 }
 
+/**
+ * Resolves the external release URL for a specific plugin version.
+ *
+ * Plugin catalogs often provide repository URLs pointing to a specific branch,
+ * tag, or subfolder (e.g. `https://github.com/owner/repo/tree/v0.3.3` or
+ * `https://github.com/owner/repo/tree/main/packages/plugin`), or git clone URLs
+ * (`.git`). This extracts the base repository root and appends the appropriate
+ * release path for the given version tag.
+ */
+export function resolveMarketplaceReleaseUrl(source?: string | null, version?: string | PluginMarketplaceVersion | null): string {
+  const trimmedSource = source?.trim();
+  const rawVersion = typeof version === "string" ? version.trim() : (version?.version?.trim() ?? "");
+  if (!trimmedSource || !rawVersion) return "";
+
+  const tag = rawVersion.startsWith("v") || rawVersion.startsWith("V") ? rawVersion : `v${rawVersion}`;
+  const repo = extractRepositoryBaseUrl(trimmedSource);
+  if (!repo) return "";
+
+  if (repo.host === "cnb.cool" || repo.host.endsWith(".cnb.cool")) {
+    return `${repo.baseUrl}/-/releases/tag/${encodeURIComponent(tag)}`;
+  }
+  if (repo.host === "gitlab.com" || repo.host.endsWith(".gitlab.com")) {
+    return `${repo.baseUrl}/-/releases/${encodeURIComponent(tag)}`;
+  }
+  return `${repo.baseUrl}/releases/tag/${encodeURIComponent(tag)}`;
+}
+
+export function extractRepositoryBaseUrl(source: string): { baseUrl: string; host: string } | null {
+  const trimmed = source.trim();
+  if (!trimmed) return null;
+
+  // Handle SSH URLs: git@github.com:owner/repo.git or ssh://git@github.com/owner/repo.git
+  const sshMatch = /^(?:ssh:\/\/)?git@([^/:]+)[:/](.+)$/i.exec(trimmed);
+  let normalized = trimmed;
+  if (sshMatch) {
+    const host = sshMatch[1];
+    const path = sshMatch[2].replace(/\.git$/i, "").replace(/^\/+/, "");
+    normalized = `https://${host}/${path}`;
+  } else if (!/^https?:\/\//i.test(normalized)) {
+    normalized = `https://${normalized}`;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    const cleaned = trimmed
+      .replace(/\/(?:-?\/)?(?:tree|blob|releases|src)(?:\/.*)?$/i, "")
+      .replace(/\.git$/i, "")
+      .replace(/\/+$/, "");
+    return cleaned ? { baseUrl: cleaned, host: "" } : null;
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const origin = parsed.origin;
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments.length === 0) return null;
+
+  // On GitHub and Gitee, repositories are strictly <owner>/<repo>.
+  // Any trailing segment (e.g. /tree/<ref>, /blob/<ref>, /releases) is not part of the repository.
+  if (host === "github.com" || host.endsWith(".github.com") || host === "gitee.com" || host.endsWith(".gitee.com")) {
+    if (segments.length >= 2) {
+      const owner = segments[0];
+      const repoName = segments[1].replace(/\.git$/i, "");
+      return { baseUrl: `${origin}/${owner}/${repoName}`, host };
+    }
+    return { baseUrl: `${origin}/${segments[0].replace(/\.git$/i, "")}`, host };
+  }
+
+  // On GitLab, CNB, etc., UI routes (tree, blob, releases, etc.) follow a "/-/" segment:
+  // e.g. https://gitlab.com/group/subgroup/project/-/tree/main
+  // e.g. https://cnb.cool/org/project/-/releases/tag/v1.0.0
+  const dashIndex = segments.indexOf("-");
+  if (dashIndex > 0) {
+    const repoSegments = segments.slice(0, dashIndex);
+    repoSegments[repoSegments.length - 1] = repoSegments[repoSegments.length - 1].replace(/\.git$/i, "");
+    return { baseUrl: `${origin}/${repoSegments.join("/")}`, host };
+  }
+
+  // Generic git hosts (Gitea, Bitbucket, self-hosted, etc.):
+  // Strip trailing branches/trees/blobs/releases/src if present
+  const cutIndex = segments.findIndex((seg) => ["tree", "blob", "releases", "src"].includes(seg.toLowerCase()));
+  if (cutIndex > 0) {
+    const repoSegments = segments.slice(0, cutIndex);
+    repoSegments[repoSegments.length - 1] = repoSegments[repoSegments.length - 1].replace(/\.git$/i, "");
+    return { baseUrl: `${origin}/${repoSegments.join("/")}`, host };
+  }
+
+  // Default: strip .git from the last segment
+  segments[segments.length - 1] = segments[segments.length - 1].replace(/\.git$/i, "");
+  return { baseUrl: `${origin}/${segments.join("/")}`, host };
+}
+
 export function buildMarketplacePluginListings(results: readonly PluginRepositoryCatalogResult[], installedPlugins: readonly InstalledPlugin[], locale: string): MarketplacePluginListing[] {
   const installedById = new Map(installedPlugins.map((plugin) => [plugin.manifest.id, plugin]));
   return results
@@ -45,7 +179,19 @@ export function buildMarketplacePluginListings(results: readonly PluginRepositor
         const latestVersion = plugin.versions.find((version) => version.version === plugin.latestVersion);
         const artifact = latestVersion ? selectMarketplaceArtifact(latestVersion.artifacts, result.target) : undefined;
         const installed = installedById.get(plugin.id);
-        const status: MarketplacePluginStatus = !artifact ? "unsupported" : !installed ? "install" : compareVersions(plugin.latestVersion, installed.manifest.version || "0.0.0") > 0 ? "update" : "installed";
+        const latestCompatibility = latestVersion?.compatibility;
+        // A rejected install marks the exact version it tried, so a later catalog release is still
+        // offered; the catalog verdict travels with the entry and needs no session state.
+        const failedInstall = pluginRequiresNewerDbxMark(result.repository.id, plugin.id, plugin.latestVersion);
+        const candidateStatus: MarketplacePluginStatus = !artifact ? "unsupported" : !installed ? "install" : compareVersions(plugin.latestVersion, installed.manifest.version || "0.0.0") > 0 ? "update" : "installed";
+        // Only a would-be install/update is downgraded: an already-installed version keeps its
+        // "installed" reading even if the catalog later marks that version incompatible.
+        const blocked = latestCompatibility?.compatible === false || !!failedInstall;
+        // A rejected install or a catalog verdict may be unfixable by upgrading (upper bound, exact
+        // older version): those must not advertise "Upgrade DBX". Missing hints default to true so
+        // a backend that predates the field keeps today's behaviour.
+        const upgradeRequired = latestCompatibility?.compatible === false ? latestCompatibility.upgradeRequired !== false : failedInstall ? failedInstall.upgradeRequired !== false : true;
+        const status: MarketplacePluginStatus = blocked && (candidateStatus === "install" || candidateStatus === "update") ? (upgradeRequired ? "requires-newer-dbx" : "incompatible") : candidateStatus;
         return {
           key: `${result.repository.id}:${plugin.id}`,
           repository: result.repository,
@@ -59,10 +205,135 @@ export function buildMarketplacePluginListings(results: readonly PluginRepositor
           verified: plugin.verified && listingRepositoryCanVerify(result.repository),
           status,
           latestVersionReleasedAt: latestVersion?.releasedAt || undefined,
+          requiredEngine: isEngineBlockedStatus(status) ? describeBlockedEngine(latestCompatibility, failedInstall) : undefined,
         };
       }),
     )
     .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function describeBlockedEngine(compatibility: PluginVersionCompatibility | undefined, failedInstall: PluginIncompatibilityMark | undefined): string | undefined {
+  if (compatibility?.compatible === false) {
+    if (compatibility.blockedBy === "hostApi") return compatibility.hostApi ? `Host API ${compatibility.hostApi}` : undefined;
+    return compatibility.dbx;
+  }
+  if (!failedInstall) return undefined;
+  return failedInstall.hostApi ? undefined : failedInstall.requirement;
+}
+
+export interface PluginIncompatibilityMark {
+  /** Catalog version whose install failed the engine gate. */
+  version: string;
+  /** Requirement the package declared, as the backend reported it. */
+  requirement: string;
+  /** True when `engines.host_api` (not `engines.dbx`) was the failing declaration. */
+  hostApi: boolean;
+  /**
+   * False when a newer DBX provably cannot satisfy the requirement (upper bound such as `<0.7.0`,
+   * an exact older version, or an ambiguous range), in which case the UI must not offer an upgrade.
+   */
+  upgradeRequired: boolean;
+}
+
+// The catalog is the only source that can warn *before* an update starts, and stores may lag. When
+// an install is still rejected by the package manifest, remember it for this session so the update
+// badge and the automatic pass stop re-offering a version the host already refused.
+// Keyed by repository too: the same plugin id+version can be published by two repositories with
+// different packages, so one repository's rejected package must not grey out the other's listing.
+const requiresNewerDbxMarks = new Map<string, PluginIncompatibilityMark>();
+
+const PLUGIN_MARK_KEY_SEPARATOR = "\u0000";
+
+function pluginMarkKey(repositoryId: string, pluginId: string): string {
+  return `${repositoryId}${PLUGIN_MARK_KEY_SEPARATOR}${pluginId}`;
+}
+
+export function markPluginRequiresNewerDbx(repositoryId: string, pluginId: string, version: string, mark: Omit<PluginIncompatibilityMark, "version">): void {
+  requiresNewerDbxMarks.set(pluginMarkKey(repositoryId, pluginId), { ...mark, version });
+}
+
+export function pluginRequiresNewerDbxMark(repositoryId: string, pluginId: string, version: string): PluginIncompatibilityMark | undefined {
+  const mark = requiresNewerDbxMarks.get(pluginMarkKey(repositoryId, pluginId));
+  return mark && mark.version === version ? mark : undefined;
+}
+
+/** Test hook: the marks outlive a single listing rebuild by design. */
+export function resetPluginRequiresNewerDbxMarks(): void {
+  requiresNewerDbxMarks.clear();
+}
+
+export interface ParsedPluginIncompatibility {
+  requirement: string;
+  current: string;
+  hostApi: boolean;
+  /**
+   * False when a newer host provably cannot satisfy the requirement (upper bound, exact older
+   * version, compound/unparsable range); see `requirementSatisfiedByNewerVersion`. Direction for
+   * the error-string path only — the catalog path carries the backend's semver verdict instead.
+   */
+  upgradeRequired: boolean;
+}
+
+// Numeric core shared by requirement comparators and the running host version: `v` prefix,
+// major with optional minor/patch, optional `-pre` / `+build` suffix.
+const NUMERIC_VERSION_SOURCE = String.raw`v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?`;
+const NUMERIC_VERSION_PATTERN = new RegExp(`^${NUMERIC_VERSION_SOURCE}$`);
+// One comparator only: `*` / `1.*` ranges have no numeric lower bound and must not match.
+const REQUIREMENT_COMPARATOR_PATTERN = new RegExp(`^(>=|<=|>|<|=|\\^|~)?${NUMERIC_VERSION_SOURCE}$`);
+
+function numericVersion(match: RegExpExecArray, offset: number): [number, number, number] {
+  return [Number(match[offset]), Number(match[offset + 1] ?? 0), Number(match[offset + 2] ?? 0)];
+}
+
+/**
+ * Whether a *newer* host version could satisfy `requirement`, decided from the installer's error
+ * string alone (catalog data absent). Deliberately conservative: only a single, parseable
+ * lower-bound comparator can prove direction. Compound ranges, wildcards and unparsable text
+ * report `false`, so the UI shows the generic "incompatible" state instead of advising an upgrade
+ * that may not help. Mirrors the intent of `requirement_upgradable` in
+ * crates/dbx-plugin-runtime/src/plugins/marketplace.rs, without re-implementing full semver.
+ */
+export function requirementSatisfiedByNewerVersion(requirement: string, current: string): boolean {
+  const parts = requirement
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length !== 1) return false;
+  const requirementMatch = REQUIREMENT_COMPARATOR_PATTERN.exec(parts[0]);
+  const currentMatch = NUMERIC_VERSION_PATTERN.exec(current.trim());
+  if (!requirementMatch || !currentMatch) return false;
+  const operator = requirementMatch[1] ?? "^";
+  // `<` / `<=` are upper bounds: only an *older* host satisfies them.
+  if (operator === "<" || operator === "<=") return false;
+  const bound = numericVersion(requirementMatch, 2);
+  const running = numericVersion(currentMatch, 1);
+  let comparison = 0;
+  for (let index = 0; index < bound.length; index += 1) {
+    if (bound[index] !== running[index]) {
+      comparison = bound[index] - running[index];
+      break;
+    }
+  }
+  // `>X` still holds when the running host already sits exactly on the bound; the inclusive
+  // operators (and bare/caret/tilde semantics) need the host to move forward.
+  return operator === ">" ? comparison >= 0 : comparison > 0;
+}
+
+// Mirrors `validate_engine_requirement` in crates/dbx-plugin-runtime/src/plugins/manifest.rs
+// ("Plugin requires {DBX|DBX Host API} {requirement}, but {version} is installed"). Wrapped in
+// "Plugin '{id}' is incompatible: …" by the installer.
+const PLUGIN_INCOMPATIBILITY_PATTERN = /Plugin requires (DBX Host API|DBX) (.+?), but (.+?) is installed/;
+
+export function parsePluginIncompatibility(message: string): ParsedPluginIncompatibility | null {
+  const match = PLUGIN_INCOMPATIBILITY_PATTERN.exec(message);
+  if (!match) return null;
+  const hostApi = match[1] === "DBX Host API";
+  const requirement = match[2].trim();
+  const current = match[3].trim();
+  // Both `engines.dbx` and `engines.host_api` failures go through the same conservative check: a
+  // host API upper bound (`<1.0.0`) or an exact older version is just as unfixable as a DBX one,
+  // so the direction must be parsed rather than assumed from which field failed.
+  return { hostApi, requirement, current, upgradeRequired: requirementSatisfiedByNewerVersion(requirement, current) };
 }
 
 export function selectMarketplaceArtifact(artifacts: readonly PluginMarketplaceArtifact[], target: string): PluginMarketplaceArtifact | undefined {
@@ -195,11 +466,20 @@ function firstReleaseTime(listing: MarketplacePluginListing): number {
   return times.length ? Math.min(...times) : Number.NEGATIVE_INFINITY;
 }
 
+function listingInstallCount(listing: MarketplacePluginListing, installs: Readonly<Record<string, number>> | undefined): number {
+  const value = installs?.[listing.plugin.id];
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 // Copies before sorting: the builder output is also consumed elsewhere (batch selection,
 // the installed-tab update index) and must keep its name order there.
-export function sortMarketplacePluginListings(listings: readonly MarketplacePluginListing[], mode: MarketplacePluginSortMode): MarketplacePluginListing[] {
+// `installs` is the public stats map keyed by plugin id; missing counts sort last.
+export function sortMarketplacePluginListings(listings: readonly MarketplacePluginListing[], mode: MarketplacePluginSortMode, installs?: Readonly<Record<string, number>>): MarketplacePluginListing[] {
   const byName = (left: MarketplacePluginListing, right: MarketplacePluginListing) => left.name.localeCompare(right.name);
   if (mode === "name") return [...listings].sort(byName);
+  if (mode === "installs") {
+    return [...listings].sort((left, right) => listingInstallCount(right, installs) - listingInstallCount(left, installs) || byName(left, right));
+  }
   const releaseTimeFor = mode === "recently-listed" ? firstReleaseTime : latestVersionReleaseTime;
   if (mode === "updates-first") {
     return [...listings].sort((left, right) => {

@@ -1,9 +1,10 @@
-import { reactive, shallowReactive } from "vue";
+import { markRaw, reactive, shallowReactive } from "vue";
 import { uuid } from "@/lib/common/utils";
 import * as api from "@/lib/backend/api";
 import { openDataCompareSession } from "@/composables/useDialogSources";
 import { useExportTracker } from "@/composables/useExportTracker";
-import { inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeKeyColumns, type DataCompareCellValue, type DataCompareFromTablesPreparation, type DataCompareResult, type DataCompareSyncPlan, type DataCompareSyncPlanTableOptions } from "@/lib/dataGrid/dataCompare";
+import { inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeKeyColumns, resolveEffectiveIgnoredColumns, type DataCompareFromTablesPreparation, type DataCompareResult, type DataCompareSyncPlan, type DataCompareSyncPlanTableOptions } from "@/lib/dataGrid/dataCompare";
+import { createDataCompareSelection, selectedCompareRows, type DataCompareSelection } from "@/lib/dataGrid/dataCompareSelection";
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 
 export type CompareColumn = ColumnInfo;
@@ -23,28 +24,6 @@ export interface DataCompareTableTask {
 export type DataCompareTableStatus = "different" | "same" | "error";
 export type DiffKind = "added" | "removed" | "modified";
 
-export interface SelectableDataCompareRow {
-  key: string;
-  keyValues: Record<string, DataCompareCellValue>;
-  values: Record<string, DataCompareCellValue>;
-  selected: boolean;
-}
-
-export interface SelectableDataCompareModifiedRow {
-  key: string;
-  keyValues: Record<string, DataCompareCellValue>;
-  sourceValues: Record<string, DataCompareCellValue>;
-  targetValues: Record<string, DataCompareCellValue>;
-  changes: { column: string; source: DataCompareCellValue; target: DataCompareCellValue }[];
-  selected: boolean;
-}
-
-export interface SelectableDataCompareResult {
-  added: SelectableDataCompareRow[];
-  removed: SelectableDataCompareRow[];
-  modified: SelectableDataCompareModifiedRow[];
-}
-
 export interface DataCompareTableResult {
   sourceTable: string;
   targetTable: string;
@@ -55,6 +34,8 @@ export interface DataCompareTableResult {
   added: number;
   removed: number;
   modified: number;
+  /** Rows differing only in ignored columns; identical for diff and sync purposes. */
+  ignoredOnlyCount: number;
   sourceRowCount: number;
   targetRowCount: number;
   sourceTruncated: boolean;
@@ -64,7 +45,8 @@ export interface DataCompareTableResult {
   syncEligible: boolean;
   databaseType?: DatabaseType;
   preSyncStatements?: string[];
-  diff: SelectableDataCompareResult;
+  diff: DataCompareResult;
+  selection: Record<DiffKind, DataCompareSelection>;
   expanded: boolean;
   showAll: Record<DiffKind, boolean>;
   error?: string;
@@ -94,6 +76,13 @@ export interface DataCompareSessionConfig {
    * again — it must not silently fall back to the primary key.
    */
   keyColumnsByTable: Record<string, string[]>;
+  /**
+   * Columns ignored in every table of this compare (value differences tolerated,
+   * still read). Absent/empty means nothing is ignored.
+   */
+  globalIgnoredColumns?: string[];
+  /** Additional ignored columns per source table, merged with the global list. */
+  ignoredColumnsByTable?: Record<string, string[]>;
   label: string;
 }
 
@@ -149,7 +138,24 @@ function cloneConfig(config: DataCompareSessionConfig): DataCompareSessionConfig
     targetSchemas: [...config.targetSchemas],
     targetTables: [...config.targetTables],
     keyColumnsByTable: normalizeKeyColumnOverrides(config.keyColumnsByTable),
+    globalIgnoredColumns: config.globalIgnoredColumns ? normalizeKeyColumns(config.globalIgnoredColumns) : [],
+    ignoredColumnsByTable: normalizeIgnoredColumnOverrides(config.ignoredColumnsByTable),
   };
+}
+
+/**
+ * Normalizes a per-table ignored-column map so a cloned session never shares
+ * arrays with the caller. Same shape as the match-column overrides; an absent
+ * entry and an empty array both mean "nothing extra ignored for this table".
+ */
+export function normalizeIgnoredColumnOverrides(overrides: Record<string, string[] | undefined> | null | undefined): Record<string, string[]> {
+  const normalized: Record<string, string[]> = {};
+  for (const [table, columns] of Object.entries(overrides ?? {})) {
+    if (!table) continue;
+    const normalizedColumns = normalizeKeyColumns(columns ?? []);
+    if (normalizedColumns.length > 0) normalized[table] = normalizedColumns;
+  }
+  return normalized;
 }
 
 /**
@@ -180,12 +186,17 @@ function compareErrorMessage(dependencies: DataCompareSessionDependencies, kind:
   return dependencies.formatError?.(kind, columns) ?? fallbackCompareErrorMessage(kind, columns);
 }
 
-function toSelectableDiff(diff: DataCompareResult, selected: boolean): SelectableDataCompareResult {
-  return {
-    added: diff.added.map((row) => ({ ...row, selected })),
-    removed: diff.removed.map((row) => ({ ...row, selected })),
-    modified: diff.modified.map((row) => ({ ...row, selected })),
-  };
+function tableResult(result: Omit<DataCompareTableResult, "selection">): DataCompareTableResult {
+  return shallowReactive({
+    ...result,
+    diff: markRaw(result.diff),
+    showAll: reactive(result.showAll),
+    selection: {
+      added: createDataCompareSelection(result.syncEligible),
+      removed: createDataCompareSelection(result.syncEligible),
+      modified: createDataCompareSelection(result.syncEligible),
+    },
+  });
 }
 
 export function buildDataCompareSyncPlanTables(results: DataCompareTableResult[], targetSchema: string): DataCompareSyncPlanTableOptions[] {
@@ -198,9 +209,9 @@ export function buildDataCompareSyncPlanTables(results: DataCompareTableResult[]
       keyColumns: table.keyColumns,
       columnInfo: table.columnInfo,
       diff: {
-        added: table.diff.added.filter((row) => row.selected).map(({ selected: _selected, ...row }) => row),
-        removed: table.diff.removed.filter((row) => row.selected).map(({ selected: _selected, ...row }) => row),
-        modified: table.diff.modified.filter((row) => row.selected).map(({ selected: _selected, ...row }) => row),
+        added: selectedCompareRows(table.diff.added, table.selection.added),
+        removed: selectedCompareRows(table.diff.removed, table.selection.removed),
+        modified: selectedCompareRows(table.diff.modified, table.selection.modified),
       },
       databaseType: table.databaseType,
       preSyncStatements: table.preSyncStatements ?? [],
@@ -254,7 +265,7 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
   const removed = preparation.result.removed.length;
   const modified = preparation.result.modified.length;
   const status: DataCompareTableStatus = added || removed || modified ? "different" : "same";
-  return {
+  return tableResult({
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
@@ -264,6 +275,7 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
     added,
     removed,
     modified,
+    ignoredOnlyCount: preparation.result.ignoredOnlyCount ?? 0,
     sourceRowCount: preparation.sourceRowCount,
     targetRowCount: preparation.targetRowCount,
     sourceTruncated: preparation.sourceTruncated,
@@ -272,14 +284,14 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
     syncEligible: preparation.syncEligible,
     databaseType,
     preSyncStatements: preparation.preSyncStatements,
-    diff: toSelectableDiff(preparation.result, preparation.syncEligible),
+    diff: preparation.result,
     expanded: status === "different",
     showAll: { added: false, removed: false, modified: false },
-  };
+  });
 }
 
 function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataCompareFromTablesPreparation, sourceColumns: CompareColumn[], keyColumns: string[], databaseType: DatabaseType | undefined): DataCompareTableResult {
-  return {
+  return tableResult({
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
@@ -289,6 +301,7 @@ function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataC
     added: preparation.result.added.length,
     removed: 0,
     modified: 0,
+    ignoredOnlyCount: 0,
     sourceRowCount: preparation.sourceRowCount,
     targetRowCount: 0,
     sourceTruncated: preparation.sourceTruncated,
@@ -297,14 +310,14 @@ function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataC
     syncEligible: preparation.syncEligible,
     databaseType,
     preSyncStatements: preparation.preSyncStatements,
-    diff: toSelectableDiff(preparation.result, preparation.syncEligible),
+    diff: preparation.result,
     expanded: preparation.result.added.length > 0,
     showAll: { added: false, removed: false, modified: false },
-  };
+  });
 }
 
 function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], databaseType: DatabaseType | undefined, error: unknown): DataCompareTableResult {
-  return {
+  return tableResult({
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
@@ -314,6 +327,7 @@ function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], data
     added: 0,
     removed: 0,
     modified: 0,
+    ignoredOnlyCount: 0,
     sourceRowCount: 0,
     targetRowCount: 0,
     sourceTruncated: false,
@@ -326,7 +340,7 @@ function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], data
     expanded: false,
     showAll: { added: false, removed: false, modified: false },
     error: sessionError(error),
-  };
+  });
 }
 
 /**
@@ -387,6 +401,14 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             targetTable: task.targetTable,
             columns,
             keyColumns: canonicalKeyColumns,
+            // Ignored columns stay in `columns` (still read, kept by sync INSERTs);
+            // the backend only drops them from the modified detection.
+            ignoredColumns: resolveEffectiveIgnoredColumns({
+              globalIgnoredColumns: input.globalIgnoredColumns ?? [],
+              tableIgnoredColumns: input.ignoredColumnsByTable?.[task.sourceTable],
+              columns,
+              keyColumns: canonicalKeyColumns,
+            }),
             sourceColumns: matched.sourceColumns,
           });
           keyColumns = canonicalKeyColumns;

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useComponentUpdates } from "@/composables/useComponentUpdates";
 import { useMcpUpdateBadge } from "@/composables/useMcpUpdateBadge";
+import { pluginRequiresNewerDbxMark, resetPluginRequiresNewerDbxMarks } from "@/lib/plugins/pluginMarketplace";
 import { runPendingComponentUpdatePlan, type PendingComponentUpdates } from "@/lib/updates/componentUpdateOrchestration";
 import { showToolbarUpdateAction } from "@/lib/updates/updateBadges";
 
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   fetchPluginMarketplaceCatalogs: vi.fn(),
   checkAgentUpdateBlockers: vi.fn(),
   upgradeAllAgents: vi.fn(),
+  listenAgentInstallProgress: vi.fn(),
   installJdbcPlugin: vi.fn(),
   installMcpServer: vi.fn(),
   installMarketplacePlugin: vi.fn(),
@@ -74,6 +76,7 @@ beforeEach(() => {
   mocks.buildMarketplacePluginListings.mockReturnValue([pluginUpdate]);
   mocks.checkAgentUpdateBlockers.mockResolvedValue([]);
   mocks.upgradeAllAgents.mockResolvedValue({ upgraded: 1, failed: [], cancelled: 0 });
+  mocks.listenAgentInstallProgress.mockResolvedValue(vi.fn());
   mocks.installJdbcPlugin.mockResolvedValue({ installed: true, update_available: false });
   mocks.installMcpServer.mockResolvedValue("updated");
   mocks.installMarketplacePlugin.mockResolvedValue({});
@@ -434,5 +437,75 @@ describe("useComponentUpdates", () => {
     const result = await updates.installCategory("plugins");
 
     expect(result.blockedPlugins).toEqual([{ pluginName: "Example plugin", reason: "operations" }]);
+  });
+
+  it("remembers an engine rejection so the automatic pass stops re-offering that version", async () => {
+    resetPluginRequiresNewerDbxMarks();
+    mocks.installMarketplacePlugin.mockRejectedValue(new Error("Plugin 'example' is incompatible: Plugin requires DBX >=0.7.0, but 0.6.60 is installed"));
+    const updates = useComponentUpdates({ isDesktop: true });
+
+    const result = await updates.installCategory("plugins");
+
+    expect(result.plugins).toBe(0);
+    expect(pluginRequiresNewerDbxMark("official", "example", "1.1.0")).toEqual({ version: "1.1.0", requirement: ">=0.7.0", hostApi: false, upgradeRequired: true });
+    // A catalog release past the rejected version is not blocked by the mark.
+    expect(pluginRequiresNewerDbxMark("official", "example", "1.2.0")).toBeUndefined();
+    // Neither is the same id+version offered by another repository.
+    expect(pluginRequiresNewerDbxMark("team-repo", "example", "1.1.0")).toBeUndefined();
+    resetPluginRequiresNewerDbxMarks();
+  });
+
+  it("tracks driver install progress and batch counts during driver update", async () => {
+    let capturedHandler: ((payload: unknown) => void) | null = null;
+    mocks.listenAgentInstallProgress.mockImplementation(async (handler: (payload: unknown) => void) => {
+      capturedHandler = handler;
+      return () => {};
+    });
+
+    const upgradeDeferred = deferred<{ upgraded: number; failed: any[]; cancelled: number }>();
+    mocks.upgradeAllAgents.mockReturnValue(upgradeDeferred.promise);
+
+    const updates = useComponentUpdates({ isDesktop: true });
+    const updatePromise = updates.installCategory("drivers");
+
+    await vi.waitFor(() => expect(mocks.listenAgentInstallProgress).toHaveBeenCalledOnce());
+    expect(capturedHandler).not.toBeNull();
+
+    // Initial batch total is set from updatable drivers count
+    expect(updates.driverBatchTotal.value).toBe(1);
+    expect(updates.driverBatchCompleted.value).toBe(0);
+
+    // Simulate progress event for downloading mysql driver
+    capturedHandler!({
+      step: "driver",
+      db_type: "mysql",
+      downloaded: 40,
+      total: 100,
+      total_drivers: 1,
+    });
+
+    expect(updates.driverProgressMap.value.mysql).toMatchObject({
+      step: "driver",
+      db_type: "mysql",
+      downloaded: 40,
+      total: 100,
+    });
+
+    // Simulate completion of mysql driver
+    capturedHandler!({
+      step: "done",
+      db_type: "mysql",
+    });
+
+    expect(updates.driverBatchCompleted.value).toBe(1);
+    expect(updates.driverProgressMap.value.mysql).toBeNull();
+
+    upgradeDeferred.resolve({ upgraded: 1, failed: [], cancelled: 0 });
+    await updatePromise;
+
+    // After finish, progress map and counters reset
+    expect(updates.driverProgressMap.value).toEqual({});
+    expect(updates.driverBatchCompleted.value).toBe(0);
+    expect(updates.driverBatchTotal.value).toBe(0);
   });
 });

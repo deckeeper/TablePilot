@@ -64,6 +64,7 @@ const emit = defineEmits<{
 
 defineSlots<{
   "trigger-label"?(props: { value: string; label: string; loading: boolean }): any;
+  "option-action"?(props: { option: string; label: string }): any;
   "option-label"?(props: { option: string; label: string }): any;
   "custom-option-label"?(props: { value: string }): any;
 }>();
@@ -82,6 +83,7 @@ const { t } = useI18n();
 
 let shouldFocusAdjacentOnClose = false;
 let tabDirection: 1 | -1 = 1;
+let focusRestoreElement: HTMLElement | null = null;
 
 function getTriggerElement(): HTMLElement | undefined {
   const target = triggerButton.value;
@@ -200,11 +202,19 @@ watch(open, async (value) => {
     searchText.value = "";
     highlightIndex.value = -1;
     activeHelpOption.value = undefined;
+    const restoreTarget = focusRestoreElement;
+    focusRestoreElement = null;
     if (shouldFocusAdjacentOnClose) {
       const dir = tabDirection;
       shouldFocusAdjacentOnClose = false;
       await nextTick();
       focusAdjacentElement(dir);
+    } else if (restoreTarget) {
+      // Reka's modal popover refocuses the trigger synchronously on close, so
+      // the restore must land on the next tick to win for shortcut-opened
+      // dropdowns.
+      await nextTick();
+      if (restoreTarget.isConnected) restoreTarget.focus();
     }
     return;
   }
@@ -343,6 +353,15 @@ function handleKeydown(event: KeyboardEvent) {
     open.value = false;
   }
 }
+
+defineExpose({
+  openDropdown: () => {
+    if (props.disabled) return false;
+    focusRestoreElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    open.value = true;
+    return true;
+  },
+});
 </script>
 
 <template>
@@ -386,33 +405,34 @@ function handleKeydown(event: KeyboardEvent) {
               {{ loadingText }}
             </div>
             <template v-else-if="filteredOptions.length">
-              <button
-                v-for="(option, index) in filteredOptions"
-                :key="option"
-                type="button"
-                tabindex="-1"
-                :title="optionTooltip(option) ? undefined : optionTitle(option)"
-                :class="
-                  cn(
-                    'group flex h-8 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none',
-                    props.itemClass,
-                    index === highlightIndex && 'bg-accent text-accent-foreground',
-                  )
-                "
-                @pointerenter="activateHelpForOption(option)"
-                @click="selectOrClearOption(option)"
-              >
-                <span class="relative h-3.5 w-3.5 shrink-0">
-                  <Check :class="cn('absolute inset-0 h-3.5 w-3.5', option !== modelValue ? 'opacity-0' : clearSelectedOption ? 'opacity-100 group-hover:opacity-0 group-focus-visible:opacity-0' : 'opacity-100')" />
-                  <X v-if="clearSelectedOption && option === modelValue" class="absolute inset-0 h-3.5 w-3.5 opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100" />
-                </span>
-                <!-- Keep custom labels inside the flex row so long content cannot overlap adjacent UI. -->
-                <div class="dbx-searchable-select-option-label min-w-0 flex-1 overflow-hidden">
-                  <slot name="option-label" :option="option" :label="displayName?.(option)">
-                    <span class="block truncate">{{ displayName?.(option) }}</span>
-                  </slot>
-                </div>
-              </button>
+              <div v-for="(option, index) in filteredOptions" :key="option" class="flex min-w-0 items-center">
+                <button
+                  type="button"
+                  tabindex="-1"
+                  :title="optionTooltip(option) ? undefined : optionTitle(option)"
+                  :class="
+                    cn(
+                      'group flex h-8 w-full flex-1 min-w-0 items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none',
+                      props.itemClass,
+                      index === highlightIndex && 'bg-accent text-accent-foreground',
+                    )
+                  "
+                  @pointerenter="activateHelpForOption(option)"
+                  @click="selectOrClearOption(option)"
+                >
+                  <span class="relative h-3.5 w-3.5 shrink-0">
+                    <Check :class="cn('absolute inset-0 h-3.5 w-3.5', option !== modelValue ? 'opacity-0' : clearSelectedOption ? 'opacity-100 group-hover:opacity-0 group-focus-visible:opacity-0' : 'opacity-100')" />
+                    <X v-if="clearSelectedOption && option === modelValue" class="absolute inset-0 h-3.5 w-3.5 opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100" />
+                  </span>
+                  <!-- Keep custom labels inside the flex row so long content cannot overlap adjacent UI. -->
+                  <div class="dbx-searchable-select-option-label min-w-0 flex-1 overflow-hidden">
+                    <slot name="option-label" :option="option" :label="displayName?.(option)">
+                      <span class="block truncate">{{ displayName?.(option) }}</span>
+                    </slot>
+                  </div>
+                </button>
+                <slot name="option-action" :option="option" :label="displayName?.(option)" />
+              </div>
               <button
                 v-if="canSelectCustom"
                 type="button"

@@ -23,6 +23,10 @@ describe("batchColumnSelectionColumnList", () => {
     expect(batchColumnSelectionColumnList(["id", "name"], "insert", "users")).toBe("id, name");
   });
 
+  it("repeats a quoted qualifier verbatim (#11330, #15190)", () => {
+    expect(batchColumnSelectionColumnList(["id", "name"], "select", '"ap"')).toBe('id, "ap".name');
+  });
+
   it("formats candidates with column comments in SELECT mode (#11354)", () => {
     const candidates = [{ apply: "order_start_time", comment: "医嘱开始时间" }, { apply: "order_end_time", comment: "医嘱结束时间" }, { apply: "patient_id" }];
     expect(batchColumnSelectionColumnList(candidates, "select", "t", "  ")).toBe("order_start_time, -- 医嘱开始时间\n  t.order_end_time, -- 医嘱结束时间\n  t.patient_id");
@@ -169,5 +173,14 @@ describe("shouldResolveSqlColumnCompletion", () => {
 
   it("keeps empty non-SELECT column contexts from fetching metadata", () => {
     expect(shouldResolveSqlColumnCompletion({ suggestColumns: true, hasReferencedTables: true, prefix: "", typedActivation: false, selectListColumnContext: false })).toBe(false);
+  });
+
+  it("resolves a bare `alias.` position so cold metadata is fetched (#12227 #12692)", () => {
+    expect(shouldResolveSqlColumnCompletion({ suggestColumns: true, hasReferencedTables: true, prefix: "", typedActivation: false, selectListColumnContext: false, qualifierDot: true })).toBe(true);
+  });
+
+  it("does not let qualifierDot override a disabled column context", () => {
+    expect(shouldResolveSqlColumnCompletion({ suggestColumns: false, hasReferencedTables: true, prefix: "", typedActivation: false, selectListColumnContext: false, qualifierDot: true })).toBe(false);
+    expect(shouldResolveSqlColumnCompletion({ suggestColumns: true, hasReferencedTables: false, prefix: "", typedActivation: false, selectListColumnContext: false, qualifierDot: true })).toBe(false);
   });
 });

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { BackendErrorException } from "@/lib/backend/errorUtils";
 
 const apiMock = vi.hoisted(() => ({
   getColumns: vi.fn(),
@@ -16,6 +17,7 @@ vi.mock("@/lib/backend/api", () => apiMock);
 
 import {
   buildDuplicateTableStructurePlan,
+  buildMysqlTableMaintenanceSql,
   buildVacuumTableSql,
   buildMysqlAutoIncrementSql,
   collectDuplicateTableColumnComments,
@@ -25,11 +27,98 @@ import {
   oracleDuplicateTableCreateOptions,
   sqlServerClonePrimaryKeyConstraintName,
   SQLSERVER_IDENTIFIER_MAX_LENGTH,
+  summarizeMysqlTableMaintenanceResult,
   supportsMysqlAutoIncrement,
+  supportsMysqlTableMaintenance,
+  tableAdminSqlOptionsForRow,
 } from "@/lib/database/dbAdminSql";
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
+});
+
+/**
+ * #14717 review: the Object Browser must hand `foreignTable: true` to the drop
+ * builder, or PostgreSQL answers `DROP TABLE` with "is not a table". The flag has
+ * to survive separately from `row.type`, which the row normalizer folds into
+ * "TABLE" for a foreign table.
+ */
+describe("Object Browser table admin SQL options", () => {
+  it("marks a foreign-table row so the drop uses DROP FOREIGN TABLE", () => {
+    const options = tableAdminSqlOptionsForRow({
+      row: { name: "vmes_bfl_last", schema: "de_dd", foreignTable: true },
+      databaseType: "postgres",
+      schema: "de_dd",
+      identifierQuote: '"',
+    });
+
+    expect(options.foreignTable).toBe(true);
+    expect(options.tableName).toBe("vmes_bfl_last");
+    expect(options.databaseType).toBe("postgres");
+  });
+
+  it("leaves an ordinary table without the foreign flag", () => {
+    const options = tableAdminSqlOptionsForRow({
+      row: { name: "orders", schema: "public" },
+      databaseType: "postgres",
+      schema: "public",
+    });
+
+    expect(options.foreignTable).toBeUndefined();
+    expect(options.cascade).toBeUndefined();
+  });
+
+  it("keeps cascade independent from the foreign flag", () => {
+    const options = tableAdminSqlOptionsForRow({
+      row: { name: "remote", schema: "public", foreignTable: true },
+      databaseType: "postgres",
+      cascade: true,
+    });
+
+    expect(options).toMatchObject({ foreignTable: true, cascade: true });
+  });
+});
+
+/**
+ * #14717 review: the Object Browser must hand `foreignTable: true` to the drop
+ * builder, or PostgreSQL answers `DROP TABLE` with "is not a table". The flag has
+ * to survive separately from `row.type`, which the row normalizer folds into
+ * "TABLE" for a foreign table.
+ */
+describe("Object Browser table admin SQL options", () => {
+  it("marks a foreign-table row so the drop uses DROP FOREIGN TABLE", () => {
+    const options = tableAdminSqlOptionsForRow({
+      row: { name: "vmes_bfl_last", schema: "de_dd", foreignTable: true },
+      databaseType: "postgres",
+      schema: "de_dd",
+      identifierQuote: '"',
+    });
+
+    expect(options.foreignTable).toBe(true);
+    expect(options.tableName).toBe("vmes_bfl_last");
+    expect(options.databaseType).toBe("postgres");
+  });
+
+  it("leaves an ordinary table without the foreign flag", () => {
+    const options = tableAdminSqlOptionsForRow({
+      row: { name: "orders", schema: "public" },
+      databaseType: "postgres",
+      schema: "public",
+    });
+
+    expect(options.foreignTable).toBeUndefined();
+    expect(options.cascade).toBeUndefined();
+  });
+
+  it("keeps cascade independent from the foreign flag", () => {
+    const options = tableAdminSqlOptionsForRow({
+      row: { name: "remote", schema: "public", foreignTable: true },
+      databaseType: "postgres",
+      cascade: true,
+    });
+
+    expect(options).toMatchObject({ foreignTable: true, cascade: true });
+  });
 });
 
 describe("MySQL AUTO_INCREMENT administration", () => {
@@ -218,7 +307,7 @@ describe("damengDuplicateTableCreateOptions", () => {
       ] as any,
     });
 
-    expect(options).toMatchObject({ databaseType: "dameng", schema: "APP", tableName: "ORDERS_COPY", tableComment: "orders clone" });
+    expect(options).toMatchObject({ databaseType: "dameng", schema: "APP", tableName: "orders_copy", tableComment: "orders clone" });
     expect(options.columns).toHaveLength(3);
     expect(options.columns[0]).toMatchObject({
       name: "ID",
@@ -288,11 +377,10 @@ describe("damengDuplicateTableCreateOptions", () => {
     expect(options.tableComment).toBe("empty clone");
   });
 
-  it("keeps unquoted Dameng target folding compatible with the data-copy path", () => {
+  it.each(["data_source_copy", "DATA_SOURCE_COPY", "Data_Source_copy", 'data"source_copy', "数据源_副本"])("preserves the requested Dameng clone name %s", (targetName) => {
     const columns = [{ name: "ID", data_type: "INT", is_nullable: false, column_default: null, is_primary_key: false, extra: null }] as any;
 
-    expect(damengDuplicateTableCreateOptions({ targetName: "orders_copy", columns, indexes: [] }).tableName).toBe("ORDERS_COPY");
-    expect(damengDuplicateTableCreateOptions({ targetName: "OrdersCopy", columns, indexes: [] }).tableName).toBe("OrdersCopy");
+    expect(damengDuplicateTableCreateOptions({ targetName, columns, indexes: [] }).tableName).toBe(targetName);
   });
 });
 
@@ -364,7 +452,7 @@ describe("buildDuplicateTableStructurePlan", () => {
       expect.objectContaining({
         databaseType: "dameng",
         schema: "SYSDBA",
-        tableName: "ORDERS_COPY",
+        tableName: "orders_copy",
       }),
     );
     expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
@@ -486,7 +574,161 @@ describe("buildDuplicateTableStructurePlan", () => {
     expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
   });
 
-  it.each(["postgres", "mysql", "highgo", "kingbase", undefined] as const)("keeps %s clones on the generic path", async (databaseType) => {
+  it.each(["oscar", "kingbase"] as const)("loads %s source column comments and keeps table and column comments in the clone plan", async (databaseType) => {
+    const columns = [
+      { name: "ID", comment: null, data_type: "int", is_nullable: false, column_default: null, is_primary_key: true },
+      { name: "NAME", comment: "  用户's;姓名  ", data_type: "varchar(50)", is_nullable: true, column_default: null, is_primary_key: false },
+      { name: "BLANK", comment: " \t\n ", data_type: "varchar(50)", is_nullable: true, column_default: null, is_primary_key: false },
+    ];
+    const sql = 'CREATE TABLE "SYSDBA"."USERS_COPY" AS SELECT * FROM "SYSDBA"."USERS" WHERE 1=0;\nCOMMENT ON TABLE "SYSDBA"."USERS_COPY" IS \'  用户\'\'s;表  \';\nCOMMENT ON COLUMN "SYSDBA"."USERS_COPY"."NAME" IS \'  用户\'\'s;姓名  \';';
+    apiMock.getColumns.mockResolvedValue(columns);
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({
+      connectionId: "connection-1",
+      database: "osrdb",
+      catalog: "catalog",
+      databaseType,
+      schema: "SYSDBA",
+      sourceName: "USERS",
+      targetName: "USERS_COPY",
+      tableComment: "  用户's;表  ",
+      identifierQuote: '"',
+    });
+
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("connection-1", "osrdb", "SYSDBA", "USERS", "catalog");
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledExactlyOnceWith({
+      databaseType,
+      schema: "SYSDBA",
+      sourceName: "USERS",
+      targetName: "USERS_COPY",
+      tableComment: "  用户's;表  ",
+      columnComments: [{ name: "NAME", comment: "  用户's;姓名  " }],
+      identifierQuote: '"',
+    });
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: true });
+    expect(apiMock.listIndexes).not.toHaveBeenCalled();
+    expect(apiMock.buildCreateTableSql).not.toHaveBeenCalled();
+    expect(apiMock.getTableComment).not.toHaveBeenCalled();
+  });
+
+  it.each([null, "", " \t\n "])("reuses Oscar columns and keeps absent comments optional: %j", async (comment) => {
+    const columns = [{ name: "note", comment, data_type: "text", is_nullable: true, column_default: null, is_primary_key: false }];
+    const sql = 'CREATE TABLE "copy" AS SELECT * FROM "source" WHERE 1=0;';
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({
+      connectionId: "oscar-1",
+      database: "osrdb",
+      databaseType: "oscar",
+      sourceName: "source",
+      targetName: "copy",
+      tableComment: comment,
+      sourceColumns: columns,
+    });
+
+    expect(apiMock.getColumns).not.toHaveBeenCalled();
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: comment, columnComments: [] }));
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: false });
+  });
+
+  it("does not silently clone Oscar without comments when column metadata fails", async () => {
+    const error = new Error("column metadata unavailable");
+    apiMock.getColumns.mockRejectedValueOnce(error);
+
+    await expect(buildDuplicateTableStructurePlan({ connectionId: "oscar-1", database: "osrdb", databaseType: "oscar", sourceName: "source", targetName: "copy" })).rejects.toBe(error);
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("oscar-1", "osrdb", "", "source", undefined);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  const kingbaseClone = { connectionId: "kingbase-1", database: "app", databaseType: "kingbase", schema: "public", sourceName: "source", targetName: "copy" } as const;
+
+  it.each([
+    ["Web", new BackendErrorException("Agent RPC error (-1): KINGBASE_CATALOG_OID_UNAVAILABLE: kb: column c.oid does not exist")],
+    ["desktop with an older agent", 'Agent RPC error (-1): kb: column "rel.oid" does not exist'],
+  ])("clones Kingbase structure when the catalog OID is unavailable on %s", async (_transport, error) => {
+    apiMock.getColumns.mockRejectedValueOnce(error);
+    const sql = 'CREATE TABLE "copy" AS SELECT * FROM "source" WHERE 1=0;\nCOMMENT ON TABLE "copy" IS \'table note\';';
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValueOnce(sql);
+
+    await expect(buildDuplicateTableStructurePlan({ ...kingbaseClone, tableComment: "table note" })).resolves.toEqual({ sql, sourceColumns: undefined, executeAsScript: true, commentMetadataIncomplete: true });
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: "table note", columnComments: [] }));
+  });
+
+  it.each(["Agent RPC error (-1): kb: permission denied for relation sys_class", "Agent RPC error (-1): kb: column a.attnum does not exist", "column query timed out"])("surfaces unrelated Kingbase column errors: %s", async (message) => {
+    apiMock.getColumns.mockRejectedValueOnce(new Error(message));
+
+    await expect(buildDuplicateTableStructurePlan({ ...kingbaseClone, tableComment: "table note" })).rejects.toThrow(message);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it("requires Kingbase column metadata to plan a clone with data", async () => {
+    const error = new Error("Agent RPC error (-1): KINGBASE_CATALOG_OID_UNAVAILABLE: kb: column c.oid does not exist");
+    apiMock.getColumns.mockRejectedValueOnce(error);
+
+    await expect(buildDuplicateTableStructurePlan({ ...kingbaseClone, tableComment: "table note", copyData: true })).rejects.toBe(error);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Kingbase clone with no writable columns before building SQL", async () => {
+    await expect(buildDuplicateTableStructurePlan({ ...kingbaseClone, tableComment: "table note", copyData: true, sourceColumns: [] })).rejects.toThrow("No writable columns");
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [false, "Agent RPC error (-1): unknown method: get_table_comment"],
+    [true, new BackendErrorException("unknown method: get_table_comment")],
+  ] as const)("keeps planning a Kingbase clone with copyData=%s when the old agent lacks table comments", async (copyData, error) => {
+    apiMock.getTableComment.mockRejectedValueOnce(error);
+    const columns = [{ name: "note", comment: "column note", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false }];
+    const sql = "CREATE TABLE copy AS SELECT * FROM source WHERE 1=0;\nCOMMENT ON COLUMN copy.note IS 'column note';";
+    apiMock.getColumns.mockResolvedValueOnce(columns);
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValueOnce(sql);
+
+    await expect(buildDuplicateTableStructurePlan({ ...kingbaseClone, copyData })).resolves.toEqual({ sql, sourceColumns: columns, executeAsScript: true, commentMetadataIncomplete: true });
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: null, columnComments: [{ name: "note", comment: "column note" }] }));
+  });
+
+  it("clones only the structure when both Kingbase comment lookups are unavailable", async () => {
+    apiMock.getTableComment.mockRejectedValueOnce("unknown method: get_table_comment");
+    apiMock.getColumns.mockRejectedValueOnce("Agent RPC error (-1): kb: column c.oid does not exist");
+    const sql = "CREATE TABLE copy AS SELECT * FROM source WHERE 1=0;";
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValueOnce(sql);
+
+    await expect(buildDuplicateTableStructurePlan(kingbaseClone)).resolves.toEqual({ sql, sourceColumns: undefined, executeAsScript: false, commentMetadataIncomplete: true });
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: null, columnComments: [] }));
+  });
+
+  it.each(["Agent RPC error (-1): kb: permission denied for relation sys_class", "get_table_comment timed out", "Agent RPC error (-1): unknown method: get_columns"])("surfaces unrelated Kingbase table-comment errors: %s", async (message) => {
+    const error = new Error(message);
+    apiMock.getTableComment.mockRejectedValueOnce(error);
+
+    await expect(buildDuplicateTableStructurePlan({ ...kingbaseClone, sourceColumns: [] })).rejects.toBe(error);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it("loads the Kingbase table comment when the source entry has none", async () => {
+    apiMock.getTableComment.mockResolvedValue("table comment");
+    const sql = "CREATE TABLE copy AS SELECT * FROM source WHERE 1=0;\nCOMMENT ON TABLE copy IS 'table comment';";
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({
+      connectionId: "kingbase-1",
+      database: "app",
+      databaseType: "kingbase",
+      schema: "public",
+      sourceName: "source",
+      targetName: "copy",
+      sourceColumns: [],
+    });
+
+    expect(apiMock.getTableComment).toHaveBeenCalledExactlyOnceWith("kingbase-1", "app", "public", "source", undefined);
+    expect(apiMock.getColumns).not.toHaveBeenCalled();
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: "table comment", columnComments: [] }));
+    expect(plan).toEqual({ sql, sourceColumns: [], executeAsScript: true });
+  });
+
+  it.each(["postgres", "mysql", "highgo", undefined] as const)("keeps %s clones on the generic path", async (databaseType) => {
     apiMock.buildDuplicateTableStructureSql.mockResolvedValue('CREATE TABLE "copy" (LIKE "source" INCLUDING ALL);');
 
     const plan = await buildDuplicateTableStructurePlan({
@@ -703,5 +945,41 @@ describe("damengDropSchemaExecutionSchema", () => {
 
   it("fails closed when the username is missing", () => {
     expect(damengDropSchemaExecutionSchema(undefined, "TARGET")).toBeNull();
+  });
+});
+
+describe("MySQL table maintenance", () => {
+  it("offers the statements only to plain MySQL-family connections", () => {
+    for (const connection of [{ db_type: "mysql" }, { db_type: "mysql", driver_profile: " MariaDB " }, { db_type: "mysql", driver_profile: "greatsql" }]) {
+      expect(supportsMysqlTableMaintenance(connection as any), JSON.stringify(connection)).toBe(true);
+    }
+    for (const connection of [undefined, { db_type: "postgres" }, { db_type: "mysql", driver_profile: "tidb" }, { db_type: "mysql", driver_profile: "doris" }, { db_type: "doris" }]) {
+      expect(supportsMysqlTableMaintenance(connection as any), JSON.stringify(connection)).toBe(false);
+    }
+  });
+
+  it("builds one statement per operation and escapes backticks in the table name", () => {
+    expect(buildMysqlTableMaintenanceSql("analyze", "orders")).toBe("ANALYZE TABLE `orders`");
+    expect(buildMysqlTableMaintenanceSql("check", "orders")).toBe("CHECK TABLE `orders`");
+    expect(buildMysqlTableMaintenanceSql("optimize", "orders")).toBe("OPTIMIZE TABLE `orders`");
+    expect(buildMysqlTableMaintenanceSql("repair", "we`ird")).toBe("REPAIR TABLE `we``ird`");
+  });
+
+  it("reports the final message, or the error text when the server answered with an error row", () => {
+    const columns = ["Table", "Op", "Msg_type", "Msg_text"];
+    expect(
+      summarizeMysqlTableMaintenanceResult({
+        columns,
+        rows: [
+          ["db.t", "optimize", "note", "Table does not support optimize, doing recreate + analyze instead"],
+          ["db.t", "optimize", "status", "OK"],
+        ],
+      }),
+    ).toEqual({ ok: true, message: "OK" });
+    expect(summarizeMysqlTableMaintenanceResult({ columns, rows: [["db.t", "repair", "error", "The storage engine for the table doesn't support repair"]] })).toEqual({
+      ok: false,
+      message: "The storage engine for the table doesn't support repair",
+    });
+    expect(summarizeMysqlTableMaintenanceResult({ columns: [], rows: [] })).toEqual({ ok: true, message: "" });
   });
 });

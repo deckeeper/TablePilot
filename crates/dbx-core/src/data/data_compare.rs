@@ -13,20 +13,41 @@ use crate::schema::get_columns_core;
 use crate::sql_dialect::{
     build_count_table_sql, build_iris_table_select_sql, firebird_rows_clause, pagination_strategy,
     qualified_table_name, quote_iris_identifier, quote_table_identifier, table_data_qualified_table_name,
-    PaginationContext, TablePaginationStrategy,
+    uses_single_row_insert_statements, PaginationContext, TablePaginationStrategy,
 };
-use crate::transfer::{generate_comment_ddl, generate_create_table_ddl};
+use crate::transfer::{
+    generate_comment_ddl, generate_create_table_ddl, is_identity_column_extra,
+    is_postgres_generated_always_identity_extra, postgres_sequence_sync_statement,
+    wrap_dameng_identity_insert_sql_for_table,
+};
 
 use super::sample_pairing::retain_shared_sample_rows_by_key;
 
 const DATA_SYNC_INSERT_BATCH_SIZE: usize = 500;
 const DATA_SYNC_CONDITION_BATCH_SIZE: usize = 200;
 
+/// 数据比对的查询选项：查询超时跟随连接配置（0 = 不限时），而不是
+/// `QueryExecutionOptions` 默认的 30 秒。大表比较（行计数、批量读取、采样）
+/// 常常超过 30 秒，用户调大连接的查询超时后即可完成（#13330）。
+async fn compare_query_options(
+    state: &AppState,
+    connection_id: &str,
+    max_rows: Option<usize>,
+) -> QueryExecutionOptions {
+    let timeout_secs = {
+        let configs = state.configs.read().await;
+        configs.get(connection_id).map(|config| config.effective_query_timeout_secs())
+    };
+    QueryExecutionOptions { max_rows, timeout_secs, ..Default::default() }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompareDataRowsOptions {
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     #[serde(default)]
     pub source_rows: Vec<Vec<Value>>,
     #[serde(default)]
@@ -41,6 +62,8 @@ pub struct DataComparePreparationOptions {
     pub schema: Option<String>,
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_info: Vec<DataGridColumnInfo>,
     #[serde(default)]
@@ -64,6 +87,8 @@ pub struct DataCompareFromTablesOptions {
     pub target_table: String,
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_columns: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +152,11 @@ pub struct DataCompareResult {
     pub added: Vec<DataCompareRow>,
     pub removed: Vec<DataCompareRow>,
     pub modified: Vec<DataCompareModifiedRow>,
+    /// Rows matching on key columns whose value differences all fall in ignored
+    /// columns. They count as identical for diff and sync purposes, but the count
+    /// is surfaced so an ignore list cannot silently hide real divergence.
+    #[serde(default)]
+    pub ignored_only_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +309,8 @@ pub struct VerifyDataOptions {
     pub target_table: String,
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +340,7 @@ pub fn prepare_data_compare(options: DataComparePreparationOptions) -> Result<Da
         schema,
         columns,
         key_columns,
+        ignored_columns,
         column_info,
         source_rows,
         target_rows,
@@ -316,6 +349,7 @@ pub fn prepare_data_compare(options: DataComparePreparationOptions) -> Result<Da
     let result = compare_data_rows(CompareDataRowsOptions {
         columns: columns.clone(),
         key_columns: key_columns.clone(),
+        ignored_columns,
         source_rows,
         target_rows,
     })?;
@@ -340,7 +374,7 @@ pub async fn prepare_data_compare_from_tables(
     let target_database_type = connection_database_type(state, &options.target_connection_id).await?;
     ensure_data_compare_supported(source_database_type, "source")?;
     ensure_data_compare_supported(target_database_type, "target")?;
-    let fetch_batch_size = options.fetch_batch_size.unwrap_or(1000).max(1);
+    let fetch_batch_size = options.fetch_batch_size.unwrap_or(DEFAULT_FETCH_BATCH_SIZE).max(1);
 
     let source_count_sql =
         build_count_table_sql(Some(source_database_type), Some(&options.source_schema), &options.source_table);
@@ -355,7 +389,7 @@ pub async fn prepare_data_compare_from_tables(
             &source_count_sql,
             Some(&options.source_schema),
             None,
-            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+            compare_query_options(state, &options.source_connection_id, Some(1)).await,
         ),
         execute_sql_statement_with_options(
             state,
@@ -364,7 +398,7 @@ pub async fn prepare_data_compare_from_tables(
             &target_count_sql,
             Some(&options.target_schema),
             None,
-            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+            compare_query_options(state, &options.target_connection_id, Some(1)).await,
         )
     )?;
     let source_row_count = first_count(&source_count_result.rows)?;
@@ -399,6 +433,7 @@ pub async fn prepare_data_compare_from_tables(
                         source_database_type,
                         fetch_batch_size,
                         row_budget,
+                        source_row_count,
                     ),
                     fetch_compare_rows(
                         state,
@@ -411,6 +446,7 @@ pub async fn prepare_data_compare_from_tables(
                         target_database_type,
                         fetch_batch_size,
                         row_budget,
+                        target_row_count,
                     )
                 )?;
                 let source_truncated = source_row_count > row_budget as u64;
@@ -471,13 +507,19 @@ pub async fn prepare_data_compare_from_tables(
     )
     .await?;
 
+    // Checksums must judge the same scope the diff judges: an ignored column's value
+    // difference is tolerated by the diff, so it cannot flip the checksum verdict.
+    let ignored_set = resolve_ignored_columns(&options.columns, &options.ignored_columns, &options.key_columns);
+    let checksum_columns =
+        options.columns.iter().filter(|column| !ignored_set.contains(column.as_str())).cloned().collect::<Vec<_>>();
+
     let source_checksums = if enable_checksum && !source_rows.is_empty() {
-        Some(compute_column_checksums(&options.columns, &source_rows))
+        Some(compute_column_checksums(&checksum_columns, &source_rows))
     } else {
         None
     };
     let target_checksums = if enable_checksum && !target_rows.is_empty() {
-        Some(compute_column_checksums(&options.columns, &target_rows))
+        Some(compute_column_checksums(&checksum_columns, &target_rows))
     } else {
         None
     };
@@ -491,6 +533,7 @@ pub async fn prepare_data_compare_from_tables(
         schema: Some(options.target_schema),
         columns: options.columns,
         key_columns: options.key_columns,
+        ignored_columns: options.ignored_columns,
         column_info: target_columns.into_iter().map(data_grid_column_info).collect(),
         source_rows,
         target_rows,
@@ -528,7 +571,7 @@ pub async fn prepare_data_compare_missing_target(
     let target_database_type = connection_database_type(state, &options.target_connection_id).await?;
     ensure_data_compare_supported(source_database_type, "source")?;
     ensure_data_compare_supported(target_database_type, "target")?;
-    let fetch_batch_size = options.fetch_batch_size.unwrap_or(1000).max(1);
+    let fetch_batch_size = options.fetch_batch_size.unwrap_or(DEFAULT_FETCH_BATCH_SIZE).max(1);
     let source_columns = get_columns_core(
         state,
         &options.source_connection_id,
@@ -548,7 +591,7 @@ pub async fn prepare_data_compare_missing_target(
         &source_count_sql,
         Some(&options.source_schema),
         None,
-        QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+        compare_query_options(state, &options.source_connection_id, Some(1)).await,
     )
     .await?;
     let source_row_count = first_count(&source_count_result.rows)?;
@@ -568,6 +611,7 @@ pub async fn prepare_data_compare_missing_target(
         source_database_type,
         fetch_batch_size,
         row_budget,
+        source_row_count,
     )
     .await?;
     let source_truncated = source_row_count > row_budget as u64;
@@ -702,7 +746,7 @@ fn missing_target_diff(columns: &[String], key_columns: &[String], source_rows: 
         })
         .collect();
 
-    DataCompareResult { added, removed: Vec::new(), modified: Vec::new() }
+    DataCompareResult { added, removed: Vec::new(), modified: Vec::new(), ignored_only_count: 0 }
 }
 
 pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareResult, String> {
@@ -716,9 +760,11 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
     let (target, target_order) =
         collect_compare_rows(&options.columns, &options.key_columns, &column_indexes, options.target_rows, "target")?;
     let key_columns: HashSet<&str> = options.key_columns.iter().map(String::as_str).collect();
+    let ignored_columns = resolve_ignored_columns(&options.columns, &options.ignored_columns, &options.key_columns);
 
     let mut added = Vec::new();
     let mut modified = Vec::new();
+    let mut ignored_only_count = 0usize;
 
     for key in &source_order {
         let source_values = source.get(key).expect("source key should exist");
@@ -747,13 +793,27 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
             })
             .collect::<Vec<_>>();
 
-        if !changes.is_empty() {
+        // An ignored column's difference never affects row identity: only changes on
+        // compared columns are reported, and a row whose differences were all ignored
+        // is counted separately instead of being reported as modified.
+        let visible_changes: Vec<DataCompareChangedCell> = if ignored_columns.is_empty() {
+            changes
+        } else {
+            let visible =
+                changes.iter().filter(|change| !ignored_columns.contains(&change.column)).cloned().collect::<Vec<_>>();
+            if visible.is_empty() && !changes.is_empty() {
+                ignored_only_count += 1;
+            }
+            visible
+        };
+
+        if !visible_changes.is_empty() {
             modified.push(DataCompareModifiedRow {
                 key: key.clone(),
                 key_values: key_values_for_row(source_values, &options.key_columns, &column_indexes),
                 source_values: row_object(&options.columns, source_values),
                 target_values: row_object(&options.columns, target_values),
-                changes,
+                changes: visible_changes,
             });
         }
     }
@@ -769,8 +829,30 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
         }
     }
 
-    Ok(DataCompareResult { added, removed, modified })
+    Ok(DataCompareResult { added, removed, modified, ignored_only_count })
 }
+
+/// Resolves user-supplied ignored column names against the columns being compared.
+/// Matching is case-insensitive so a cross-database compare tolerates case drift;
+/// names matching no compared column are dropped (they may exist only on the source
+/// side or nowhere); a name that is also a key column keeps its key role, because
+/// locating rows must win over ignoring a column.
+fn resolve_ignored_columns(columns: &[String], ignored_columns: &[String], key_columns: &[String]) -> HashSet<String> {
+    if ignored_columns.is_empty() {
+        return HashSet::new();
+    }
+    let key_set: HashSet<&str> = key_columns.iter().map(String::as_str).collect();
+    columns
+        .iter()
+        .filter(|column| !key_set.contains(column.as_str()))
+        .filter(|column| ignored_columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
+        .cloned()
+        .collect()
+}
+
+/// Rows per page when a compare reads a table. Keyset paging keeps each page an index seek,
+/// so larger pages mostly just save round trips.
+const DEFAULT_FETCH_BATCH_SIZE: usize = 10_000;
 
 static NULL_VALUE: Value = Value::Null;
 
@@ -910,14 +992,30 @@ fn generate_data_sync_statements(options: &GenerateDataSyncSqlOptions<'_>) -> Ve
     let table = qualified_table_name(options.database_type, options.schema, options.table_name);
     let column_info = options.column_info;
     let added = generate_insert_sync_statements(options, &table, column_info);
+    let sequence_resets = generate_sequence_reset_statements(options, &table, column_info);
     let modified = generate_update_sync_statements(options, &table, column_info);
     let removed = generate_delete_sync_statements(options, &table, column_info);
 
-    let mut statements = Vec::with_capacity(added.len() + modified.len() + removed.len());
+    let mut statements = Vec::with_capacity(added.len() + sequence_resets.len() + modified.len() + removed.len());
     statements.extend(added);
+    statements.extend(sequence_resets);
     statements.extend(modified);
     statements.extend(removed);
     statements
+}
+
+/// Rows that share one `INSERT … VALUES (…), (…), …` statement.
+///
+/// Oracle-family servers take a single row per `INSERT … VALUES`, so the MySQL
+/// and PostgreSQL multi-row list is a syntax error there (#15442 reports
+/// `ORA-00933: SQL command not properly ended`); those dialects get one
+/// statement per added row instead.
+fn sync_insert_batch_size(database_type: Option<DatabaseType>) -> usize {
+    if database_type.is_some_and(uses_single_row_insert_statements) {
+        1
+    } else {
+        DATA_SYNC_INSERT_BATCH_SIZE
+    }
 }
 
 fn generate_insert_sync_statements(
@@ -938,10 +1036,27 @@ fn generate_insert_sync_statements(
     if writable_columns.is_empty() {
         return options.diff.added.par_iter().map(|_| format!("INSERT INTO {table} DEFAULT VALUES;")).collect();
     }
+    let writes_identity = |is_identity: fn(Option<&str>) -> bool| {
+        writable_columns
+            .iter()
+            .any(|column| is_identity(column_info_for(column_info, column).and_then(|info| info.extra.as_deref())))
+    };
+    // SQL Server rejects explicit identity values (error 544) unless IDENTITY_INSERT is on.
+    // The wrapper stays inside each statement so a per-statement retry keeps it.
+    let sqlserver_identity_insert =
+        options.database_type == Some(DatabaseType::SqlServer) && writes_identity(is_identity_column_extra);
+    // PostgreSQL rejects explicit values for GENERATED ALWAYS identity columns without an override.
+    let overriding = if options.database_type == Some(DatabaseType::Postgres)
+        && writes_identity(is_postgres_generated_always_identity_extra)
+    {
+        " OVERRIDING SYSTEM VALUE"
+    } else {
+        ""
+    };
     options
         .diff
         .added
-        .par_chunks(DATA_SYNC_INSERT_BATCH_SIZE)
+        .par_chunks(sync_insert_batch_size(options.database_type))
         .map(|chunk| {
             let values = chunk
                 .iter()
@@ -961,9 +1076,46 @@ fn generate_insert_sync_statements(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("INSERT INTO {table} ({columns}) VALUES {values};")
+            let insert = format!("INSERT INTO {table} ({columns}){overriding} VALUES {values};");
+            if sqlserver_identity_insert {
+                wrap_dameng_identity_insert_sql_for_table(&insert, table)
+            } else {
+                insert
+            }
         })
         .collect()
+}
+
+/// Explicit inserts into serial/identity columns do not advance PostgreSQL sequences,
+/// so the next default value would collide with a synchronized row. Move each sequence
+/// past the column's current maximum once the inserts have run.
+///
+/// Shares the transfer pipeline's `setval` shape, so like pg_dump the reset can also
+/// move a sequence backward when it sits above the table maximum (ids that were
+/// allocated and later deleted).
+fn generate_sequence_reset_statements(
+    options: &GenerateDataSyncSqlOptions<'_>,
+    table: &str,
+    column_info: &[DataGridColumnInfo],
+) -> Vec<String> {
+    if options.database_type != Some(DatabaseType::Postgres) || options.diff.added.is_empty() {
+        return Vec::new();
+    }
+    options
+        .columns
+        .iter()
+        .filter(|column| is_postgres_sequence_backed_column(column_info_for(column_info, column)))
+        .map(|column| format!("{};", postgres_sequence_sync_statement(table, column)))
+        .collect()
+}
+
+fn is_postgres_sequence_backed_column(column_info: Option<&DataGridColumnInfo>) -> bool {
+    let Some(column_info) = column_info else {
+        return false;
+    };
+    let extra = column_info.extra.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    let default = column_info.column_default.as_deref().unwrap_or("").trim_start().to_ascii_lowercase();
+    extra.contains("identity") || extra.ends_with("serial") || default.starts_with("nextval(")
 }
 
 fn generate_update_sync_statements(
@@ -1205,6 +1357,19 @@ fn build_data_compare_select_sql(
                 "WITH {page_alias} AS (SELECT {select_columns}, ROW_NUMBER() OVER (ORDER BY {order_expression}) AS {row_number_alias} FROM {table}) SELECT {select_columns} FROM {page_alias} WHERE {row_number_alias} > {offset} AND {row_number_alias} <= {end} ORDER BY {row_number_alias}"
             )
         }
+        TablePaginationStrategy::TeradataTop => {
+            if offset == 0 {
+                return format!("SELECT TOP {row_limit} {select_columns} FROM {table}{order_by}");
+            }
+            // The window specification needs an ORDER BY. Compares select key columns
+            // before paging, so `order_by` is normally ` ORDER BY ...`; `ORDER BY 1`
+            // keeps the SQL valid if a keyless compare ever reaches this arm.
+            let window = if order_by.is_empty() { "ORDER BY 1" } else { order_by.trim() };
+            let end = offset + row_limit;
+            format!(
+                "SELECT * FROM (SELECT {select_columns}, ROW_NUMBER() OVER ({window}) AS \"__dbx_row_num\" FROM {table}) \"dbx_page\" WHERE \"__dbx_row_num\" > {offset} AND \"__dbx_row_num\" <= {end} ORDER BY \"__dbx_row_num\""
+            )
+        }
         TablePaginationStrategy::IrisTop => {
             build_iris_table_select_sql(&select_columns, &table, "", &order_by, row_limit, offset as u64)
         }
@@ -1267,6 +1432,12 @@ fn build_rownum_data_compare_select_sql(
 /// fetch turns a large table into an out-of-memory freeze on the client. Callers derive
 /// `source_truncated` / `target_truncated` from the table's row count versus `row_budget`
 /// so a partial diff is never mistaken for a complete one.
+///
+/// SQL Server and PostgreSQL page by key (seek) instead of by offset: an offset page
+/// re-reads every earlier row, which makes a full read quadratic in the table size.
+/// `expected_rows` is the table's counted size; when a keyset read ends with a different
+/// number of rows (NULL or non-unique keys, a key literal that does not round-trip), the
+/// table is re-read with offset paging so the result is never silently incomplete.
 async fn fetch_compare_rows(
     state: &AppState,
     connection_id: &str,
@@ -1278,10 +1449,76 @@ async fn fetch_compare_rows(
     database_type: DatabaseType,
     fetch_batch_size: usize,
     row_budget: usize,
+    expected_rows: u64,
 ) -> Result<Vec<Vec<Value>>, String> {
-    let mut rows = Vec::new();
-    let mut offset = 0usize;
+    if let Some(key_indexes) = keyset_key_indexes(database_type, columns, key_columns) {
+        // A keyset page error (e.g. a key column whose rendered text literal does
+        // not implicitly cast in a `>` predicate, such as PostgreSQL money/bytea)
+        // falls back to offset paging instead of failing a compare that the
+        // offset path can still serve.
+        let rows = match fetch_compare_rows_by_key(
+            state,
+            connection_id,
+            database,
+            schema,
+            table_name,
+            columns,
+            key_columns,
+            &key_indexes,
+            database_type,
+            fetch_batch_size,
+            row_budget,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                log::warn!(
+                    "[data-compare:keyset-fallback] database_type={database_type:?} table={table_name} error={error}"
+                );
+                None
+            }
+        };
+        if let Some(rows) = rows {
+            let expected = expected_rows.min(row_budget as u64);
+            if rows.len() as u64 == expected {
+                return Ok(rows);
+            }
+        }
+    }
 
+    fetch_compare_rows_by_offset(
+        state,
+        connection_id,
+        database,
+        schema,
+        table_name,
+        columns,
+        key_columns,
+        database_type,
+        fetch_batch_size,
+        row_budget,
+        0,
+        Vec::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_compare_rows_by_offset(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    database_type: DatabaseType,
+    fetch_batch_size: usize,
+    row_budget: usize,
+    mut offset: usize,
+    mut rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>, String> {
     while rows.len() < row_budget {
         let batch_size = fetch_batch_size.min(row_budget - rows.len());
         let sql =
@@ -1293,7 +1530,7 @@ async fn fetch_compare_rows(
             &sql,
             Some(schema),
             None,
-            QueryExecutionOptions { max_rows: Some(batch_size), ..Default::default() },
+            compare_query_options(state, connection_id, Some(batch_size)).await,
         )
         .await?;
         let fetched = result.rows.len();
@@ -1308,6 +1545,131 @@ async fn fetch_compare_rows(
     }
 
     Ok(rows)
+}
+
+/// Reads pages by key. Returns `None` when a page boundary cannot be expressed as a key
+/// predicate (a NULL or structured key value), so the caller falls back to offset paging.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_compare_rows_by_key(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    key_indexes: &[usize],
+    database_type: DatabaseType,
+    fetch_batch_size: usize,
+    row_budget: usize,
+) -> Result<Option<Vec<Vec<Value>>>, String> {
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut after: Option<Vec<String>> = None;
+
+    while rows.len() < row_budget {
+        let batch_size = fetch_batch_size.min(row_budget - rows.len());
+        let sql = build_keyset_data_compare_select_sql(
+            database_type,
+            schema,
+            table_name,
+            columns,
+            key_columns,
+            batch_size,
+            after.as_deref(),
+        );
+        let result = execute_sql_statement_with_options(
+            state,
+            connection_id,
+            database,
+            &sql,
+            Some(schema),
+            None,
+            compare_query_options(state, connection_id, Some(batch_size)).await,
+        )
+        .await?;
+        let fetched = result.rows.len();
+        if fetched == 0 {
+            break;
+        }
+        rows.extend(result.rows);
+        if fetched < batch_size {
+            break;
+        }
+        let Some(last_row) = rows.last() else { break };
+        let Some(boundary) = keyset_boundary_literals(database_type, last_row, key_indexes) else {
+            return Ok(None);
+        };
+        after = Some(boundary);
+    }
+
+    Ok(Some(rows))
+}
+
+/// Positions of the key columns in `columns`, when this database pages compares by key.
+fn keyset_key_indexes(database_type: DatabaseType, columns: &[String], key_columns: &[String]) -> Option<Vec<usize>> {
+    if !matches!(database_type, DatabaseType::SqlServer | DatabaseType::Postgres) || key_columns.is_empty() {
+        return None;
+    }
+    key_columns.iter().map(|key| columns.iter().position(|column| column == key)).collect()
+}
+
+/// SQL literals for the last row's key values; `None` when one cannot bound a key range.
+fn keyset_boundary_literals(database_type: DatabaseType, row: &[Value], key_indexes: &[usize]) -> Option<Vec<String>> {
+    key_indexes
+        .iter()
+        .map(|&index| {
+            let value = row.get(index)?;
+            matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_))
+                .then(|| format_grid_sql_literal(value, Some(database_type), None))
+        })
+        .collect()
+}
+
+/// Builds one keyset page: rows ordered by key, strictly after the `after` key literals.
+fn build_keyset_data_compare_select_sql(
+    database_type: DatabaseType,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    row_limit: usize,
+    after: Option<&[String]>,
+) -> String {
+    let table = qualified_table_name(Some(database_type), Some(schema), table_name);
+    let quote_column = |column: &str| quote_table_identifier(Some(database_type), column);
+    let select_columns = columns.iter().map(|column| quote_column(column)).collect::<Vec<_>>().join(", ");
+    let quoted_keys = key_columns.iter().map(|column| quote_column(column)).collect::<Vec<_>>();
+    let order_by = quoted_keys.iter().map(|column| format!("{column} ASC")).collect::<Vec<_>>().join(", ");
+    let where_sql = after
+        .map(|literals| format!(" WHERE {}", keyset_after_predicate(database_type, &quoted_keys, literals)))
+        .unwrap_or_default();
+
+    if database_type == DatabaseType::SqlServer {
+        format!("SELECT TOP ({row_limit}) {select_columns} FROM {table}{where_sql} ORDER BY {order_by}")
+    } else {
+        format!("SELECT {select_columns} FROM {table}{where_sql} ORDER BY {order_by} LIMIT {row_limit};")
+    }
+}
+
+/// `(k1, k2) > (v1, v2)` - PostgreSQL compares row values natively (and seeks a composite
+/// index with it); SQL Server needs the expanded `k1 > v1 OR (k1 = v1 AND k2 > v2)` form.
+fn keyset_after_predicate(database_type: DatabaseType, quoted_keys: &[String], literals: &[String]) -> String {
+    if quoted_keys.len() == 1 {
+        return format!("{} > {}", quoted_keys[0], literals[0]);
+    }
+    if database_type == DatabaseType::Postgres {
+        return format!("({}) > ({})", quoted_keys.join(", "), literals.join(", "));
+    }
+    (0..quoted_keys.len())
+        .map(|position| {
+            let mut terms = (0..position)
+                .map(|earlier| format!("{} = {}", quoted_keys[earlier], literals[earlier]))
+                .collect::<Vec<_>>();
+            terms.push(format!("{} > {}", quoted_keys[position], literals[position]));
+            format!("({})", terms.join(" AND "))
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 fn where_by_key(
@@ -1532,6 +1894,10 @@ fn build_limited_sampling_select_sql(
             let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
             format!("SELECT TOP ({row_limit}) {select_columns} FROM {table}{order}")
         }
+        TablePaginationStrategy::InformixFirst => {
+            let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
+            format!("SELECT FIRST {row_limit} {select_columns} FROM {table}{order}")
+        }
         _ => {
             let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
             format!("SELECT {select_columns} FROM {table}{order} LIMIT {row_limit}")
@@ -1633,7 +1999,7 @@ fn build_sampling_select_sql(
             DatabaseType::Questdb => {
                 format!("SELECT {select_columns} FROM {table} ORDER BY RAND() LIMIT {sample_size}")
             }
-            DatabaseType::Informix => {
+            DatabaseType::Informix | DatabaseType::Gbase8s => {
                 format!("SELECT FIRST {sample_size} {select_columns} FROM {table} ORDER BY RAND()")
             }
             _ => {
@@ -1730,7 +2096,7 @@ fn build_sampling_select_sql(
                 DatabaseType::Questdb => {
                     format!("SELECT {select_columns} FROM {table} ORDER BY RAND() LIMIT {random_count}")
                 }
-                DatabaseType::Informix => {
+                DatabaseType::Informix | DatabaseType::Gbase8s => {
                     format!("SELECT FIRST {random_count} {select_columns} FROM {table} ORDER BY RAND()")
                 }
                 _ => {
@@ -1778,7 +2144,7 @@ async fn fetch_sampled_compare_rows(
         &sql,
         Some(schema),
         None,
-        QueryExecutionOptions { max_rows: Some(sample_size), ..Default::default() },
+        compare_query_options(state, connection_id, Some(sample_size)).await,
     )
     .await?;
 
@@ -1855,6 +2221,7 @@ pub async fn verify_data(state: &AppState, options: VerifyDataOptions) -> Result
         target_table: options.target_table,
         columns: options.columns,
         key_columns: options.key_columns,
+        ignored_columns: options.ignored_columns,
         source_columns: None,
         fetch_batch_size: options.fetch_batch_size,
         degradation_threshold: Some(degradation_threshold),
@@ -1911,9 +2278,45 @@ mod tests {
         DataGridColumnInfo { extra: Some(extra.to_string()), ..data_compare_column(name, data_type) }
     }
 
+    #[tokio::test]
+    async fn compare_query_options_follows_connection_query_timeout() {
+        // #13330: compare queries used to run on the 30-second default regardless of
+        // the connection's configured query timeout, so large tables could never
+        // finish. The compare options must carry the connection's setting, with an
+        // explicit 0 meaning "no limit".
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("state.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let config: crate::models::connection::ConnectionConfig = serde_json::from_value(json!({
+            "id": "compare-timeout",
+            "name": "compare timeout",
+            "db_type": DatabaseType::Mysql,
+            "host": "localhost",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "query_timeout_secs": 0,
+        }))
+        .unwrap();
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let unlimited = compare_query_options(&state, "compare-timeout", Some(500)).await;
+        assert_eq!(unlimited.timeout_secs, Some(0));
+
+        state.configs.write().await.get_mut("compare-timeout").unwrap().query_timeout_secs = 120;
+        let configured = compare_query_options(&state, "compare-timeout", Some(500)).await;
+        assert_eq!(configured.timeout_secs, Some(120));
+
+        // An unknown connection keeps the historical 30-second default instead of
+        // silently dropping the timeout.
+        let unknown = compare_query_options(&state, "missing", Some(500)).await;
+        assert_eq!(unknown.timeout_secs, None);
+    }
+
     #[test]
     fn compares_rows_by_primary_key_and_reports_added_removed_and_modified_rows() {
         let diff = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![
@@ -1943,8 +2346,155 @@ mod tests {
     }
 
     #[test]
+    fn ignored_columns_do_not_mark_rows_modified_and_are_counted_separately() {
+        let diff = compare_data_rows(CompareDataRowsOptions {
+            columns: vec!["id".to_string(), "name".to_string(), "updated_at".to_string()],
+            key_columns: vec!["id".to_string()],
+            ignored_columns: vec!["updated_at".to_string()],
+            source_rows: vec![
+                vec![json!(1), json!("Ada"), json!("2026-01-01 08:00")],
+                vec![json!(2), json!("Bob"), json!("2026-01-01 09:00")],
+            ],
+            target_rows: vec![
+                vec![json!(1), json!("Ada"), json!("2026-01-01 09:00")],
+                vec![json!(2), json!("Bobby"), json!("2026-01-01 09:00")],
+            ],
+        })
+        .expect("data comparison should succeed");
+
+        // Row 1 differs only in the ignored column: identical for the diff, counted
+        // separately. Row 2 is still modified, but only by the compared column.
+        assert!(diff.added.is_empty() && diff.removed.is_empty());
+        assert_eq!(diff.ignored_only_count, 1);
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].changes.len(), 1);
+        assert_eq!(diff.modified[0].changes[0].column, "name");
+    }
+
+    #[test]
+    fn ignored_column_names_match_case_insensitively_and_keys_win_over_ignore() {
+        let diff = compare_data_rows(CompareDataRowsOptions {
+            columns: vec!["id".to_string(), "name".to_string(), "Version".to_string()],
+            key_columns: vec!["id".to_string()],
+            ignored_columns: vec!["VERSION".to_string(), "ID".to_string()],
+            source_rows: vec![vec![json!(1), json!("Ada"), json!(2)]],
+            target_rows: vec![vec![json!(1), json!("Ada"), json!(3)]],
+        })
+        .expect("data comparison should succeed");
+
+        // "VERSION" ignores the "Version" column despite the case drift; "ID" cannot
+        // demote the key column, so the row is still located by it.
+        assert!(diff.added.is_empty() && diff.removed.is_empty() && diff.modified.is_empty());
+        assert_eq!(diff.ignored_only_count, 1);
+    }
+
+    #[test]
+    fn unknown_ignored_columns_are_dropped_without_error() {
+        let diff = compare_data_rows(CompareDataRowsOptions {
+            columns: vec!["id".to_string(), "name".to_string()],
+            key_columns: vec!["id".to_string()],
+            ignored_columns: vec!["nope".to_string(), "also_missing".to_string()],
+            source_rows: vec![vec![json!(1), json!("Ada")]],
+            target_rows: vec![vec![json!(1), json!("Bobby")]],
+        })
+        .expect("data comparison should succeed");
+
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].changes.len(), 1);
+        assert_eq!(diff.ignored_only_count, 0);
+    }
+
+    #[test]
+    fn ignored_columns_stay_in_row_values_for_display_and_sync() {
+        let diff = compare_data_rows(CompareDataRowsOptions {
+            columns: vec!["id".to_string(), "name".to_string(), "version".to_string()],
+            key_columns: vec!["id".to_string()],
+            ignored_columns: vec!["version".to_string()],
+            source_rows: vec![vec![json!(1), json!("Ada"), json!(7)]],
+            target_rows: Vec::new(),
+        })
+        .expect("data comparison should succeed");
+
+        // The added row carries the ignored column's real value so generated INSERTs
+        // keep it and NOT NULL columns without defaults do not break the sync.
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0].values.get("version"), Some(&json!(7)));
+    }
+
+    #[test]
+    fn sync_sql_skips_ignored_columns_on_update_but_keeps_them_on_insert() {
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            table_name: "items".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec!["id".to_string(), "name".to_string(), "version".to_string()],
+            key_columns: vec!["id".to_string()],
+            ignored_columns: vec!["version".to_string()],
+            column_info: Vec::new(),
+            source_rows: vec![
+                vec![json!(1), json!("Ada"), json!(9)],
+                vec![json!(2), json!("Bob"), json!(3)],
+                vec![json!(3), json!("Cara"), json!(5)],
+            ],
+            target_rows: vec![vec![json!(1), json!("Ada Lovelace"), json!(4)], vec![json!(2), json!("Bob"), json!(8)]],
+            database_type: Some(DatabaseType::Postgres),
+        })
+        .expect("data compare preparation should succeed");
+
+        // Row 1 is modified by "name" only: the UPDATE must not rewrite "version".
+        // Row 2 differs only in the ignored "version" column: no statement at all.
+        // Row 3 is missing on the target: the INSERT keeps "version" with its value.
+        assert_eq!(
+            preparation.sync_statements,
+            vec![
+                "INSERT INTO \"public\".\"items\" (\"id\", \"name\", \"version\") VALUES (3, 'Cara', 5);",
+                "UPDATE \"public\".\"items\" SET \"name\" = 'Ada' WHERE \"id\" = 1;",
+            ]
+        );
+        assert_eq!(preparation.result.ignored_only_count, 1);
+        assert_eq!(preparation.result.modified.len(), 1);
+    }
+
+    #[test]
+    fn oracle_family_inserts_one_added_row_per_statement() {
+        // Oracle-family servers accept a single row per `INSERT … VALUES`, so the
+        // batched list raised `ORA-00933: SQL command not properly ended` (#15442).
+        for database_type in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            let preparation = prepare_data_compare(DataComparePreparationOptions {
+                table_name: "role_oper_func".to_string(),
+                schema: Some("HOPS".to_string()),
+                columns: vec!["ROLE_ID".to_string(), "OPER_ID".to_string(), "FUNC_ID".to_string()],
+                key_columns: vec!["ROLE_ID".to_string(), "OPER_ID".to_string(), "FUNC_ID".to_string()],
+                ignored_columns: Vec::new(),
+                column_info: Vec::new(),
+                source_rows: vec![
+                    vec![json!(1), json!(2), json!(10)],
+                    vec![json!(1), json!(2), json!(11)],
+                    vec![json!(1), json!(2), json!(12)],
+                ],
+                target_rows: Vec::new(),
+                database_type: Some(database_type),
+            })
+            .expect("data compare preparation should succeed");
+
+            assert_eq!(
+                preparation.sync_statements,
+                vec![
+                    "INSERT INTO \"HOPS\".\"role_oper_func\" (\"ROLE_ID\", \"OPER_ID\", \"FUNC_ID\") \
+                     VALUES (1, 2, 10);",
+                    "INSERT INTO \"HOPS\".\"role_oper_func\" (\"ROLE_ID\", \"OPER_ID\", \"FUNC_ID\") \
+                     VALUES (1, 2, 11);",
+                    "INSERT INTO \"HOPS\".\"role_oper_func\" (\"ROLE_ID\", \"OPER_ID\", \"FUNC_ID\") \
+                     VALUES (1, 2, 12);",
+                ],
+                "{database_type:?}"
+            );
+        }
+    }
+
+    #[test]
     fn generates_data_synchronization_sql() {
         let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
             table_name: "users".to_string(),
             schema: Some("public".to_string()),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
@@ -1974,6 +2524,7 @@ mod tests {
     #[test]
     fn postgres_sync_omits_generated_columns_but_keeps_identity_columns() {
         let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
             table_name: "generated_column_sync_test".to_string(),
             schema: Some("public".to_string()),
             columns: vec!["id".to_string(), "quantity".to_string(), "total_price".to_string()],
@@ -1996,10 +2547,144 @@ mod tests {
         assert_eq!(
             preparation.sync_sql,
             [
-                "INSERT INTO \"public\".\"generated_column_sync_test\" (\"id\", \"quantity\") VALUES (1, 2);",
+                "INSERT INTO \"public\".\"generated_column_sync_test\" (\"id\", \"quantity\") OVERRIDING SYSTEM VALUE VALUES (1, 2);",
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"generated_column_sync_test\"', 'id')::regclass, GREATEST(COALESCE(MAX(\"id\"::bigint), 0), 1), MAX(\"id\"::bigint) IS NOT NULL) FROM \"public\".\"generated_column_sync_test\";",
                 "UPDATE \"public\".\"generated_column_sync_test\" SET \"quantity\" = 3 WHERE \"id\" = 2;",
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn postgres_sync_resets_serial_sequences_after_inserts() {
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
+            table_name: "migration".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec!["id".to_string(), "legacy_id".to_string(), "name".to_string()],
+            key_columns: vec!["id".to_string()],
+            column_info: vec![
+                data_compare_column_with_extra("id", "integer", "serial"),
+                DataGridColumnInfo {
+                    column_default: Some("nextval('legacy_seq'::regclass)".to_string()),
+                    ..data_compare_column("legacy_id", "bigint")
+                },
+                data_compare_column("name", "text"),
+            ],
+            source_rows: vec![vec![json!(5), json!(9), json!("add_column")]],
+            target_rows: Vec::new(),
+            database_type: Some(DatabaseType::Postgres),
+        })
+        .expect("data compare preparation should succeed");
+
+        assert_eq!(
+            preparation.sync_statements,
+            vec![
+                "INSERT INTO \"public\".\"migration\" (\"id\", \"legacy_id\", \"name\") VALUES (5, 9, 'add_column');",
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"migration\"', 'id')::regclass, GREATEST(COALESCE(MAX(\"id\"::bigint), 0), 1), MAX(\"id\"::bigint) IS NOT NULL) FROM \"public\".\"migration\";",
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"migration\"', 'legacy_id')::regclass, GREATEST(COALESCE(MAX(\"legacy_id\"::bigint), 0), 1), MAX(\"legacy_id\"::bigint) IS NOT NULL) FROM \"public\".\"migration\";",
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_sync_sequence_reset_casts_non_integer_columns_to_bigint() {
+        // A nextval-backed column does not have to be an integer column; without the
+        // ::bigint cast COALESCE(MAX(text), 0) fails to resolve types at run time.
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
+            table_name: "legacy_shapes".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec!["id".to_string(), "legacy_ref".to_string()],
+            key_columns: vec!["id".to_string()],
+            column_info: vec![
+                data_compare_column_with_extra("id", "integer", "serial"),
+                DataGridColumnInfo {
+                    column_default: Some("nextval('legacy_ref_seq'::regclass)::text".to_string()),
+                    ..data_compare_column("legacy_ref", "text")
+                },
+            ],
+            source_rows: vec![vec![json!(1), json!("7")]],
+            target_rows: Vec::new(),
+            database_type: Some(DatabaseType::Postgres),
+        })
+        .expect("data compare preparation should succeed");
+
+        let reset = preparation
+            .sync_statements
+            .iter()
+            .find(|statement| statement.contains("setval") && statement.contains("\"legacy_ref\""))
+            .expect("sequence reset for legacy_ref");
+        assert_eq!(
+            *reset,
+            "SELECT setval(pg_get_serial_sequence('\"public\".\"legacy_shapes\"', 'legacy_ref')::regclass, GREATEST(COALESCE(MAX(\"legacy_ref\"::bigint), 0), 1), MAX(\"legacy_ref\"::bigint) IS NOT NULL) FROM \"public\".\"legacy_shapes\";"
+        );
+    }
+
+    #[test]
+    fn postgres_sync_skips_sequence_reset_without_inserts() {
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
+            table_name: "migration".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec!["id".to_string(), "name".to_string()],
+            key_columns: vec!["id".to_string()],
+            column_info: vec![
+                data_compare_column_with_extra("id", "integer", "serial"),
+                data_compare_column("name", "text"),
+            ],
+            source_rows: vec![vec![json!(1), json!("new")]],
+            target_rows: vec![vec![json!(1), json!("old")], vec![json!(2), json!("gone")]],
+            database_type: Some(DatabaseType::Postgres),
+        })
+        .expect("data compare preparation should succeed");
+
+        assert!(preparation.sync_statements.iter().all(|statement| !statement.contains("setval")));
+    }
+
+    #[test]
+    fn sqlserver_sync_wraps_identity_inserts_with_identity_insert() {
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
+            table_name: "migration".to_string(),
+            schema: Some("dbo".to_string()),
+            columns: vec!["id".to_string(), "name".to_string()],
+            key_columns: vec!["id".to_string()],
+            column_info: vec![
+                data_compare_column_with_extra("id", "int", "identity(1,1)"),
+                data_compare_column("name", "nvarchar(100)"),
+            ],
+            source_rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("Bob")]],
+            target_rows: vec![vec![json!(2), json!("Bobby")]],
+            database_type: Some(DatabaseType::SqlServer),
+        })
+        .expect("data compare preparation should succeed");
+
+        assert_eq!(
+            preparation.sync_statements[0],
+            "SET IDENTITY_INSERT [dbo].[migration] ON;\nINSERT INTO [dbo].[migration] ([id], [name]) VALUES (1, N'Ada');\nSET IDENTITY_INSERT [dbo].[migration] OFF;"
+        );
+        assert!(!preparation.sync_statements[1].contains("IDENTITY_INSERT"));
+    }
+
+    #[test]
+    fn sqlserver_sync_skips_identity_insert_without_identity_columns() {
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
+            table_name: "migration".to_string(),
+            schema: Some("dbo".to_string()),
+            columns: vec!["id".to_string(), "name".to_string()],
+            key_columns: vec!["id".to_string()],
+            column_info: vec![data_compare_column("id", "int"), data_compare_column("name", "nvarchar(100)")],
+            source_rows: vec![vec![json!(1), json!("Ada")]],
+            target_rows: Vec::new(),
+            database_type: Some(DatabaseType::SqlServer),
+        })
+        .expect("data compare preparation should succeed");
+
+        assert_eq!(
+            preparation.sync_statements,
+            vec!["INSERT INTO [dbo].[migration] ([id], [name]) VALUES (1, N'Ada');"]
         );
     }
 
@@ -2017,6 +2702,7 @@ mod tests {
                     "generated always as (base_value + 1) stored",
                 )],
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: vec![
                         DataCompareRow {
                             key: "0".to_string(),
@@ -2066,6 +2752,7 @@ mod tests {
                     ),
                 ],
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     modified: vec![DataCompareModifiedRow {
@@ -2132,7 +2819,7 @@ mod tests {
                         "generated always as (quantity * unit_price) stored",
                     ),
                 ],
-                diff: DataCompareResult { added: Vec::new(), removed: Vec::new(), modified },
+                diff: DataCompareResult { added: Vec::new(), removed: Vec::new(), modified, ignored_only_count: 0 },
                 database_type: Some(DatabaseType::Postgres),
                 pre_sync_statements: Vec::new(),
                 sync_eligible: true,
@@ -2148,6 +2835,7 @@ mod tests {
     #[test]
     fn sync_keeps_legacy_writes_when_column_metadata_is_missing() {
         let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
             table_name: "generated_column_sync_test".to_string(),
             schema: Some("public".to_string()),
             columns: vec!["id".to_string(), "total_price".to_string()],
@@ -2166,6 +2854,7 @@ mod tests {
     #[test]
     fn generates_mysql_bit_synchronization_literals_without_string_quotes() {
         let preparation = prepare_data_compare(DataComparePreparationOptions {
+            ignored_columns: Vec::new(),
             table_name: "users".to_string(),
             schema: None,
             columns: vec!["id".to_string(), "enabled".to_string(), "flags".to_string()],
@@ -2194,6 +2883,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: vec![DataCompareRow {
                         key: "1".to_string(),
                         key_values: HashMap::from([(String::from("id"), json!(1))]),
@@ -2240,6 +2930,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: vec![DataCompareRow {
                         key: "1".to_string(),
                         key_values: HashMap::from([(String::from("id"), json!(1))]),
@@ -2269,6 +2960,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: vec![
                         DataCompareRow {
                             key: "1".to_string(),
@@ -2311,6 +3003,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     modified: vec![
@@ -2369,6 +3062,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: Vec::new(),
                     removed: vec![
                         DataCompareRow {
@@ -2402,6 +3096,7 @@ mod tests {
         let column_info = Vec::new();
         let pre_sync_statements = vec!["CREATE TABLE \"public\".\"users\" (\"id\" integer);".to_string()];
         let diff = DataCompareResult {
+            ignored_only_count: 0,
             added: vec![DataCompareRow {
                 key: "1".to_string(),
                 key_values: HashMap::from([(String::from("id"), json!(1))]),
@@ -2467,6 +3162,7 @@ mod tests {
                 key_columns: Vec::new(),
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: vec![DataCompareRow {
                         key: "0".to_string(),
                         key_values: HashMap::new(),
@@ -2505,6 +3201,7 @@ mod tests {
                     ),
                 ],
                 diff: DataCompareResult {
+                    ignored_only_count: 0,
                     added: vec![DataCompareRow {
                         key: "0".to_string(),
                         key_values: HashMap::new(),
@@ -2535,6 +3232,7 @@ mod tests {
     #[test]
     fn requires_at_least_one_key_column() {
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string()],
             key_columns: Vec::new(),
             source_rows: vec![vec![json!(1)]],
@@ -2548,6 +3246,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_row_keys_with_key_column_context() {
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![vec![json!(1), json!("Ada")], vec![json!(1), json!("Ada Clone")]],
@@ -2561,6 +3260,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_target_keys_with_key_column_context() {
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![vec![json!(1), json!("Ada")]],
@@ -2574,6 +3274,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_composite_keys_with_both_columns_named() {
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["tenant_id".to_string(), "user_id".to_string(), "name".to_string()],
             key_columns: vec!["tenant_id".to_string(), "user_id".to_string()],
             source_rows: vec![
@@ -2601,6 +3302,7 @@ mod tests {
                     let unique = vec![vec![json!(1), json!("Ada")]];
                     let (source_rows, target_rows) = if label == "source" { (kept, unique) } else { (unique, kept) };
                     let result = compare_data_rows(CompareDataRowsOptions {
+                        ignored_columns: Vec::new(),
                         columns: vec!["id".to_string(), "name".to_string()],
                         key_columns: vec!["id".to_string()],
                         source_rows,
@@ -2650,6 +3352,7 @@ mod tests {
             assert_eq!(kept, rows);
             for (source_rows, target_rows) in [(kept.clone(), rows.clone()), (rows.clone(), kept)] {
                 let diff = compare_data_rows(CompareDataRowsOptions {
+                    ignored_columns: Vec::new(),
                     columns: vec!["id".to_string(), "name".to_string()],
                     key_columns: vec!["id".to_string()],
                     source_rows,
@@ -2682,6 +3385,7 @@ mod tests {
             );
             assert_eq!(source_rows.len(), target_rows.len());
             let error = compare_data_rows(CompareDataRowsOptions {
+                ignored_columns: Vec::new(),
                 columns: vec!["id".to_string(), "name".to_string()],
                 key_columns: vec!["id".to_string()],
                 source_rows,
@@ -2701,6 +3405,7 @@ mod tests {
             let rows = vec![vec![json!(1), json!("Ada")]; 2];
             let (source_rows, target_rows) = if label == "source" { (rows, Vec::new()) } else { (Vec::new(), rows) };
             let error = compare_data_rows(CompareDataRowsOptions {
+                ignored_columns: Vec::new(),
                 columns: vec!["id".to_string(), "name".to_string()],
                 key_columns: vec!["id".to_string()],
                 source_rows,
@@ -2783,6 +3488,7 @@ mod tests {
         // The raw multi-branch sampling result currently trips the duplicate
         // check - this is the #9095 false positive.
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: overlapped.clone(),
@@ -2808,6 +3514,7 @@ mod tests {
         );
 
         let diff = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: deduped,
@@ -2837,6 +3544,7 @@ mod tests {
         assert_eq!(kept, rows);
 
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: kept,
@@ -2856,6 +3564,7 @@ mod tests {
         assert_eq!(kept, rows);
 
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: rows,
@@ -2874,6 +3583,7 @@ mod tests {
         let big_b = json!("-9222269855922960742");
 
         let no_diff = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![vec![big_a.clone(), json!("Alpha")]],
@@ -2883,6 +3593,7 @@ mod tests {
         assert!(no_diff.added.is_empty() && no_diff.removed.is_empty() && no_diff.modified.is_empty());
 
         let diff = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![vec![big_b.clone(), json!("Beta")]],
@@ -2896,6 +3607,7 @@ mod tests {
     #[test]
     fn bigint_duplicate_error_reports_exact_string_key() {
         let err = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![
@@ -2906,6 +3618,64 @@ mod tests {
         })
         .expect_err("duplicate bigint keys should fail");
         assert!(err.contains("Duplicate source key for column(s) [id]: \"-9222269855922960743\""), "{err}");
+    }
+
+    #[test]
+    fn builds_keyset_page_sql_for_sqlserver() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let keys = vec!["id".to_string()];
+        assert_eq!(
+            build_keyset_data_compare_select_sql(DatabaseType::SqlServer, "dbo", "users", &columns, &keys, 500, None),
+            "SELECT TOP (500) [id], [name] FROM [dbo].[users] ORDER BY [id] ASC"
+        );
+        let boundary = keyset_boundary_literals(DatabaseType::SqlServer, &[json!(42), json!("x")], &[0]).unwrap();
+        assert_eq!(
+            build_keyset_data_compare_select_sql(
+                DatabaseType::SqlServer,
+                "dbo",
+                "users",
+                &columns,
+                &keys,
+                500,
+                Some(&boundary)
+            ),
+            "SELECT TOP (500) [id], [name] FROM [dbo].[users] WHERE [id] > 42 ORDER BY [id] ASC"
+        );
+    }
+
+    #[test]
+    fn builds_keyset_page_sql_for_composite_keys() {
+        let columns = vec!["a".to_string(), "b".to_string(), "v".to_string()];
+        let keys = vec!["a".to_string(), "b".to_string()];
+        let row = [json!(1), json!("o'k"), json!("v")];
+        let mssql = keyset_boundary_literals(DatabaseType::SqlServer, &row, &[0, 1]).unwrap();
+        assert_eq!(
+            build_keyset_data_compare_select_sql(DatabaseType::SqlServer, "dbo", "t", &columns, &keys, 10, Some(&mssql)),
+            "SELECT TOP (10) [a], [b], [v] FROM [dbo].[t] WHERE ([a] > 1) OR ([a] = 1 AND [b] > N'o''k') ORDER BY [a] ASC, [b] ASC"
+        );
+        let pg = keyset_boundary_literals(DatabaseType::Postgres, &row, &[0, 1]).unwrap();
+        assert_eq!(
+            build_keyset_data_compare_select_sql(DatabaseType::Postgres, "public", "t", &columns, &keys, 10, Some(&pg)),
+            "SELECT \"a\", \"b\", \"v\" FROM \"public\".\"t\" WHERE (\"a\", \"b\") > (1, 'o''k') ORDER BY \"a\" ASC, \"b\" ASC LIMIT 10;"
+        );
+    }
+
+    #[test]
+    fn keyset_paging_only_applies_to_supported_databases_with_selected_keys() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let keys = vec!["id".to_string()];
+        assert_eq!(keyset_key_indexes(DatabaseType::Postgres, &columns, &keys), Some(vec![0]));
+        assert_eq!(keyset_key_indexes(DatabaseType::SqlServer, &columns, &keys), Some(vec![0]));
+        assert_eq!(keyset_key_indexes(DatabaseType::Mysql, &columns, &keys), None);
+        assert_eq!(keyset_key_indexes(DatabaseType::Postgres, &columns, &[]), None);
+        assert_eq!(keyset_key_indexes(DatabaseType::Postgres, &[], &keys), None);
+    }
+
+    #[test]
+    fn keyset_boundary_rejects_null_and_structured_keys() {
+        assert_eq!(keyset_boundary_literals(DatabaseType::Postgres, &[Value::Null], &[0]), None);
+        assert_eq!(keyset_boundary_literals(DatabaseType::Postgres, &[json!({"a": 1})], &[0]), None);
+        assert_eq!(keyset_boundary_literals(DatabaseType::Postgres, &[json!(1)], &[3]), None);
     }
 
     #[test]
@@ -2937,6 +3707,36 @@ mod tests {
                 0,
             ),
             "SELECT TOP (50) [id], [name] FROM [dbo].[users] ORDER BY [id] ASC"
+        );
+    }
+
+    #[test]
+    fn builds_backend_table_select_sql_for_teradata_top_and_row_number_pages() {
+        // #14604: Teradata rejects `LIMIT`; bounded reads cap with `TOP n` and page
+        // past the first batch through a `ROW_NUMBER()` derived table.
+        assert_eq!(
+            build_data_compare_select_sql(
+                DatabaseType::Teradata,
+                "sales",
+                "orders",
+                &["id".to_string(), "name".to_string()],
+                &["id".to_string()],
+                500,
+                0,
+            ),
+            "SELECT TOP 500 \"id\", \"name\" FROM \"sales\".\"orders\" ORDER BY \"id\" ASC"
+        );
+        assert_eq!(
+            build_data_compare_select_sql(
+                DatabaseType::Teradata,
+                "sales",
+                "orders",
+                &["id".to_string(), "name".to_string()],
+                &["id".to_string()],
+                500,
+                500,
+            ),
+            "SELECT * FROM (SELECT \"id\", \"name\", ROW_NUMBER() OVER (ORDER BY \"id\" ASC) AS \"__dbx_row_num\" FROM \"sales\".\"orders\") \"dbx_page\" WHERE \"__dbx_row_num\" > 500 AND \"__dbx_row_num\" <= 1000 ORDER BY \"__dbx_row_num\""
         );
     }
 
@@ -3176,6 +3976,26 @@ mod tests {
             "SELECT TOP (3) [id], [tenant_id], [name] FROM [dbo].[EVENTS] ORDER BY [id] DESC, [tenant_id] DESC"
         ));
         assert!(!sql.contains(" LIMIT "));
+    }
+
+    #[test]
+    fn builds_gbase8s_hybrid_sampling_sql_with_first() {
+        for database_type in [DatabaseType::Informix, DatabaseType::Gbase8s] {
+            let sql = build_sampling_select_sql(
+                database_type,
+                "gbasedbt",
+                "events",
+                &["id".to_string(), "name".to_string()],
+                &["id".to_string()],
+                &SamplingStrategy::Hybrid,
+                10,
+            );
+
+            assert!(sql.contains("SELECT FIRST 5 id, name FROM"));
+            assert!(sql.contains("SELECT FIRST 2 id, name FROM"));
+            assert!(sql.contains("SELECT FIRST 3 id, name FROM"));
+            assert!(!sql.contains(" LIMIT "));
+        }
     }
 
     #[test]
