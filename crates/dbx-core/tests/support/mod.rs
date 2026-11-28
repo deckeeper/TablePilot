@@ -158,7 +158,11 @@ pub fn postgres_test_config(id: &str, port: u16) -> ConnectionConfig {
         transport_layers: Vec::new(),
         connect_timeout_secs: 5,
         query_timeout_secs: 30,
+
+        write_timeout_secs: 0,
         idle_timeout_secs: 60,
+        manual_transaction_timeout_secs: 300,
+        idle_disconnect_secs: 0,
         keepalive_interval_secs: 0,
         ssl: false,
         ca_cert_path: String::new(),
@@ -196,9 +200,12 @@ pub fn postgres_test_config(id: &str, port: u16) -> ConnectionConfig {
         is_production: false,
         production_databases: vec![],
         production_badge_scope: None,
+        watermark: None,
         show_system_schemas: false,
         sidebar_auto_load_all_tables: false,
         show_database_links: None,
+        show_native_jobs: None,
+        show_user_admin: None,
         database_info: None,
     }
 }

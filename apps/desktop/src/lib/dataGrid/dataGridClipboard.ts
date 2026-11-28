@@ -48,21 +48,21 @@ export function clearDataGridClipboardCopy(): void {
 }
 
 export function rememberDataGridClipboardCopy(text: string, rows: readonly (readonly unknown[])[], header?: readonly unknown[]): void {
-  // Preserve the logical grid matrix because plain TSV cannot escape embedded tabs or newlines.
+  // Preserve the logical grid matrix to retain SQL NULLs and literal display text.
   const headerRows = header ? [header.map((value) => displayCellValue(value as CellValue))] : [];
   const copiedRows = rows.map((row) => row.map((value) => (value === null ? null : displayCellValue(value as CellValue))));
   internalClipboardCopy = { text, rows: [...headerRows, ...copiedRows], writeRevision: getClipboardWriteRevision() };
 }
 
-export function parseDataGridClipboard(text: string, limits: DataGridClipboardLimits = {}): Array<Array<string | null>> {
-  return finishDataGridRowPreparation(prepareDataGridClipboard(text, limits));
+export function parseDataGridClipboard(text: string, limits: DataGridClipboardLimits = {}, nullText = ""): Array<Array<string | null>> {
+  return finishDataGridRowPreparation(prepareDataGridClipboard(text, limits, nullText));
 }
 
-export function parseDataGridClipboardInBatches(text: string, options: DataGridRowPreparationOptions = {}, limits: DataGridClipboardLimits = {}): Promise<Array<Array<string | null>> | null> {
-  return runDataGridRowPreparation(prepareDataGridClipboard(text, limits), options, null);
+export function parseDataGridClipboardInBatches(text: string, options: DataGridRowPreparationOptions = {}, limits: DataGridClipboardLimits = {}, nullText = ""): Promise<Array<Array<string | null>> | null> {
+  return runDataGridRowPreparation(prepareDataGridClipboard(text, limits, nullText), options, null);
 }
 
-function* prepareDataGridClipboard(text: string, limits: DataGridClipboardLimits): Generator<DataGridRowPreparationProgress, Array<Array<string | null>>> {
+function* prepareDataGridClipboard(text: string, limits: DataGridClipboardLimits, nullText = "", parseQuotedFields = true): Generator<DataGridRowPreparationProgress, Array<Array<string | null>>> {
   const maxRows = limits.maxRows ?? 100_000;
   const maxCells = limits.maxCells ?? 1_000_000;
   let cells = 0;
@@ -81,11 +81,18 @@ function* prepareDataGridClipboard(text: string, limits: DataGridClipboardLimits
   }
   let row: Array<string | null> = [];
   let start = 0;
+  let inQuotes = false;
+  let quotedEnd = -1;
   let nextYield = DATA_GRID_CLIPBOARD_BATCH_CHARS;
   if (text.length > DATA_GRID_CLIPBOARD_BATCH_CHARS) yield { completed: 0, total: text.length, phase: "parsing" };
+  // Only the configured NULL text becomes NULL again; every other field — an
+  // empty one included — keeps its literal text so a pasted '' stays '' (issue #12727).
+  const nullTextIsConfigured = nullText.length > 0;
   const appendCell = (end: number) => {
     if (rows.length >= maxRows || ++cells > maxCells) throw new DataGridClipboardCapacityError();
-    row.push(text.slice(start, end));
+    const quoted = quotedEnd >= start;
+    const cell = quoted ? text.slice(start + 1, quotedEnd).replace(/""/g, '"') : text.slice(start, end);
+    row.push(!quoted && nullTextIsConfigured && cell === nullText ? null : cell);
   };
   for (let index = 0; index < text.length; index++) {
     if (index >= nextYield) {
@@ -93,6 +100,20 @@ function* prepareDataGridClipboard(text: string, limits: DataGridClipboardLimits
       nextYield = index + DATA_GRID_CLIPBOARD_BATCH_CHARS;
     }
     const char = text[index];
+    if (parseQuotedFields && index === start && char === '"') {
+      inQuotes = true;
+      continue;
+    }
+    if (inQuotes) {
+      if (char === '"') {
+        if (text[index + 1] === '"') index++;
+        else if (index + 1 === text.length || /[\t\r\n]/.test(text[index + 1]!)) {
+          inQuotes = false;
+          quotedEnd = index;
+        }
+      }
+      continue;
+    }
     if (char !== "\t" && char !== "\r" && char !== "\n") continue;
     appendCell(index);
     if (char !== "\t") {
@@ -102,7 +123,11 @@ function* prepareDataGridClipboard(text: string, limits: DataGridClipboardLimits
       if (rows.length % 1000 === 0) yield { completed: index + 1, total: text.length, phase: "parsing" };
     }
     start = index + 1;
+    quotedEnd = -1;
   }
+  // Incomplete quoting can be ordinary pasted text. Keep the previous literal
+  // delimiter behavior rather than merging the remaining rows into one cell.
+  if (inQuotes) return yield* prepareDataGridClipboard(text, limits, nullText, false);
   if (start < text.length || row.length || !rows.length) {
     appendCell(text.length);
     rows.push(row);
@@ -110,6 +135,10 @@ function* prepareDataGridClipboard(text: string, limits: DataGridClipboardLimits
   return rows;
 }
 
+// Maps the in-bounds portion of a clipboard matrix onto overwrite cells.
+// Callers are responsible for splitting out any rows beyond `maxRows` and
+// appending those as new rows themselves, so clipboard data is never silently
+// dropped (issue #15263).
 export function planDataGridPaste(rows: readonly (readonly (string | null)[])[], maxRows: number, maxColumns: number): DataGridPasteCell[] {
   if (maxRows <= 0 || maxColumns <= 0) return [];
   const cells: DataGridPasteCell[] = [];

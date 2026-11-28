@@ -24,7 +24,7 @@ export const deleteConnectionsWithGroup = ref(false);
 export const showTableVGroupDialog = ref(false);
 export const tableVGroupName = ref("");
 /** Scope snapshot + creation payload for the table vgroup naming dialog. */
-export const tableVGroupDialogScope = shallowRef<TreeNode | null>(null);
+export const tableVGroupDialogScope = shallowRef<(TreeNode & TableVGroupScope) | null>(null);
 export const tableVGroupDialogParentGroupId = ref<string | null>(null);
 export const tableVGroupDialogTableNames = ref<string[]>([]);
 export const showTableVGroupDeleteConfirm = ref(false);
@@ -56,6 +56,8 @@ export const batchMysqlAutoIncrementPreviewSql = ref("");
 export const showRenameObjectDialog = ref(false);
 export const renameObjectName = ref("");
 export const renameObjectError = ref("");
+/** Non-blocking caveat shown above the rename preview (e.g. MySQL grants that will not follow the rename). */
+export const renameObjectWarning = ref("");
 export const renameObjectPreviewSql = ref("");
 export const dropTablePreviewSql = ref("");
 export const dropTableCascade = ref(false);
@@ -120,6 +122,8 @@ export const showDropDatabaseConfirm = ref(false);
 export const dropDatabaseLoading = ref(false);
 export const showDropMongoCollectionConfirm = ref(false);
 export const dropMongoCollectionLoading = ref(false);
+export const showClearMongoCollectionConfirm = ref(false);
+export const clearMongoCollectionLoading = ref(false);
 export const showRenameMongoCollectionDialog = ref(false);
 export const renameMongoCollectionName = ref("");
 export const renameMongoCollectionError = ref("");

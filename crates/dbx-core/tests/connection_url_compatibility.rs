@@ -1,6 +1,7 @@
 use dbx_core::models::connection::{
-    default_connect_timeout_secs, default_idle_timeout_secs, default_keepalive_interval_secs,
-    default_query_timeout_secs, default_redis_key_separator, ConnectionConfig, DatabaseType,
+    default_connect_timeout_secs, default_idle_disconnect_secs, default_idle_timeout_secs,
+    default_keepalive_interval_secs, default_manual_transaction_timeout_secs, default_query_timeout_secs,
+    default_redis_key_separator, ConnectionConfig, DatabaseType,
 };
 use std::str::FromStr;
 
@@ -29,13 +30,19 @@ fn mysql_config(username: &str, password: &str, database: Option<&str>) -> Conne
         show_system_schemas: false,
         sidebar_auto_load_all_tables: false,
         show_database_links: None,
+        show_native_jobs: None,
+        show_user_admin: None,
         attached_databases: Vec::new(),
         init_script: None,
         color: None,
         transport_layers: Vec::new(),
         connect_timeout_secs: default_connect_timeout_secs(),
         query_timeout_secs: default_query_timeout_secs(),
+
+        write_timeout_secs: 0,
         idle_timeout_secs: default_idle_timeout_secs(),
+        manual_transaction_timeout_secs: default_manual_transaction_timeout_secs(),
+        idle_disconnect_secs: default_idle_disconnect_secs(),
         keepalive_interval_secs: default_keepalive_interval_secs(),
         ssl: false,
         ca_cert_path: String::new(),
@@ -73,6 +80,7 @@ fn mysql_config(username: &str, password: &str, database: Option<&str>) -> Conne
         is_production: false,
         production_databases: vec![],
         production_badge_scope: None,
+        watermark: None,
         database_info: None,
     }
 }

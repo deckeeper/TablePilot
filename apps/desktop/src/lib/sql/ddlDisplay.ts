@@ -1,10 +1,11 @@
-import { requiresDamengIdentifierQuote, requiresMysqlIdentifierQuote, requiresOracleIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
+import { requiresClickhouseIdentifierQuote, requiresDamengIdentifierQuote, requiresMysqlIdentifierQuote, requiresOracleIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
 import { tokenIsIdentifier, tokenizeSqlSemantic, unquoteSqlSemanticIdentifier } from "@/lib/sql/semantic/tokens";
 import type { SqlSemanticToken } from "@/lib/sql/semantic/types";
 import { formatSqlForDisplay, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
-import { formatStarRocksDdlForDisplay } from "@/lib/sql/starrocksDdlDisplay";
+import { compactDdlSql } from "@/lib/sql/ddlCompact";
+import { formatStarRocksDdlForDisplay, formatStarRocksViewForDisplay } from "@/lib/sql/starrocksDdlDisplay";
 import { dropsSchemaQualifier, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
 import type { DatabaseType } from "@/types/database";
 
@@ -30,8 +31,9 @@ type DdlColumnAttributePositions = {
 function canRenderUnquoted(identifier: string, dialect: SqlFormatDialect): boolean {
   switch (dialect) {
     case "mysql":
-    case "clickhouse":
       return !requiresMysqlIdentifierQuote(identifier);
+    case "clickhouse":
+      return !requiresClickhouseIdentifierQuote(identifier);
     case "postgres":
     case "sqlite":
     case "duckdb":
@@ -389,8 +391,7 @@ function findLineIndex(lineStarts: number[], position: number): number {
   return 0;
 }
 
-function findCreateTableBody(sql: string, dialect: SqlFormatDialect): { start: number; end: number } | undefined {
-  const tokens = tokenizeSqlSemantic(sql, dialect);
+function findCreateTableBody(tokens: readonly SqlSemanticToken[]): DdlSpan | undefined {
   const createIndex = tokens.findIndex((token) => token.kind === "word" && token.normalized === "create");
   if (createIndex < 0) return undefined;
 
@@ -413,6 +414,29 @@ function findCreateTableBody(sql: string, dialect: SqlFormatDialect): { start: n
   const closing = tokens.find((token, index) => index > openingIndex && token.kind === "punctuation" && token.text === ")" && token.depth === opening.depth);
   if (!closing) return undefined;
   return { start: opening.span.end, end: closing.span.start };
+}
+
+/** Removes only the table counter from a MySQL CREATE TABLE statement. */
+export function mysqlDdlWithoutAutoIncrementValue(sql: string): string | undefined {
+  const tokens = tokenizeSqlSemantic(sql, "mysql", { mysqlDashCommentRequiresWhitespace: true, mysqlBackslashEscape: true });
+  if (tokens.some((token) => token.closed === false)) return undefined;
+  const body = findCreateTableBody(tokens);
+  if (!body) return undefined;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const option = tokens[index]!;
+    if (option.span.start <= body.end || option.depth !== 0) continue;
+    if (option.text === ";" || (option.kind === "word" && ["partition", "as", "select"].includes(option.normalized))) break;
+    if (option.kind !== "word" || option.normalized !== "auto_increment") continue;
+    const equals = tokens[index + 1];
+    const value = tokens[index + 2];
+    if (equals?.text !== "=" || value?.kind !== "number" || !/^\d+$/.test(value.text)) continue;
+    // Only consume horizontal separation before the option, keeping newlines that end comments.
+    let start = option.span.start;
+    while (start > 0 && (sql[start - 1] === " " || sql[start - 1] === "\t")) start -= 1;
+    return sql.slice(0, start) + sql.slice(value.span.end);
+  }
+  return undefined;
 }
 
 function readColumnAlignment(line: string, lineIndex: number, dialect: SqlFormatDialect): DdlColumnAlignment | undefined {
@@ -455,7 +479,7 @@ function findColumnAttributePositions(line: string, dialect: SqlFormatDialect): 
 }
 
 export function uppercaseDdlColumnTypes(sql: string, dialect: SqlFormatDialect): string {
-  const body = findCreateTableBody(sql, dialect);
+  const body = findCreateTableBody(tokenizeSqlSemantic(sql, dialect));
   if (!body) return sql;
 
   const lines = sql.split("\n");
@@ -503,7 +527,7 @@ function alignColumnAttribute(lines: string[], columns: DdlColumnAlignment[], at
 }
 
 export function alignDdlColumnDefinitions(sql: string, dialect: SqlFormatDialect): string {
-  const body = findCreateTableBody(sql, dialect);
+  const body = findCreateTableBody(tokenizeSqlSemantic(sql, dialect));
   if (!body) return sql;
 
   const lines = sql.split("\n");
@@ -561,6 +585,7 @@ export interface DdlDisplayFormatOptions {
    * reloading the DDL.
    */
   excludeDdlStorage?: boolean;
+  compactDdlSql?: boolean;
 }
 
 /**
@@ -573,7 +598,8 @@ export function applyDdlDisplayPreferences(sql: string, options: DdlDisplayForma
   const qualified = applyDdlDatabaseQualifier(sql, options.dialect, options.databaseType, options.includeDatabaseName, options.database, options.catalog);
   const quoted = options.quoteIdentifiers ? qualified : omitDdlIdentifierQuotes(qualified, options.dialect);
   const aligned = options.databaseType === "starrocks" ? formatStarRocksDdlForDisplay(quoted) : alignDdlColumnDefinitions(uppercaseDdlColumnTypes(quoted, options.dialect), options.dialect);
-  return options.excludeDdlStorage ? applyDdlStoragePreference(aligned, options.databaseType) : aligned;
+  const filtered = options.excludeDdlStorage ? applyDdlStoragePreference(aligned, options.databaseType) : aligned;
+  return options.compactDdlSql ? compactDdlSql(filtered, options.databaseType) : filtered;
 }
 
 /**
@@ -583,5 +609,6 @@ export function applyDdlDisplayPreferences(sql: string, options: DdlDisplayForma
  * result of the object DDL fetch straight through it.
  */
 export async function formatDdlForDisplay(ddl: string, options: DdlDisplayFormatOptions, formatter: Partial<SqlFormatterSettings> = DEFAULT_SQL_FORMATTER_SETTINGS): Promise<string> {
-  return applyDdlDisplayPreferences(options.databaseType === "starrocks" ? ddl : await formatSqlForDisplay(ddl, options.dialect, formatter), options);
+  const formatted = options.databaseType === "starrocks" ? await formatStarRocksViewForDisplay(ddl, formatter) : await formatSqlForDisplay(ddl, options.dialect, formatter);
+  return applyDdlDisplayPreferences(formatted, options);
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 // PR-A4/P2 global bottom panel dock (HOST_PLUGIN_UI_SPEC §8.3) — a generic host container:
 // it only provides the panel frame (tab strip, drag-resize height, collapse/maximize/hide) and hosts any plugin's
 // panel webviews, with zero plugin business inside; multi-terminal/shell selection/connection switching all live in the plugin
@@ -114,30 +115,18 @@ onScopeDispose(() => window.removeEventListener("dbx:plugins-changed", onPlugins
 
 async function loadPluginData() {
   try {
+    // Deliberately no ui warm here. A panel plugin's ui build is tens of MB
+    // (io.dbx.ssh ships a ~25 MB single-file html) and the read → decode →
+    // inline pipeline keeps several full-size copies alive while it runs, which
+    // WebKit does not hand back promptly. Warming every panel plugin at startup
+    // (and again on each dbx:plugins-changed) cost hundreds of MB of WebContent
+    // memory for users who never open those panels. The html is loaded when a
+    // panel mounts, or ahead of that by the "+" picker (warmActivePluginPanelHtml).
     plugins.value = await api.listPlugins();
-    schedulePanelUiWarm(plugins.value);
   } catch {
     // Keep the previous list: clearing it flips every panel's
     // `v-if="definitionFor(...)"` false and unmounts live terminal webviews.
   }
-}
-
-// Generic first-open warm (any plugin, any entry point): plugins that declare
-// an open-workbench command with presentation:"panel" get their multi-megabyte
-// ui html read/inlined at idle time, so the FIRST panel the user opens — from
-// the "+" picker, a command menu, or a toolbar placement — mounts on a warm
-// cache instead of paying the pipeline after the click. Idle-scheduled so it
-// never competes with startup traffic; the module LRU bounds memory and
-// getOrLoadPluginUiHtml coalesces with real opens racing the warm.
-function schedulePanelUiWarm(definitions: InstalledPlugin[]) {
-  const candidates = definitions.filter((plugin) => (plugin.manifest.contributions || []).some((contribution) => contribution.type === "command" && contribution.action.type === "open-workbench" && contribution.action.presentation === "panel"));
-  if (!candidates.length) return;
-  const idle: (callback: () => void) => void = typeof window.requestIdleCallback === "function" ? window.requestIdleCallback : (callback) => void window.setTimeout(callback, 2000);
-  idle(() => {
-    for (const plugin of candidates) {
-      void getOrLoadPluginUiHtml(`${plugin.manifest.id}:${plugin.manifest.version}`, plugin.manifest.id).catch(() => undefined);
-    }
-  });
 }
 
 function definitionFor(pluginId: string): InstalledPlugin | undefined {
@@ -274,7 +263,7 @@ function onPlusAction(value: string) {
           host: connection.host,
           port: connection.port,
           username: connection.username,
-          readOnly: connection.read_only === true,
+          readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
         },
       },
     });
@@ -328,6 +317,15 @@ function onPanelOpenWorkbench(entry: (typeof entries.value)[number], _contributi
     commandContext: payload,
   });
   activatePluginDockEntry(id);
+}
+
+function onSetEntryTitle(entry: PluginDockEntry, title: string | null) {
+  if (title && title.trim()) {
+    renamePluginDockEntry(entry.id, title.trim());
+  } else {
+    const contribution = workbenchContributionFor(entry);
+    renamePluginDockEntry(entry.id, contribution?.label || entry.workbenchContributionId);
+  }
 }
 
 // §8.3/§7.4 two-phase close: removing an entry first asks its panel webview to
@@ -638,6 +636,8 @@ onScopeDispose(() => window.removeEventListener("blur", onPlusMenuWindowBlur));
           :plugin="definitionFor(entry.pluginId)!"
           :contribution="workbenchContributionFor(entry)!"
           :context="entry.context"
+          :set-title="(title) => onSetEntryTitle(entry, title)"
+          :get-title="() => entry.title"
           @close-tab="closeEntry(entry.id)"
           @open-workbench="(_pluginId, contributionId, context, options) => onPanelOpenWorkbench(entry, contributionId, context, options)"
         />

@@ -1,5 +1,7 @@
+// @vitest-environment happy-dom
+
 import { describe, expect, it } from "vitest";
-import { floatingArrowOffset, floatingCursorPosition, floatingViewportShift } from "@/lib/common/floatingViewportPosition";
+import { flipFloatingSide, floatingArrowOffset, floatingCursorPosition, floatingSurfaceOverlapsTrigger, floatingViewportShift, visibleTriggerRect } from "@/lib/common/floatingViewportPosition";
 
 describe("floating viewport position", () => {
   it.each([
@@ -34,5 +36,140 @@ describe("floating viewport position", () => {
     expect(floatingArrowOffset(320, -48)).toBe(208);
     expect(floatingArrowOffset(40, 100)).toBe(8);
     expect(floatingArrowOffset(40, -100)).toBe(32);
+  });
+
+  it("flips a side to the opposite edge", () => {
+    expect(flipFloatingSide("top")).toBe("bottom");
+    expect(flipFloatingSide("bottom")).toBe("top");
+    expect(flipFloatingSide("left")).toBe("right");
+    expect(flipFloatingSide("right")).toBe("left");
+  });
+
+  it("detects a surface that covers its own trigger", () => {
+    const trigger = { left: 100, right: 200, top: 8, bottom: 32 };
+    // Clamped back down over the trigger (#15331).
+    expect(floatingSurfaceOverlapsTrigger({ left: 90, right: 210, top: 8, bottom: 32 }, trigger)).toBe(true);
+    // A partial overlap still swallows the middle of the trigger.
+    expect(floatingSurfaceOverlapsTrigger({ left: 90, right: 210, top: 20, bottom: 44 }, trigger)).toBe(true);
+    // Sitting exactly above or below the trigger is fine.
+    expect(floatingSurfaceOverlapsTrigger({ left: 90, right: 210, top: -16, bottom: 8 }, trigger)).toBe(false);
+    expect(floatingSurfaceOverlapsTrigger({ left: 90, right: 210, top: 32, bottom: 56 }, trigger)).toBe(false);
+    // Horizontally clear also counts as no overlap.
+    expect(floatingSurfaceOverlapsTrigger({ left: 200, right: 320, top: 8, bottom: 32 }, trigger)).toBe(false);
+  });
+});
+
+describe("visibleTriggerRect", () => {
+  it("returns unclipped bounding rect when there are no clipping ancestors", () => {
+    const parent = document.createElement("div");
+    const trigger = document.createElement("button");
+    parent.append(trigger);
+    document.body.append(parent);
+
+    trigger.getBoundingClientRect = () => ({ left: 50, right: 250, top: 100, bottom: 130, width: 200, height: 30 }) as DOMRect;
+
+    expect(visibleTriggerRect(trigger)).toEqual({
+      left: 50,
+      right: 250,
+      top: 100,
+      bottom: 130,
+      width: 200,
+      height: 30,
+    });
+
+    parent.remove();
+  });
+
+  it("clamps right edge to clipping container when trigger is wider than the scroll container", () => {
+    const scroller = document.createElement("div");
+    scroller.style.overflowX = "auto";
+    const trigger = document.createElement("div");
+    scroller.append(trigger);
+    document.body.append(scroller);
+
+    scroller.getBoundingClientRect = () => ({ left: 0, right: 260, top: 50, bottom: 600, width: 260, height: 550 }) as DOMRect;
+    trigger.getBoundingClientRect = () => ({ left: 0, right: 580, top: 120, bottom: 148, width: 580, height: 28 }) as DOMRect;
+
+    expect(visibleTriggerRect(trigger)).toEqual({
+      left: 0,
+      right: 260,
+      top: 120,
+      bottom: 148,
+      width: 260,
+      height: 28,
+    });
+
+    scroller.remove();
+  });
+
+  it("clamps left edge when trigger is scrolled out to the left", () => {
+    const scroller = document.createElement("div");
+    scroller.style.overflowX = "scroll";
+    const trigger = document.createElement("div");
+    scroller.append(trigger);
+    document.body.append(scroller);
+
+    scroller.getBoundingClientRect = () => ({ left: 0, right: 260, top: 50, bottom: 600, width: 260, height: 550 }) as DOMRect;
+    trigger.getBoundingClientRect = () => ({ left: -150, right: 200, top: 120, bottom: 148, width: 350, height: 28 }) as DOMRect;
+
+    expect(visibleTriggerRect(trigger)).toEqual({
+      left: 0,
+      right: 200,
+      top: 120,
+      bottom: 148,
+      width: 200,
+      height: 28,
+    });
+
+    scroller.remove();
+  });
+
+  it("clamps top and bottom edges for vertical scroll container", () => {
+    const scroller = document.createElement("div");
+    scroller.style.overflowY = "auto";
+    const trigger = document.createElement("div");
+    scroller.append(trigger);
+    document.body.append(scroller);
+
+    scroller.getBoundingClientRect = () => ({ left: 0, right: 300, top: 100, bottom: 400, width: 300, height: 300 }) as DOMRect;
+    trigger.getBoundingClientRect = () => ({ left: 10, right: 200, top: 80, bottom: 140, width: 190, height: 60 }) as DOMRect;
+
+    expect(visibleTriggerRect(trigger)).toEqual({
+      left: 10,
+      right: 200,
+      top: 100,
+      bottom: 140,
+      width: 190,
+      height: 40,
+    });
+
+    scroller.remove();
+  });
+
+  it("computes intersection across nested clipping ancestors", () => {
+    const outer = document.createElement("div");
+    outer.style.overflow = "hidden";
+    const inner = document.createElement("div");
+    inner.style.overflowX = "auto";
+    const trigger = document.createElement("div");
+
+    inner.append(trigger);
+    outer.append(inner);
+    document.body.append(outer);
+
+    outer.getBoundingClientRect = () => ({ left: 20, right: 280, top: 40, bottom: 500, width: 260, height: 460 }) as DOMRect;
+    inner.getBoundingClientRect = () => ({ left: 0, right: 350, top: 40, bottom: 500, width: 350, height: 460 }) as DOMRect;
+    trigger.getBoundingClientRect = () => ({ left: 0, right: 600, top: 100, bottom: 130, width: 600, height: 30 }) as DOMRect;
+
+    expect(visibleTriggerRect(trigger)).toEqual({
+      left: 20,
+      right: 280,
+      top: 100,
+      bottom: 130,
+      width: 260,
+      height: 30,
+    });
+
+    outer.remove();
   });
 });

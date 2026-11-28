@@ -1158,8 +1158,8 @@ fn parse_collection_prefix(source: &str) -> Result<(String, usize), String> {
         return Err("MongoDB command must start with db.<collection>.".to_string());
     }
     let rest = &source[3..];
-    if rest.starts_with("getCollection") {
-        let open = rest.find('(').ok_or("Invalid db.getCollection() command.")?;
+    if let Some(call) = rest.strip_prefix("getCollection").map(str::trim_start).filter(|s| s.starts_with('(')) {
+        let open = rest.len() - call.len();
         let close = matching_paren(rest, open).ok_or("Invalid db.getCollection() command.")?;
         let args = split_top_level(&rest[open + 1..close]);
         if args.len() != 1 {
@@ -1356,12 +1356,52 @@ fn read_shell_regex_literal(input: &str, index: usize) -> Result<ShellRegexLiter
     Ok(ShellRegexLiteral { end: cursor, pattern, options: options.into_iter().collect() })
 }
 
+fn read_shell_template(input: &str) -> Result<(String, usize), String> {
+    let mut chars = input[1..].char_indices().peekable();
+    let mut value = String::new();
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '`' => return Ok((value, offset + 2)),
+            '$' if chars.peek().is_some_and(|(_, next)| *next == '{') => {
+                return Err("MongoDB shell arguments do not support template substitutions.".to_string());
+            }
+            '\r' => {
+                chars.next_if(|(_, next)| *next == '\n');
+                value.push('\n');
+            }
+            '\\' => match chars.next().map(|(_, c)| c) {
+                Some('\n') => {}
+                Some('\r') => {
+                    chars.next_if(|(_, next)| *next == '\n');
+                }
+                Some(c @ ('\\' | '`' | '$' | '\'' | '"' | '/')) => value.push(c),
+                Some('n') => value.push('\n'),
+                Some('r') => value.push('\r'),
+                Some('t') => value.push('\t'),
+                Some('b') => value.push('\u{8}'),
+                Some('f') => value.push('\u{c}'),
+                Some('v') => value.push('\u{b}'),
+                _ => return Err("Unsupported escape in MongoDB template string.".to_string()),
+            },
+            _ => value.push(ch),
+        }
+    }
+    Err("Unclosed MongoDB template string.".to_string())
+}
+
 fn transform_shell_regex_literals(input: &str) -> Result<String, String> {
     let mut output = String::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         let rest = &input[index..];
         let ch = rest.chars().next().ok_or("Invalid MongoDB argument.")?;
+
+        if ch == '`' {
+            let (value, consumed) = read_shell_template(rest)?;
+            output.push_str(&serde_json::to_string(&value).map_err(|e| e.to_string())?);
+            index += consumed;
+            continue;
+        }
 
         if matches!(ch, '"' | '\'') {
             let start = index;
@@ -1423,7 +1463,7 @@ fn is_shell_regex_value_position(input: &str, index: usize) -> bool {
         let rest = &input[cursor..];
         let current = rest.chars().next().expect("cursor is on a character boundary");
 
-        if matches!(current, '"' | '\'') {
+        if matches!(current, '"' | '\'' | '`') {
             let quote = current;
             cursor += current.len_utf8();
             let mut escaped = false;
@@ -1477,13 +1517,18 @@ fn is_shell_regex_value_prefix(previous_significant: Option<char>) -> bool {
 /// Shell value constructors rewritten to extended JSON before json5 parsing.
 /// `Date` is only recognised after `new`, matching the shell where a bare `Date()`
 /// returns a string rather than a date.
-const SHELL_CONSTRUCTORS: [&str; 11] = [
+const SHELL_CONSTRUCTORS: [&str; 15] = [
     "ObjectId",
     "ISODate",
     "Date",
     "NumberLong",
     "NumberInt",
     "NumberDecimal",
+    // mongosh's BSON type names for the same values.
+    "Int32",
+    "Long",
+    "Double",
+    "Decimal128",
     "UUID",
     "BinData",
     "Timestamp",
@@ -1621,6 +1666,10 @@ fn key_constant_json(name: &str) -> String {
 
 /// Rewrite one `Name(...)` / `new Name(...)` call at `index`, or None when it is not a known constructor.
 fn shell_constructor_call(input: &str, index: usize) -> Result<Option<(String, usize)>, String> {
+    // Only at the start of a name, so `myLong(1)` is not read as `Long(1)`.
+    if input[..index].chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.')) {
+        return Ok(None);
+    }
     let rest = &input[index..];
     let (name_start, is_new) = match rest.strip_prefix("new") {
         Some(after) if after.starts_with(|ch: char| ch.is_whitespace()) => {
@@ -1670,8 +1719,8 @@ fn shell_constructor_to_extended_json(name: &str, inner: &str) -> Result<String,
             Some(millis) => Ok(format!(r#"{{"$date":{{"$numberLong":"{millis}"}}}}"#)),
             None => Ok(extended_json("$date", &parse_string_arg(inner)?)),
         },
-        "NumberLong" | "NumberInt" => {
-            let key = if name == "NumberLong" { "$numberLong" } else { "$numberInt" };
+        "NumberLong" | "NumberInt" | "Long" | "Int32" => {
+            let key = if matches!(name, "NumberLong" | "Long") { "$numberLong" } else { "$numberInt" };
             let value = match integer {
                 Some(value) => value.to_string(),
                 None => parse_string_arg(inner)?,
@@ -1679,13 +1728,13 @@ fn shell_constructor_to_extended_json(name: &str, inner: &str) -> Result<String,
             value.parse::<i64>().map_err(|_| format!("MongoDB {name}() requires an integer argument."))?;
             Ok(extended_json(key, &value))
         }
-        "NumberDecimal" => {
+        "NumberDecimal" | "Decimal128" | "Double" => {
             let value = match parse_json_value(inner) {
                 Some(Value::Number(number)) => number.to_string(),
                 _ => parse_string_arg(inner)?,
             };
-            value.parse::<f64>().map_err(|_| "MongoDB NumberDecimal() requires a numeric argument.".to_string())?;
-            Ok(extended_json("$numberDecimal", &value))
+            value.parse::<f64>().map_err(|_| format!("MongoDB {name}() requires a numeric argument."))?;
+            Ok(extended_json(if name == "Double" { "$numberDouble" } else { "$numberDecimal" }, &value))
         }
         _ => Err(format!("Unsupported MongoDB value constructor {name}().")),
     }
@@ -2080,6 +2129,24 @@ mod tests {
     }
 
     #[test]
+    fn inserts_multiline_backtick_strings_as_document_data() {
+        let source = "db.issue_demo.insert({text: `line1\r\nline2) // \"ObjectId()\" \\`tick\\` \\${name}`});";
+        let MongoCommand::Insert { documents, .. } = parse(source).unwrap() else { panic!("expected insert") };
+        assert_eq!(parse_json_value(&documents).unwrap()["text"], "line1\nline2) // \"ObjectId()\" `tick` ${name}");
+        assert!(parse("db.issue_demo.insert({text: `value ${name}`})").is_err());
+    }
+
+    #[test]
+    fn parses_collections_named_like_get_collection() {
+        for name in ["getCollection", "getCollectionArchive"] {
+            assert_eq!(
+                parse(&format!("db.{name}.count()")).unwrap(),
+                MongoCommand::Count { collection: name.to_string(), filter: "{}".to_string(), accurate: false }
+            );
+        }
+    }
+
+    #[test]
     fn parses_get_collection_and_count() {
         assert_eq!(
             parse("db.getCollection('audit.logs').count()").unwrap(),
@@ -2175,6 +2242,43 @@ mod tests {
         };
         let oid = parse_json_value(&filter).unwrap()["_id"]["$oid"].as_str().unwrap().to_string();
         assert!(oid.len() == 24 && oid.chars().all(|ch| ch.is_ascii_hexdigit()), "{oid}");
+    }
+
+    #[test]
+    fn rewrites_mongosh_bson_type_constructors() {
+        let MongoCommand::Insert { documents, .. } = parse(
+            "db.getCollection(\"issue_demo\").insert({\n    name: \"demo\",\n    coins: Int32(\"15000\"),\n    amount: Decimal128(\"100\")\n});",
+        )
+        .unwrap() else {
+            panic!("expected an insert command");
+        };
+        assert_eq!(
+            parse_json_value(&documents).unwrap(),
+            serde_json::json!({ "name": "demo", "coins": { "$numberInt": "15000" }, "amount": { "$numberDecimal": "100" } })
+        );
+
+        let MongoCommand::Find { filter, .. } = parse(
+            r#"db.orders.find({a: Int32(3), b: new Int32(-4), c: Long("9223372036854775807"), d: Long(5), e: Double(1.5), f: Double("2"), g: Decimal128("12.34")})"#,
+        )
+        .unwrap() else {
+            panic!("expected a find command");
+        };
+        assert_eq!(
+            parse_json_value(&filter).unwrap(),
+            serde_json::json!({
+                "a": { "$numberInt": "3" },
+                "b": { "$numberInt": "-4" },
+                "c": { "$numberLong": "9223372036854775807" },
+                "d": { "$numberLong": "5" },
+                "e": { "$numberDouble": "1.5" },
+                "f": { "$numberDouble": "2" },
+                "g": { "$numberDecimal": "12.34" },
+            })
+        );
+
+        assert!(parse(r#"db.orders.find({a: Long("x")})"#).unwrap_err().contains("Long() requires an integer"));
+        assert!(parse(r#"db.orders.find({a: Double("abc")})"#).unwrap_err().contains("Double() requires a numeric"));
+        assert!(parse("db.orders.find({a: myLong(1)})").is_err());
     }
 
     #[test]

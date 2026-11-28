@@ -1,4 +1,4 @@
-import type { DatabaseType, ObjectSourceKind, TreeNode, TreeNodeType } from "@/types/database";
+import type { DatabaseType, ObjectBrowserFilter, ObjectSourceKind, PackageMemberFocus, TreeNode, TreeNodeType } from "@/types/database";
 import { customTypeCapabilities, supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
 import { supportsConnectionQueryActions } from "@/lib/database/databaseFeatureSupport";
 import { matchesShortcut, type ShortcutLikeEvent } from "@/lib/editor/keyboardShortcuts";
@@ -45,11 +45,14 @@ const toggleLeafNodeTypes = new Set<TreeNodeType>([
   "user-admin",
   "dameng-users",
   "dameng-roles",
+  "dameng-job-admin",
+  "database-job-admin",
+  "postgres-aggregate-functions",
 ]);
 // These are application entry points rather than database objects. They should
 // always navigate on a single click, even when the user prefers double-click
 // activation for ordinary tree objects.
-const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview", "etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control", "meilisearch-system"]);
+const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview", "etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control", "meilisearch-system", "dameng-job-admin", "database-job-admin", "postgres-aggregate-functions"]);
 const repeatableNavigationTreeNodeTypes = new Set<TreeNodeType>(["etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control"]);
 
 export function isDirectNavigationTreeNode(type: TreeNodeType): boolean {
@@ -96,12 +99,32 @@ const databaseChildGroupNodeTypes = new Set<TreeNodeType>([
   "group-triggers",
   "group-events",
   "group-sequences",
+  "group-database-indexes",
   "group-synonyms",
   "group-jobs",
   "group-packages",
+  "group-package-bodies",
   "group-types",
 ]);
 const displayPathObjectNodeTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "trigger", "event", "sequence", "synonym", "package", "package-body", "type", "type-body"]);
+
+const groupNodeObjectBrowserFilters: Partial<Record<TreeNodeType, ObjectBrowserFilter>> = {
+  "group-tables": "tables",
+  "group-views": "views",
+  "group-materialized-views": "materializedViews",
+  "group-procedures": "procedures",
+  "group-functions": "functions",
+  "group-triggers": "triggers",
+  "group-events": "events",
+};
+
+/** 分组节点对应的对象浏览器分类：双击分组行时对象浏览器直接选中该分类。
+ *  `group-triggers` 同时用于数据库级与表级分组；表级分组属于具体表节点，
+ *  双击时应保持展开行为，而不是跳转到数据库范围的对象浏览器。 */
+export function objectBrowserFilterForGroupNode(type: TreeNodeType, tableName?: string | null): ObjectBrowserFilter | undefined {
+  if (type === "group-triggers" && tableName) return undefined;
+  return groupNodeObjectBrowserFilters[type];
+}
 
 export function objectSourceKindForTreeNode(type: TreeNodeType): ObjectSourceKind | null {
   if (type === "view") return "VIEW";
@@ -127,13 +150,21 @@ export interface TreeNodeObjectSourceTarget {
   signature?: string;
 }
 
+/**
+ * 包成员打开的是**包体**：实现在那里，光标才能落到子程序上（DataGrip 同行为）。
+ * 只有包头、没有包体的包（纯常量/类型声明）由取源的 PACKAGE_BODY→PACKAGE 回退
+ * 兜底（`loadObjectSourceWithRoutineFallback`），不会因此打不开。
+ *
+ * 成员签名**不进**取源身份：它描述的是成员而不是这个包体，带上去既会让后端按
+ * 重载去匹配一个不存在的独立子程序，又会让同一个包体的每个成员各开一个 tab。
+ * 成员身份另走 `packageMemberFocusForTreeNode`，只用于把光标放到实现上。
+ */
 export function objectSourceTargetForTreeNode(node: TreeNode): TreeNodeObjectSourceTarget | null {
   if ((node.type === "procedure" || node.type === "function") && node.parentType === "package" && node.parentName) {
     return {
       name: node.parentName,
       schema: node.parentSchema || node.schema,
-      objectType: "PACKAGE",
-      signature: node.signature,
+      objectType: "PACKAGE_BODY",
     };
   }
   const objectType = objectSourceKindForTreeNode(node.type);
@@ -146,6 +177,14 @@ export function objectSourceTargetForTreeNode(node: TreeNode): TreeNodeObjectSou
   };
 }
 
+/** 树上选中的包成员身份；非包成员返回 null。打开包体后据此把光标放到实现上。 */
+export function packageMemberFocusForTreeNode(node: TreeNode): PackageMemberFocus | null {
+  if ((node.type !== "procedure" && node.type !== "function") || node.parentType !== "package" || !node.parentName) return null;
+  const name = node.objectName || node.label;
+  if (!name) return null;
+  return { name, kind: node.type, ...(node.signature ? { signature: node.signature } : {}) };
+}
+
 export function isDocumentBrowserTreeNode(type: TreeNodeType): boolean {
   return documentBrowserNodeTypes.has(type);
 }
@@ -153,17 +192,18 @@ export function isDocumentBrowserTreeNode(type: TreeNodeType): boolean {
 /**
  * Whether a tree node type may open an object source dialog for the given
  * connection type. TYPE/TYPE_BODY only have a real source implementation on
- * Xugu; other databases list types without a DDL getter this cycle.
+ * Oracle-family databases and Xugu; PostgreSQL-family databases list types
+ * without a CREATE TYPE getter this cycle.
  */
 function canOpenTreeNodeSource(type: TreeNodeType, dbType?: DatabaseType): boolean {
   if (type === "type" || type === "type-body") return supportsTypeObjectSource(dbType);
   return true;
 }
 
-export function treeNodeRowAction(type: TreeNodeType, canExpand: boolean, activation: SidebarActivation = "single", dbType?: DatabaseType, browseObjectsOnDatabaseActivation = false, canOpenObjectBrowser = false): TreeNodeRowAction {
+export function treeNodeRowAction(type: TreeNodeType, canExpand: boolean, activation: SidebarActivation = "single", dbType?: DatabaseType, browseObjectsOnDatabaseActivation = false, canOpenObjectBrowser = false, autoExpandOnDatabaseActivation = true): TreeNodeRowAction {
   if (!shouldActivateTreeNodeOnSingleClick(type, activation)) return "none";
   if (canOpenObjectBrowser && shouldBrowseObjectsOnDatabaseActivation(type, browseObjectsOnDatabaseActivation)) {
-    return canExpand ? "open-object-browser-and-expand" : "open-object-browser";
+    return canExpand && autoExpandOnDatabaseActivation ? "open-object-browser-and-expand" : "open-object-browser";
   }
   if (type === "extension") return "open-extension-details";
   if (type === "event-trigger") return "open-event-trigger-details";
@@ -171,7 +211,7 @@ export function treeNodeRowAction(type: TreeNodeType, canExpand: boolean, activa
   if (dataNodeTypes.has(type)) return "open-data";
   if (type === "column") return "locate-column";
   // PostgreSQL-family custom types: open read-only details (toggle when expandable).
-  if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : "none";
+  if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : supportsTypeObjectSource(dbType) ? "open-source" : "none";
   // Xugu and other databases: expandable package/type nodes toggle their members.
   if ((type === "package" || type === "type") && canExpand) return "toggle";
   if (sourceNodeTypes.has(type) && canOpenTreeNodeSource(type, dbType)) return "open-source";
@@ -187,7 +227,16 @@ export function shouldRunTreeNodeRowAction(action: TreeNodeRowAction, clickDetai
   return action !== "none" && clickDetail <= 1;
 }
 
-export function treeNodeRowDoubleClickAction(type: TreeNodeType, canOpenObjectBrowser: boolean, activation: SidebarActivation = "single", canExpand = false, dbType?: DatabaseType, canOpenDatabaseBrowser = false, browseObjectsOnDatabaseActivation = false): TreeNodeRowDoubleClickAction {
+export function treeNodeRowDoubleClickAction(
+  type: TreeNodeType,
+  canOpenObjectBrowser: boolean,
+  activation: SidebarActivation = "single",
+  canExpand = false,
+  dbType?: DatabaseType,
+  canOpenDatabaseBrowser = false,
+  browseObjectsOnDatabaseActivation = false,
+  autoExpandOnDatabaseActivation = true,
+): TreeNodeRowDoubleClickAction {
   // Single-click activation already handles the first click in a dblclick
   // sequence. Most rows have no trailing action, while field/index rows have
   // an explicit structure-editor action in either activation mode.
@@ -201,13 +250,13 @@ export function treeNodeRowDoubleClickAction(type: TreeNodeType, canOpenObjectBr
   if (type === "column" || type === "index") return "open-structure-editor";
   if (activation === "double") {
     if (canOpenObjectBrowser && shouldBrowseObjectsOnDatabaseActivation(type, browseObjectsOnDatabaseActivation)) {
-      return canExpand ? "open-object-browser-and-expand" : "open-object-browser";
+      return canExpand && autoExpandOnDatabaseActivation ? "open-object-browser-and-expand" : "open-object-browser";
     }
     if (canOpenObjectBrowser && type === "object-browser") return "open-object-browser";
     if (type === "extension") return "open-extension-details";
     if (type === "event-trigger") return "open-event-trigger-details";
     if (dataNodeTypes.has(type)) return "open-data";
-    if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : "none";
+    if (type === "type" && customTypeCapabilities(dbType).details) return canExpand ? "toggle" : supportsTypeObjectSource(dbType) ? "open-source" : "none";
     if (sourceNodeTypes.has(type) && canOpenTreeNodeSource(type, dbType)) return "open-source";
     if (savedSqlNodeTypes.has(type)) return "open-saved-sql";
     if (toggleLeafNodeTypes.has(type)) return "toggle";
@@ -221,6 +270,7 @@ export function sidebarSelectionCopyAction(event: ShortcutLikeEvent, platform?: 
 }
 
 export function copyNameForTreeNode(node: TreeNode): string {
+  if (node.type === "index" && node.objectScope === "schema" && node.objectName) return node.objectName;
   if (tableChildGroupNodeTypes.has(node.type) && node.tableName) return node.tableName;
   if (databaseChildGroupNodeTypes.has(node.type)) return node.schema || node.database || node.label;
   if (node.type === "column") {

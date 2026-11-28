@@ -166,6 +166,91 @@ describe("useDataGridSearch", () => {
     expect(search.matches.value).toEqual([]);
     expect(search.currentMatchIndex.value).toBe(-1);
   });
+
+  it("does not auto-navigate or reset match position when rows change without a query change (#13241)", async () => {
+    vi.useFakeTimers();
+    const rows = ref([
+      ["hit", "other1"],
+      ["hit", "other2"],
+    ]);
+    const onNavigate = vi.fn();
+    const search = useDataGridSearch({
+      columns: ["id", "extra"],
+      rows,
+      getCellSearchText: (row, column) => row[column],
+      onNavigate,
+    });
+    search.searchText.value = "hit";
+    await flushSearchDebounce();
+    expect(search.currentMatchIndex.value).toBe(0);
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    expect(onNavigate).toHaveBeenLastCalledWith({ kind: "cell", displayRow: 0, col: 0 });
+
+    // User navigates to match 1
+    search.navigateMatch(1);
+    expect(search.currentMatchIndex.value).toBe(1);
+    expect(onNavigate).toHaveBeenCalledTimes(2);
+    expect(onNavigate).toHaveBeenLastCalledWith({ kind: "cell", displayRow: 1, col: 0 });
+
+    // User edits an unrelated column on row 1 (or sets it to NULL), updating rows
+    onNavigate.mockClear();
+    rows.value = [
+      ["hit", "other1"],
+      ["hit", "null"],
+    ];
+    await nextTick();
+    await nextTick();
+
+    // Match position must remain at index 1 and onNavigate must NOT be called
+    expect(search.currentMatchIndex.value).toBe(1);
+    expect(search.currentMatch.value).toEqual({ kind: "cell", displayRow: 1, col: 0 });
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+
+  it("preserves match index without onNavigate when cell is set to null or rows reload after commit (#13241)", async () => {
+    vi.useFakeTimers();
+    const rows = ref<Array<[string, string | null]>>([
+      ["user-1", "val1"],
+      ["user-2", "val2"],
+    ]);
+    const onNavigate = vi.fn();
+    const search = useDataGridSearch({
+      columns: ["_id", "status"],
+      rows,
+      getCellSearchText: (row, column) => (row[column] ?? "").toLowerCase(),
+      onNavigate,
+    });
+    search.searchText.value = "user";
+    await flushSearchDebounce();
+    expect(search.currentMatchIndex.value).toBe(0);
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+
+    // Navigate to second document
+    search.navigateMatch(1);
+    expect(search.currentMatchIndex.value).toBe(1);
+    expect(onNavigate).toHaveBeenCalledTimes(2);
+
+    // Set field to null
+    onNavigate.mockClear();
+    rows.value = [
+      ["user-1", "val1"],
+      ["user-2", null],
+    ];
+    await nextTick();
+    await nextTick();
+    expect(search.currentMatchIndex.value).toBe(1);
+    expect(onNavigate).not.toHaveBeenCalled();
+
+    // Reload after commit with fresh objects but same data
+    rows.value = [
+      ["user-1", "val1"],
+      ["user-2", null],
+    ];
+    await nextTick();
+    await nextTick();
+    expect(search.currentMatchIndex.value).toBe(1);
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
 });
 
 describe("useDataGridSearch persistence (#8524)", () => {
@@ -295,5 +380,76 @@ describe("useDataGridSearch persistence (#8524)", () => {
 
     expect(search.restorePersistedState()).toBe(false);
     expect(loadDataGridSearchState("tab-1", SCOPE)).toBeUndefined();
+  });
+});
+
+describe("useDataGridSearch IME composition", () => {
+  function createSearch() {
+    const onNavigate = vi.fn();
+    const search = useDataGridSearch({
+      columns: ["id", "name"],
+      rows: [["1", "Alice"]],
+      getCellSearchText: (row: string[], column: number) => row[column].toLowerCase(),
+      onNavigate,
+    });
+    return { search, onNavigate };
+  }
+
+  function keydown(init: { key: string; isComposing?: boolean; keyCode?: number }): KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> } {
+    return { ...init, preventDefault: vi.fn(), stopPropagation: vi.fn() } as unknown as KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> };
+  }
+
+  it("leaves Tab to the input method while a composition is active", () => {
+    const { search } = createSearch();
+    // A column-prefix suggestion would otherwise make Tab accept it.
+    search.searchText.value = "na";
+
+    const event = keydown({ key: "Tab", isComposing: true });
+    search.onKeydown(event);
+
+    // The IME owns Tab: never swallow it, never accept a suggestion for the
+    // not-yet-committed pinyin.
+    expect(event.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("leaves Enter and arrows to the input method while a composition is active", async () => {
+    vi.useFakeTimers();
+    const { search, onNavigate } = createSearch();
+    search.searchText.value = "ali";
+    await flushSearchDebounce();
+    // The debounced query auto-navigates to its first match; drop that call so
+    // the assertion below only observes navigation caused by the keydown.
+    onNavigate.mockClear();
+
+    for (const key of ["Enter", "ArrowDown", "ArrowUp"]) {
+      const event = keydown({ key, isComposing: true });
+      search.onKeydown(event);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    }
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+
+  it("treats the keyCode 229 / Process fallback as a composition", () => {
+    // Some engines report an active composition through keyCode 229 /
+    // "Process" instead of `isComposing`. (The Enter WebKit sends *after*
+    // compositionend is covered at the component level in
+    // DataGridSearchIme.spec.ts: only the search bar sees composition events.)
+    const { search } = createSearch();
+    for (const event of [keydown({ key: "Enter", keyCode: 229 }), keydown({ key: "Process" })]) {
+      search.onKeydown(event);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps normal shortcut handling once the composition commits", () => {
+    const { search } = createSearch();
+    search.searchText.value = "ali";
+    vi.useFakeTimers();
+
+    const event = keydown({ key: "Enter" });
+    search.onKeydown(event);
+
+    // A committed query still navigates as before.
+    expect(event.preventDefault).toHaveBeenCalled();
   });
 });

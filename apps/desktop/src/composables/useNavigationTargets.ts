@@ -4,9 +4,11 @@ import { invalidateTableMetadataCache, loadTableMetadata } from "@/lib/metadata/
 import { canApplyDataTabMetadata, canReuseActiveMongoTab, type DataTabReuseMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { buildTableSelectSql, requiresEagerTableMetadataForDataOpen } from "@/lib/table/tableSelectSql";
+import { loadTableDataQueryDefaults, removeTableDataQueryDefaults, shouldRetryWithoutTableDataQueryDefaults } from "@/lib/table/tableDataQueryDefaults";
 import { resolveTableDefaultSort, applyTableDefaultSortResult } from "@/lib/table/tableDefaultSort";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
-import { editableRowIdentifierColumns, physicalTablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
+import { editableRowIdentifierColumns, isViewTableType, physicalTablePrimaryKeys, postgresTupleLocatorUnsupportedEngine, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
+import { markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
@@ -66,7 +68,6 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
   const settingsStore = useSettingsStore();
-  const pageLimit = tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
 
   if (options.isCurrent?.() === false) return;
 
@@ -78,6 +79,10 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
     return;
   }
   const tableSchema = connectionObjectTreeNodeSchema(config, target.database, target.schema);
+  const savedQuery = target.whereInput === undefined ? loadTableDataQueryDefaults({ ...target, schema: tableSchema }) : undefined;
+  const savedOrderBy = settingsStore.editorSettings.dataGridOrderByVisible === false ? undefined : savedQuery?.orderBy;
+  const whereInput = target.whereInput ?? savedQuery?.whereInput;
+  const pageLimit = tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize, { connectionId: target.connectionId, database: target.database, catalog: target.catalog, schema: tableSchema, tableName: target.tableName });
   const tabTitle = target.catalog ? `${target.catalog}.${tableSchema || target.database}.${target.tableName}` : tableSchema ? `${tableSchema}.${target.tableName}` : target.tableName;
   if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
     await connectionStore.ensureConnected(target.connectionId);
@@ -174,8 +179,8 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
         tableType: targetTableType,
         columns: columns.map((column) => column.name),
         primaryKeys,
-        orderBy: defaultSort.orderBy,
-        whereInput: target.whereInput,
+        orderBy: savedOrderBy ?? defaultSort.orderBy,
+        whereInput,
         limit: pageLimit,
       });
       if (!isPreparationCurrent() || !isCurrentGeneration()) return;
@@ -190,9 +195,41 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
         primaryKeys,
       });
       firstExecuteStarted = true;
-      if (targetTab) targetTab.orderByInput = defaultSort.orderBy;
+      if (targetTab) {
+        if (savedQuery?.whereInput) targetTab.whereInput = savedQuery.whereInput;
+        targetTab.orderByInput = savedOrderBy ?? defaultSort.orderBy;
+      }
       await queryStore.executeTabSql(tabId, sql, { pagination: { limit: pageLimit, offset: 0 } });
-      if (isCurrentTarget() && targetTab) applyTableDefaultSortResult(targetTab, defaultSort, queryStore.sortTabResultLocally);
+      // 保存的默认筛选/排序随首查失败（列被删/改名，schema 漂移）：镜像 #12647
+      // 的降级契约——清掉过期默认值并不带它们重试一次，表仍能打开
+      if (savedQuery && isCurrentTarget() && shouldRetryWithoutTableDataQueryDefaults(savedQuery, queryStore.tabs.find((tab) => tab.id === tabId)?.result)) {
+        removeTableDataQueryDefaults({ ...target, schema: tableSchema });
+        const plainSql = await buildTableSelectSql({
+          databaseType: effectiveDbType,
+          driverProfile: config.driver_profile,
+          serverVersion: connectionStore.getConfig(target.connectionId)?.database_info?.productVersion,
+          identifierQuote,
+          schema: tableSchema,
+          catalog: target.catalog,
+          database: target.database,
+          tableName: target.tableName,
+          includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+          injectDefaultTimeSeriesWhere: true,
+          tableType: targetTableType,
+          columns: columns.map((column) => column.name),
+          primaryKeys,
+          orderBy: defaultSort.orderBy,
+          limit: pageLimit,
+        });
+        if (!isPreparationCurrent() || !isCurrentGeneration()) return;
+        queryStore.updateSql(tabId, plainSql);
+        if (targetTab) {
+          targetTab.whereInput = undefined;
+          targetTab.orderByInput = defaultSort.orderBy;
+        }
+        await queryStore.executeTabSql(tabId, plainSql, { pagination: { limit: pageLimit, offset: 0 } });
+      }
+      if (!savedOrderBy && isCurrentTarget() && targetTab) applyTableDefaultSortResult(targetTab, defaultSort, queryStore.sortTabResultLocally);
       return;
     }
     let eagerMetadata: Awaited<ReturnType<typeof loadTableMetadata>> | undefined;
@@ -217,8 +254,9 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
     }
     const eagerColumns = eagerMetadata?.metadata.columns ?? [];
     const eagerPrimaryKeys = eagerMetadata?.metadata.primaryKeys ?? [];
-    const defaultSort = resolveTableDefaultSort(settingsStore.editorSettings, effectiveDbType, physicalTablePrimaryKeys(eagerColumns, eagerMetadata?.metadata.indexes), identifierQuote);
-    const sql = await buildTableSelectSql({
+    const eagerIncludeRowId = Boolean(eagerMetadata) && shouldIncludeSyntheticRowId(effectiveDbType, eagerPrimaryKeys, targetTableType) && !rowIdLocatorUnsupported(target.connectionId) && !postgresTupleLocatorUnsupportedEngine(config);
+    const defaultSort = resolveTableDefaultSort(settingsStore.editorSettings, effectiveDbType, physicalTablePrimaryKeys(eagerColumns, eagerMetadata?.metadata.indexes, effectiveDbType), identifierQuote);
+    const tableSelectSqlOptions = {
       databaseType: effectiveDbType,
       driverProfile: config.driver_profile,
       serverVersion: connectionStore.getConfig(target.connectionId)?.database_info?.productVersion,
@@ -231,11 +269,13 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
       tableType: targetTableType,
       columns: eagerColumns.map((column) => column.name),
       primaryKeys: eagerPrimaryKeys,
-      orderBy: defaultSort.orderBy,
-      ...tableDataLargeValuePreviewOptions(effectiveDbType, eagerColumns, eagerPrimaryKeys, pageLimit),
-      whereInput: target.whereInput,
+      includeRowId: eagerIncludeRowId,
+      orderBy: savedOrderBy ?? defaultSort.orderBy,
+      ...tableDataLargeValuePreviewOptions(effectiveDbType, eagerColumns, eagerPrimaryKeys, pageLimit, config.db_type === "jdbc"),
+      whereInput,
       limit: pageLimit,
-    });
+    };
+    const sql = await buildTableSelectSql(tableSelectSqlOptions);
     if (!isPreparationCurrent() || !isCurrentGeneration()) return;
     queryStore.updateSql(tabId, sql);
     queryStore.setTableMeta(tabId, {
@@ -251,7 +291,10 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
     // 取消计数快照：isCancelling 是瞬态的（取消失败/查询先完成会被清掉），
     // 比对计数才能跨越 executeTabSql 生命周期识别"执行期间用户请求过停止"
     const cancelCountBeforeExecute = queryStore.tabs.find((tab) => tab.id === tabId)?.cancelRequestCount ?? 0;
-    if (targetTab) targetTab.orderByInput = defaultSort.orderBy;
+    if (targetTab) {
+      if (savedQuery?.whereInput) targetTab.whereInput = savedQuery.whereInput;
+      targetTab.orderByInput = savedOrderBy ?? defaultSort.orderBy;
+    }
     await queryStore.executeTabSql(tabId, sql, { pagination: { limit: pageLimit, offset: 0 } });
     if (!isCurrentTarget()) return;
     // 首次查询被停止/失败（executeTabSql 以 Error 结果表达，不抛出）时，
@@ -261,7 +304,34 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
     const firstResult = tabAfterFirstExecute?.result;
     const cancelRequestedDuringExecute = (tabAfterFirstExecute?.cancelRequestCount ?? 0) > cancelCountBeforeExecute;
     const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult !== undefined && isQueryExecutionErrorResult(firstResult));
-    if (!firstQueryFailed && targetTab) applyTableDefaultSortResult(targetTab, defaultSort, queryStore.sortTabResultLocally);
+    if (!savedOrderBy && !firstQueryFailed && targetTab) applyTableDefaultSortResult(targetTab, defaultSort, queryStore.sortTabResultLocally);
+    // 引擎拒绝合成行定位器（Hologres 等无系统列的 PG 兼容引擎拒 tableoid/
+    // ctid/xmin，#12647）：首查 SQL 带 __DBX_ROWID 而失败时，去掉定位器重试
+    // 一次，表仍可打开（只读）；成功后记住该连接，后续打开直接跳过定位器。
+    // 与侧边栏打开/数据页签刷新路径同一降级契约；用户主动停止不重试。
+    if (!cancelRequestedDuringExecute && tabAfterFirstExecute?.isCancelling !== true && shouldRetryWithoutRowIdLocator(sql, firstResult)) {
+      const fallbackSql = await buildTableSelectSql({ ...tableSelectSqlOptions, includeRowId: false });
+      if (!isCurrentTarget() || !isCurrentGeneration()) return;
+      queryStore.updateSql(tabId, fallbackSql);
+      await queryStore.executeTabSql(tabId, fallbackSql, { pagination: { limit: pageLimit, offset: 0 } });
+      if (!isCurrentTarget()) return;
+      const retryTab = queryStore.tabs.find((tab) => tab.id === tabId);
+      if (shouldKeepRowIdLocatorDisabled(retryTab?.result)) markRowIdLocatorUnsupported(target.connectionId);
+    }
+    // 保存的默认筛选/排序随首查执行失败（列被删/改名，schema 漂移）：镜像
+    // #12647 的降级契约——清掉过期默认值并不带它们重试一次，表仍能打开；
+    // 用户主动停止不重试（与上方行定位器降级同一取消判定）。
+    if (!cancelRequestedDuringExecute && tabAfterFirstExecute?.isCancelling !== true && shouldRetryWithoutTableDataQueryDefaults(savedQuery, firstResult)) {
+      removeTableDataQueryDefaults({ ...target, schema: tableSchema });
+      const plainSql = await buildTableSelectSql({ ...tableSelectSqlOptions, whereInput: undefined, orderBy: defaultSort.orderBy });
+      if (!isCurrentTarget() || !isCurrentGeneration()) return;
+      queryStore.updateSql(tabId, plainSql);
+      if (targetTab) {
+        targetTab.whereInput = undefined;
+        targetTab.orderByInput = defaultSort.orderBy;
+      }
+      await queryStore.executeTabSql(tabId, plainSql, { pagination: { limit: pageLimit, offset: 0 } });
+    }
     // executeTabSql surfaces query failures as an "Error" result instead of throwing.
     // A snapshot-less lake table fails the data preview above but its metadata still
     // reads fine — retry with LIMIT 0 so the user sees the table structure (columns +
@@ -282,7 +352,7 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
         includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
         injectDefaultTimeSeriesWhere: true,
         tableType: targetTableType,
-        whereInput: target.whereInput,
+        whereInput,
         limit: 0,
       });
       if (!isCurrentTarget()) return;
@@ -307,7 +377,7 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
       // 异步窗口内 tab 可能已被复用为其他目标：旧请求的元数据不得落地、
       // 不得解除新目标的 pending
       if (!isCurrentTarget() || !isCurrentGeneration()) return;
-      const useRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, targetTableType);
+      const useRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, targetTableType) && !rowIdLocatorUnsupported(target.connectionId) && !postgresTupleLocatorUnsupportedEngine(connectionStore.getConfig(target.connectionId));
       queryStore.setTableMeta(tabId, {
         schema: tableSchema,
         catalog: target.catalog,
@@ -317,7 +387,7 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
         columns,
         primaryKeys,
       });
-      if (!fellBackToLimitZero && !firstQueryFailed && (useRowId || config.db_type === "tdengine")) {
+      if (!fellBackToLimitZero && !firstQueryFailed && ((useRowId && !eagerIncludeRowId) || config.db_type === "tdengine")) {
         const newSql = await buildTableSelectSql({
           databaseType: effectiveDbType,
           driverProfile: config.driver_profile,
@@ -330,17 +400,18 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
           includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
           injectDefaultTimeSeriesWhere: true,
           tableType: targetTableType,
-          whereInput: target.whereInput,
+          whereInput,
           primaryKeys,
           columns: columns.map((column) => column.name),
+          ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, pageLimit, config.db_type === "jdbc"),
           includeRowId: true,
-          orderBy: defaultSort.orderBy,
+          orderBy: savedOrderBy ?? defaultSort.orderBy,
           limit: pageLimit,
         });
         if (!isCurrentTarget()) return;
         queryStore.updateSql(tabId, newSql);
         await queryStore.executeTabSql(tabId, newSql, { pagination: { limit: pageLimit, offset: 0 } });
-        if (isCurrentTarget() && targetTab) applyTableDefaultSortResult(targetTab, defaultSort, queryStore.sortTabResultLocally);
+        if (!savedOrderBy && isCurrentTarget() && targetTab) applyTableDefaultSortResult(targetTab, defaultSort, queryStore.sortTabResultLocally);
       }
     } catch (reason) {
       console.error("[DBX] ERROR fetching table metadata:", reason);
@@ -399,7 +470,8 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
   async function openDatabaseSearchTarget(target: NavigationTarget) {
     dialogs.showDatabaseSearchDialog.value = false;
     if (target.searchScope === "structure" && target.tableName) {
-      const tableType = (target.tableType || "").toUpperCase() === "VIEW" ? "view" : "table";
+      const normalizedTableType = target.tableType?.trim().toUpperCase().replaceAll(" ", "_");
+      const tableType = normalizedTableType === "MATERIALIZED_VIEW" ? "materialized_view" : isViewTableType(normalizedTableType) ? "view" : "table";
       queryStore.openTableStructure(target.connectionId, target.database, target.schema, target.tableName, "columns", target.columnName ? { kind: "column", name: target.columnName } : undefined, target.catalog, tableType);
       return;
     }
@@ -411,7 +483,13 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
     await openTableTarget(target);
   }
 
-  async function onStructureEditorSaved(reloadData: () => Promise<void>, toast: (msg: string, duration?: number) => void, context: { connectionId: string; database: string; schema?: string; catalog?: string; tableName: string }, commentChanged?: boolean, createdTable = false) {
+  async function onStructureEditorSaved(
+    reloadData: () => Promise<void>,
+    toast: (msg: string, duration?: number) => void,
+    context: { connectionId: string; database: string; schema?: string; catalog?: string; tableName: string; exactIdentity?: boolean },
+    commentChanged?: boolean,
+    createdTable = false,
+  ) {
     if (!context.tableName) {
       try {
         await connectionStore.refreshObjectListTreeNode(context.connectionId, context.database, context.schema || undefined);
@@ -424,11 +502,17 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
       } catch {}
     }
     connectionStore.invalidateCompletionTableCache(context.connectionId, context.database, context.tableName, context.schema, context.catalog);
-    queryStore.invalidateTableStructure(context.connectionId, context.database, context.schema, context.tableName);
+    if (context.exactIdentity) queryStore.invalidateTableStructure(context.connectionId, context.database, context.schema, context.tableName, true, context.catalog);
+    else queryStore.invalidateTableStructure(context.connectionId, context.database, context.schema, context.tableName);
     // 结构已变更：无论是否有打开的 data tab 都必须作废共享元数据缓存，否则
     // 其它 loadTableMetadata 消费者最长 30 秒拿到旧列。不带 schema/catalog
     // 维度（宁可多废，schema 形态在各消费点可能不同）
-    invalidateTableMetadataCache({ connectionId: context.connectionId, database: context.database, tableName: context.tableName });
+    invalidateTableMetadataCache({ connectionId: context.connectionId, database: context.database, tableName: context.tableName, ...(context.exactIdentity ? { schema: context.schema } : {}) });
+    try {
+      await connectionStore.refreshTableColumnsTree(context.connectionId, context.database, context.tableName, context.schema, context.catalog);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), 5000);
+    }
     const matchingDataTabs = queryStore.tabs.filter((tab) => tab.mode === "data" && tab.connectionId === context.connectionId && tab.database === context.database && tab.tableMeta?.tableName === context.tableName && (tab.schema || tab.tableMeta.schema || "") === (context.schema || ""));
     // 同一 catalog 只强制加载一次，结果分发给全部匹配 tab
     const loadedByCatalog = new Map<string, { columns: ColumnInfo[]; primaryKeys: string[] }>();

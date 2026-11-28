@@ -1,12 +1,16 @@
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { getSqlCompletionContext } from "@/lib/sql/sqlCompletion";
+import { resolveSqlDialectId } from "@/lib/sql/semantic/dialect";
 import { findCteColumnResolution, findCteReferenceAt } from "@/lib/sql/semantic/cteNavigation";
+import { resolveOraclePackageMemberNavigation } from "@/lib/sql/oraclePackageMemberNavigation";
+import { MAX_ALIAS_HIGHLIGHT_SQL_LENGTH, sqlAliasHighlightGroups } from "@/lib/sql/semantic/aliasHighlights";
+import { resolveSqlStatementWindow } from "@/lib/sql/sqlStatementWindow";
 import { extractIdentifierDetailsAt, isSqlKeyword, matchSqlObject, matchTable, resolveSqlObjectNavigationIdentity, sqlObjectNavigationTarget, sqlObjectNavigationTargetFromIdentity, sqlObjectNavigationTypeFromCompletionObjectType, type SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
-import { matchHoverTableCandidates, resolveHoverTableLookupTarget } from "@/lib/editor/hoverTableLookup";
+import { matchHoverTableCandidates, pickHoverObjectMatch, resolveHoverTableLookupTarget } from "@/lib/editor/hoverTableLookup";
 import { stabilizeUnfocusedQueryEditorPointerDown } from "@/lib/editor/queryEditorUnfocusedPointer";
 import { usesQueryEditorObjectNavigationModifier } from "@/lib/editor/queryEditorPointerSelection";
 import { queryTableNavigationTargetAtSqlPosition } from "@/lib/sql/queryCursorTableTarget";
-import type { SqlCompletionReferencedTable, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
+import type { SqlCompletionObject, SqlCompletionReferencedTable, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
 import type { Ref, ShallowRef } from "vue";
 import type { QueryEditorProps } from "./queryEditorTypes";
 import type { useConnectionStore } from "@/stores/connectionStore";
@@ -41,7 +45,7 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
   const MAX_COMPLETION_TABLES = options.maxCompletionTables;
   const tableNavigationHoverClass = "query-editor--table-navigation-hover";
 
-  function jumpToCteRange(target: { from: number; to: number }, highlight: { from: number; to: number }) {
+  function jumpToSqlRange(target: { from: number; to: number }, highlight: { from: number; to: number }) {
     const currentView = view.value;
     if (!currentView || !codeMirrorRuntime.editorViewModule || !codeMirrorRuntime.setResultSourceRangeEffect) return;
     const docLength = currentView.state.doc.length;
@@ -69,7 +73,8 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
     // modifier-held mouse moves never materialize the whole document string.
     const windowFrom = Math.max(0, pos - 1024);
     const doc = currentView.state.doc;
-    const extracted = extractIdentifierDetailsAt(doc.sliceString(windowFrom, Math.min(doc.length, pos + 1024)), pos - windowFrom);
+    const dialectId = resolveSqlDialectId({ databaseType: props.databaseType, dialect: props.databaseType ? undefined : props.dialect });
+    const extracted = extractIdentifierDetailsAt(doc.sliceString(windowFrom, Math.min(doc.length, pos + 1024)), pos - windowFrom, dialectId);
     if (!extracted || (!extracted.quoted && isSqlKeyword(extracted.identifier))) return null;
     return extracted.identifier;
   }
@@ -118,8 +123,10 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
       return false;
     }
 
-    const doc = currentView.state.doc.toString();
-    const extracted = extractIdentifierDetailsAt(doc, pos);
+    const clickedDocument = currentView.state.doc;
+    const doc = clickedDocument.toString();
+    const dialectId = resolveSqlDialectId({ databaseType: props.databaseType, dialect: props.databaseType ? undefined : props.dialect });
+    const extracted = extractIdentifierDetailsAt(doc, pos, dialectId);
     if (!extracted) {
       return false;
     }
@@ -132,8 +139,24 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
     event.preventDefault();
     setTimeout(async () => {
       try {
+        // A click on the qualifier jumps to its declaration. A click on the
+        // field continues through the existing CTE/column navigation.
+        const statement = resolveSqlStatementWindow(doc, pos, currentView.state, dialectId);
+        if (statement.to - statement.from <= MAX_ALIAS_HIGHLIGHT_SQL_LENGTH) {
+          const groups = sqlAliasHighlightGroups(doc.slice(statement.from, statement.to), { databaseType: props.databaseType, dialect: props.databaseType ? undefined : props.dialect });
+          const offset = pos - statement.from;
+          const alias = groups.find((group) => group.qualifiers.some((qualifier) => qualifier.start <= offset && offset <= qualifier.end));
+          if (alias) {
+            if (view.value === currentView && currentView.state.doc === clickedDocument) {
+              const range = { from: statement.from + alias.declaration.start, to: statement.from + alias.declaration.end };
+              jumpToSqlRange(range, range);
+            }
+            return;
+          }
+        }
+
         // Single identity model: quote flags + role (relation column list vs routine call vs unknown).
-        const identity = resolveSqlObjectNavigationIdentity(doc, pos);
+        const identity = resolveSqlObjectNavigationIdentity(doc, pos, dialectId);
         if (!identity) return;
 
         const identifierParts = identity.parts.map((part) => part.value);
@@ -181,19 +204,35 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
             if (cteModel) {
               const referenceHit = findCteReferenceAt(cteModel, pos);
               if (referenceHit?.definition.nameSpan) {
-                jumpToCteRange({ from: referenceHit.definition.nameSpan.start, to: referenceHit.definition.nameSpan.end }, { from: referenceHit.definition.sourceSpan.start, to: referenceHit.definition.sourceSpan.end });
+                jumpToSqlRange({ from: referenceHit.definition.nameSpan.start, to: referenceHit.definition.nameSpan.end }, { from: referenceHit.definition.sourceSpan.start, to: referenceHit.definition.sourceSpan.end });
                 return;
               }
               const clickQualifier = identity.parts.length >= 2 ? identity.parts[identity.parts.length - 2]?.value : undefined;
               const columnHit = findCteColumnResolution(cteModel, identity.name, clickQualifier);
               const columnTargetSpan = columnHit?.output?.jumpSpan ?? columnHit?.stars?.[0]?.starSpan;
               if (columnHit && columnTargetSpan) {
-                jumpToCteRange({ from: columnTargetSpan.start, to: columnTargetSpan.end }, { from: columnHit.definition.sourceSpan.start, to: columnHit.definition.sourceSpan.end });
+                jumpToSqlRange({ from: columnTargetSpan.start, to: columnTargetSpan.end }, { from: columnHit.definition.sourceSpan.start, to: columnHit.definition.sourceSpan.end });
                 return;
               }
             }
           } catch (error) {
             console.warn("[DBX] CTE ctrl+click resolution failed:", error);
+          }
+        }
+
+        // 0b. Oracle 包源码：包里的名字先问这个包自己。包头的 `PROCEDURE X(...);` 是声明、
+        //     包体的 `PROCEDURE X(...) IS` 是实现，都不是一个叫 X 的独立过程；拿裸名去查
+        //     数据字典只会落空，然后乐观地开出一个空的 `PROCEDURE X` 源码 tab。
+        if (props.packageSource) {
+          const packageNavigation = resolveOraclePackageMemberNavigation({ source: doc, position: pos, identity, context: props.packageSource });
+          if (packageNavigation?.kind === "document") {
+            const { nameStart, nameEnd, offset } = packageNavigation.entry;
+            if (view.value === currentView && currentView.state.doc === clickedDocument) jumpToSqlRange({ from: nameStart, to: nameEnd }, { from: offset, to: nameEnd });
+            return;
+          }
+          if (packageNavigation?.kind === "packageBody") {
+            emit("openObjectSource", packageNavigation.target, false);
+            return;
           }
         }
 
@@ -241,15 +280,18 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
           return true;
         };
 
-        // 1b. Local routine cache — skip for pure relation column lists (INSERT INTO t(...)).
+        // 1b. Routine cache — skip for pure relation column lists (INSERT INTO t(...)).
+        // Unqualified names honor tableHoverLookupMode (same scope as tables); qualified names stay scoped.
         if (!isRelationColumnList) {
-          const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, props.schema);
-          let matchedObject = matchSqlObject(identifier, localObjects);
-          if (matchedObject && openMatchedObject(matchedObject)) return;
+          const matchNavigationObject = (objects: readonly SqlCompletionObject[]) => (identity.parts.length === 1 ? pickHoverObjectMatch(objectNameFilter, objects, props.schema) : matchSqlObject(identifier, objects));
+          const unqualifiedObjectSchema = tableLookup.preferGlobalFirst ? undefined : (tableLookup.schema ?? props.schema);
 
-          if (!usesLocalOnlyCompletionMetadata()) {
-            // Disambiguate schema.routine vs package.member with small scoped lookups (no global scan).
-            if (identity.parts.length === 2 && identity.qualifier) {
+          if (identity.parts.length === 2 && identity.qualifier) {
+            const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, props.schema);
+            let matchedObject = matchNavigationObject(localObjects);
+            if (matchedObject && openMatchedObject(matchedObject)) return;
+
+            if (!usesLocalOnlyCompletionMetadata()) {
               // Prefer package.member under session schema (Oracle common: PKG.MEMBER()).
               const packageObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, props.schema, identity.qualifier, false, props.schema, ["routine"]);
               matchedObject = matchSqlObject(identifier, packageObjects);
@@ -259,10 +301,44 @@ export function useQueryEditorObjectNavigation(options: QueryEditorObjectNavigat
               const schemaObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, identity.qualifier, undefined, false, props.schema, ["routine"]);
               matchedObject = matchSqlObject(identifier, schemaObjects);
               if (matchedObject && openMatchedObject(matchedObject)) return;
-            } else {
+            }
+          } else if (identity.parts.length >= 3) {
+            const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, objectSchemaHint);
+            let matchedObject = matchNavigationObject(localObjects);
+            if (matchedObject && openMatchedObject(matchedObject)) return;
+
+            if (!usesLocalOnlyCompletionMetadata()) {
               const scopedObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, objectSchemaHint, objectParentHint, false, props.schema, ["routine"]);
               matchedObject = matchSqlObject(identifier, scopedObjects);
               if (matchedObject && openMatchedObject(matchedObject)) return;
+            }
+          } else {
+            const localObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, unqualifiedObjectSchema);
+            let matchedObject = matchNavigationObject(localObjects);
+            if (matchedObject && openMatchedObject(matchedObject)) return;
+
+            if (!matchedObject && tableLookup.allowGlobalFallback && !tableLookup.preferGlobalFirst) {
+              const localGlobalObjects = connectionStore.lookupLocalCompletionObjects(props.connectionId!, props.database!, objectNameFilter, MAX_COMPLETION_TABLES, undefined);
+              matchedObject = matchNavigationObject(localGlobalObjects);
+              if (matchedObject && openMatchedObject(matchedObject)) return;
+            }
+
+            if (!usesLocalOnlyCompletionMetadata()) {
+              if (!tableLookup.preferGlobalFirst) {
+                const scopedObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, unqualifiedObjectSchema, objectParentHint, false, props.schema, ["routine"]);
+                matchedObject = matchNavigationObject(scopedObjects);
+                if (matchedObject && openMatchedObject(matchedObject)) return;
+
+                if (tableLookup.allowGlobalFallback) {
+                  const globalObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, undefined, objectParentHint, true, props.schema, ["routine"]);
+                  matchedObject = matchNavigationObject(globalObjects);
+                  if (matchedObject && openMatchedObject(matchedObject)) return;
+                }
+              } else {
+                const globalObjects = await connectionStore.listCompletionObjects(props.connectionId!, props.database!, objectNameFilter, 20, undefined, objectParentHint, true, props.schema, ["routine"]);
+                matchedObject = matchNavigationObject(globalObjects);
+                if (matchedObject && openMatchedObject(matchedObject)) return;
+              }
             }
           }
         }

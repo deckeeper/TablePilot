@@ -8,6 +8,9 @@ const mocks = vi.hoisted(() => ({
   readPluginUiEntry: vi.fn(),
   readPluginUiAsset: vi.fn(),
   subscribePluginEvents: vi.fn(),
+  subscribeHostObservations: vi.fn(),
+  setPluginObservationInterest: vi.fn(),
+  clearPluginObservationInterest: vi.fn(),
   repushPluginConnection: vi.fn(),
   reopenPluginConnection: vi.fn(),
   openDroppedPluginLocalFiles: vi.fn(),
@@ -16,6 +19,9 @@ const mocks = vi.hoisted(() => ({
   closePluginLocalFile: vi.fn(),
   openPluginWorkbench: vi.fn(),
   isTauriRuntime: vi.fn(),
+  // Made reactive by the settingsStore mock so a test can flip the per-plugin
+  // unsafe-eval grant after mount.
+  editorSettings: { uiFontFamily: "", fontFamily: "", fontSize: 14, pluginGraphicsEngineIds: [] as string[] },
 }));
 
 vi.mock("@/lib/backend/tauri", () => ({
@@ -32,20 +38,38 @@ vi.mock("@/lib/backend/api", () => ({
   readPluginUiEntry: mocks.readPluginUiEntry,
   readPluginUiAsset: mocks.readPluginUiAsset,
   subscribePluginEvents: mocks.subscribePluginEvents,
+  subscribeHostObservations: mocks.subscribeHostObservations,
+  setPluginObservationInterest: mocks.setPluginObservationInterest,
+  clearPluginObservationInterest: mocks.clearPluginObservationInterest,
 }));
 vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: mocks.isTauriRuntime }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: vi.fn() }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: ref(false), themeRevision: ref(0) }) }));
-vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { uiFontFamily: "", fontFamily: "", fontSize: 14 } }) }));
+vi.mock("@/stores/settingsStore", async () => {
+  const { reactive } = await import("vue");
+  mocks.editorSettings = reactive(mocks.editorSettings);
+  return { useSettingsStore: () => ({ editorSettings: mocks.editorSettings }) };
+});
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     repushPluginConnection: mocks.repushPluginConnection,
     reopenPluginConnection: mocks.reopenPluginConnection,
+    connections: [
+      { id: "conn-mysql", name: "Prod MySQL", db_type: "mysql", plugin_connection_provider: undefined, plugin_connection_type: undefined, read_only: false },
+      { id: "conn-sample", name: "Sample Connection", db_type: "plugin", plugin_connection_provider: "sample.provider", plugin_connection_type: "sample", read_only: true },
+    ],
+    connectedIds: new Set(["conn-mysql"]),
   }),
 }));
-vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({ openPluginWorkbench: mocks.openPluginWorkbench }) }));
+vi.mock("@/stores/queryStore", () => ({
+  useQueryStore: () => ({
+    openPluginWorkbench: mocks.openPluginWorkbench,
+    pluginWorkbenchTitles: vi.fn((_id: string) => ["Terminal 1"]),
+  }),
+}));
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ locale: ref("en"), t: (key: string) => key }) }));
 
+import { PLUGIN_CONNECTION_EDITOR } from "@/lib/connection/pluginConnectionEdit";
 import { clearPluginUiHtmlCache } from "@/lib/plugins/pluginUiHtmlCache";
 import PluginWorkbenchHost from "./PluginWorkbenchHost.vue";
 
@@ -76,6 +100,7 @@ describe("PluginWorkbenchHost initialization", () => {
   beforeEach(() => {
     clearPluginUiHtmlCache();
     vi.clearAllMocks();
+    mocks.editorSettings.pluginGraphicsEngineIds = [];
     mocks.isTauriRuntime.mockReturnValue(false);
     const settings = (window as unknown as { happyDOM: { settings: Record<string, boolean> } }).happyDOM.settings;
     settings.disableJavaScriptFileLoading = true;
@@ -85,6 +110,9 @@ describe("PluginWorkbenchHost initialization", () => {
     vi.stubGlobal("getComputedStyle", () => Object.assign([], { getPropertyValue: () => "" }));
     mocks.readPluginUiEntry.mockResolvedValue({ dataBase64: btoa("<!doctype html><html><body></body></html>"), contentType: "text/html" });
     mocks.subscribePluginEvents.mockResolvedValue(vi.fn());
+    mocks.subscribeHostObservations.mockResolvedValue(vi.fn());
+    mocks.setPluginObservationInterest.mockResolvedValue(undefined);
+    mocks.clearPluginObservationInterest.mockResolvedValue(undefined);
     mocks.closePluginLocalFile.mockResolvedValue(undefined);
     mocks.repushPluginConnection.mockReset().mockResolvedValue(undefined);
     mocks.reopenPluginConnection.mockResolvedValue(undefined);
@@ -115,6 +143,36 @@ describe("PluginWorkbenchHost initialization", () => {
     return { frame: frame!, postMessage, ready };
   }
 
+  it("registers observation interest only for plugins that declare host.observe", async () => {
+    mocks.isTauriRuntime.mockReturnValue(true);
+
+    const observer: InstalledPlugin = {
+      manifest: { ...plugin.manifest, permissions: ["host.observe:queries"] },
+      compatibility: { compatible: true },
+    };
+    app = createApp(PluginWorkbenchHost, { plugin: observer, contribution, context: { connectionId: "connection" } });
+    app.mount(root);
+    await flushWorkbenchLoad();
+
+    expect(mocks.setPluginObservationInterest).toHaveBeenCalledTimes(1);
+    const [ownerId, pluginId] = mocks.setPluginObservationInterest.mock.calls[0] as [string, string];
+    expect(ownerId.startsWith("plugin-workbench:sample:")).toBe(true);
+    expect(pluginId).toBe("sample");
+    expect(mocks.subscribeHostObservations).toHaveBeenCalledTimes(1);
+
+    app.unmount();
+    app = undefined;
+    // The bus may not keep building payloads for a closed workbench.
+    expect(mocks.clearPluginObservationInterest).toHaveBeenCalledWith(ownerId);
+  });
+
+  it("skips observation wiring for plugins without host.observe", async () => {
+    mocks.isTauriRuntime.mockReturnValue(true);
+    await mountHost();
+    expect(mocks.setPluginObservationInterest).not.toHaveBeenCalled();
+    expect(mocks.subscribeHostObservations).not.toHaveBeenCalled();
+  });
+
   it("passes the packaged module URL and existing asset CSP into srcdoc", async () => {
     mocks.isTauriRuntime.mockReturnValue(true);
     vi.stubEnv("PROD", true);
@@ -130,6 +188,35 @@ describe("PluginWorkbenchHost initialization", () => {
     expect(srcdoc).toContain('<base href="dbx-plugin://localhost/sample/entry/">');
     expect(srcdoc).toContain("script-src 'unsafe-inline' blob: dbx-plugin:;");
     expect(mocks.readPluginUiAsset).not.toHaveBeenCalled();
+  });
+
+  it("reuses the cached sandbox document across boots without re-reading the ui build", async () => {
+    const first = await mountHost();
+    const firstSrcdoc = first.frame.getAttribute("srcdoc") ?? "";
+    expect(firstSrcdoc).toContain("<body>");
+    expect(mocks.readPluginUiEntry).toHaveBeenCalledTimes(1);
+
+    app!.unmount();
+    const second = await mountHost();
+
+    // The inlined html was released after the document was built; a second
+    // panel still boots from the cached document alone.
+    expect(mocks.readPluginUiEntry).toHaveBeenCalledTimes(1);
+    expect(second.frame.getAttribute("srcdoc")).toBe(firstSrcdoc);
+  });
+
+  it("re-reads the ui build when the unsafe-eval grant flips after the html was released", async () => {
+    const { frame } = await mountHost();
+    expect(frame.getAttribute("srcdoc")).not.toContain("'unsafe-eval'");
+    expect(mocks.readPluginUiEntry).toHaveBeenCalledTimes(1);
+
+    // The cached document carries the CSP it was built with, and the html it was
+    // built from is gone, so the grant change must trigger a fresh read.
+    mocks.editorSettings.pluginGraphicsEngineIds = ["sample"];
+    await vi.waitFor(() => expect(mocks.readPluginUiEntry).toHaveBeenCalledTimes(2));
+    await flushWorkbenchLoad();
+
+    expect(root.querySelector("iframe")?.getAttribute("srcdoc")).toContain("'unsafe-eval'");
   });
 
   it("runs reinit before one init when load precedes ready", async () => {
@@ -318,5 +405,148 @@ describe("PluginWorkbenchHost initialization", () => {
     document.dispatchEvent(payload("leave"));
     expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "dragstate", active: false }), "*");
     elementFromPoint.mockRestore();
+  });
+
+  it("converts physical window coordinates to iframe CSS coordinates and throttles sub-pixel moves", async () => {
+    const { frame, postMessage } = await mountHost();
+    const elementFromPoint = vi.spyOn(document, "elementFromPoint").mockReturnValue(frame);
+    const getBoundingClientRect = vi.spyOn(frame, "getBoundingClientRect").mockReturnValue({
+      left: 20,
+      top: 30,
+      right: 320,
+      bottom: 230,
+      width: 300,
+      height: 200,
+      x: 20,
+      y: 30,
+      toJSON: () => ({}),
+    });
+    const originalDpr = window.devicePixelRatio;
+    Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
+
+    try {
+      // 1. Enter at physical (100, 120) -> CSS (50, 60) -> relative (30, 30)
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "enter", position: { x: 100, y: 120 } },
+          cancelable: true,
+        }),
+      );
+      expect(postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ type: "dragstate", active: true, position: { x: 30, y: 30 } }), "*");
+
+      postMessage.mockClear();
+
+      // 2. Over with sub-pixel move: physical (101, 120) -> CSS (50.5, 60) -> relative (30.5, 30) -> deltaX = 0.5 < 1px
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "over", position: { x: 101, y: 120 } },
+          cancelable: true,
+        }),
+      );
+      expect(postMessage).not.toHaveBeenCalled();
+
+      // 3. Over with >= 1px move: physical (110, 120) -> CSS (55, 60) -> relative (35, 30) -> deltaX = 5 >= 1px
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "over", position: { x: 110, y: 120 } },
+          cancelable: true,
+        }),
+      );
+      expect(postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ type: "dragstate", active: true, position: { x: 35, y: 30 } }), "*");
+
+      postMessage.mockClear();
+
+      // 4. Drop at physical (120, 140) -> CSS (60, 70) -> relative (40, 40)
+      mocks.openDroppedPluginLocalFiles.mockResolvedValueOnce({
+        dropId: "drop-coord-test",
+        truncated: false,
+        files: [{ handleId: "h-coord", name: "b.txt", size: 5, contentType: "text/plain", write: false }],
+      });
+      document.dispatchEvent(
+        new CustomEvent("dbx:tauri-file-drop", {
+          detail: { type: "drop", paths: ["/tmp/b.txt"], position: { x: 120, y: 140 } },
+          cancelable: true,
+        }),
+      );
+
+      await vi.waitFor(() => {
+        expect(postMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "filedrop",
+            position: { x: 40, y: 40 },
+            dropId: "drop-coord-test",
+          }),
+          "*",
+        );
+      });
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "dragstate",
+          active: false,
+        }),
+        "*",
+      );
+    } finally {
+      Object.defineProperty(window, "devicePixelRatio", { value: originalDpr, configurable: true });
+      getBoundingClientRect.mockRestore();
+      elementFromPoint.mockRestore();
+    }
+  });
+
+  it("routes field discovery and edit requests to the injected editor", async () => {
+    const pluginWithEdit = { ...plugin, manifest: { ...plugin.manifest, permissions: ["host.connections:edit"] } };
+    const fields = [{ key: "name", type: "text", maxLength: 256, allowEmpty: false }] as const;
+    const editor = { getFields: vi.fn(() => [...fields]), openEdit: vi.fn() };
+    app = createApp(PluginWorkbenchHost, { plugin: pluginWithEdit, contribution, context: { connectionId: "conn-mysql" } });
+    app.provide(PLUGIN_CONNECTION_EDITOR, editor);
+    app.mount(root);
+    await flushWorkbenchLoad();
+    const target = root.querySelector("iframe")!.contentWindow!;
+    const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
+
+    function request(method: string, params: unknown) {
+      window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: method, method, params } }));
+    }
+    request("host.getConnectionEditFields", { connectionId: "conn-mysql" });
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ id: "host.getConnectionEditFields", result: fields }), "*"));
+    expect(editor.getFields).toHaveBeenCalledExactlyOnceWith("conn-mysql");
+
+    request("host.openConnectionEdit", { connectionId: "conn-mysql" });
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ id: "host.openConnectionEdit", result: { opened: true } }), "*"));
+    expect(editor.openEdit).toHaveBeenCalledExactlyOnceWith({ connectionId: "conn-mysql", fields: {} });
+  });
+
+  it("serves all connections with connected status when plugin has host.connections:read", async () => {
+    const pluginWithPerm: InstalledPlugin = {
+      manifest: { id: "sample", name: "Sample", version: "1.0.0", permissions: ["host.connections:read"], drivers: [], contributions: [] },
+      compatibility: { compatible: true },
+    };
+    app = createApp(PluginWorkbenchHost, { plugin: pluginWithPerm, contribution, context: { connectionId: "connection" } });
+    app.mount(root);
+    await flushWorkbenchLoad();
+    const frame = root.querySelector("iframe")!;
+    const target = frame.contentWindow!;
+    const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
+    window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } }));
+    await vi.waitFor(() => expect(mocks.repushPluginConnection).toHaveBeenCalled());
+    postMessage.mockClear();
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id: "conn-req-1", method: "host.getConnections", params: {} },
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "dbx-host",
+          type: "response",
+          id: "conn-req-1",
+          result: expect.arrayContaining([expect.objectContaining({ id: "conn-mysql", name: "Prod MySQL", dbType: "mysql", dialect: "mysql", connected: true, isConnected: true }), expect.objectContaining({ id: "conn-sample", name: "Sample Connection", connected: false, isConnected: false })]),
+        }),
+        "*",
+      ),
+    );
   });
 });
