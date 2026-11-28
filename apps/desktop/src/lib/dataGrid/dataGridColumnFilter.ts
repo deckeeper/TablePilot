@@ -183,8 +183,12 @@ export function filterModeUsesRange(mode: DataGridContextFilterMode): boolean {
   return mode === "between" || mode === "not-between";
 }
 
+// Mirrors `is_postgres_like_pattern_database` in the Rust SQL builder.
+const ILIKE_DATABASE_TYPES: ReadonlySet<DatabaseType> = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "kwdb", "kingbase", "highgo", "uxdb", "vastbase", "gbase8c", "opengauss"]);
+
 export function filterModeIsSupportedForDatabase(mode: DataGridContextFilterMode, databaseType?: DatabaseType): boolean {
   if (databaseType === "victoriametrics") return false;
+  if (mode === "ilike" || mode === "not-ilike") return !!databaseType && ILIKE_DATABASE_TYPES.has(databaseType);
   if (!filterModeUsesList(mode) && !filterModeUsesRange(mode)) return true;
   // These targets do not support all four new SQL predicates reliably.
   return databaseType !== "cassandra" && databaseType !== "influxdb" && databaseType !== "jdbc";
@@ -210,6 +214,12 @@ export function parseFilterValue(rawValue: string, columnInfo?: Pick<DataGridCol
   }
 
   if (!dataType && isNumericLiteral(unquoted)) {
+    // Leading zeros are part of the user's text value, not numeric noise:
+    // Number("0000000") is 0, which turned a text-column filter into an
+    // integer comparison when the column type was not available (#13059).
+    if (/^[+-]?0\d/.test(unquoted)) {
+      return unquoted;
+    }
     const numeric = Number(unquoted);
     if (Number.isFinite(numeric)) {
       // Keep large integers as strings to avoid JS precision loss (> Number.MAX_SAFE_INTEGER).

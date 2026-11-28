@@ -4,8 +4,16 @@ import { createApp, defineComponent, h, markRaw, nextTick, ref, type App, type P
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
+import type { TransposedMarkdownLabels } from "@/lib/dataGrid/transposedMarkdown";
 import type { QueryResult } from "@/types/database";
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+const exportMarkdown = vi.hoisted(() => vi.fn(async (_path: string, _columns: string[], _rows: unknown[][], _transposed?: TransposedMarkdownLabels) => undefined));
+vi.mock("@/lib/backend/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/backend/api")>()),
+  exportQueryResultMarkdown: exportMarkdown,
+  saveEditorSettings: vi.fn(async () => undefined),
+}));
 
 vi.mock("vue-virtual-scroller", async () => {
   const { defineComponent, h } = await import("vue");
@@ -53,10 +61,10 @@ async function settle() {
 }
 
 function transposeFieldNames(host: HTMLElement): string[] {
-  return [...host.querySelectorAll<HTMLElement>("[data-grid-transpose-column-index]")].map((field) => field.textContent?.trim().split("\n")[0] ?? "");
+  return [...host.querySelectorAll<HTMLElement>("[data-grid-transpose-column-index]")].map((field) => field.querySelector<HTMLElement>("[data-grid-transpose-field-name]")?.textContent?.trim() ?? field.textContent?.trim().split("\n")[0] ?? "");
 }
 
-function mountGrid() {
+function mountGrid(context: "table-data" | "results" = "table-data") {
   const pinia = createPinia();
   setActivePinia(pinia);
   const settingsStore = useSettingsStore();
@@ -76,6 +84,8 @@ function mountGrid() {
       execution_time_ms: 0,
     }),
   );
+  const resultColumnComments = ref<Array<string | undefined>>();
+  const grid = ref<{ toggleColumnVisibility: (columnIndex: number) => void; moveDisplayableColumn: (from: number, to: number) => void }>();
 
   const host = document.createElement("div");
   document.body.append(host);
@@ -88,14 +98,16 @@ function mountGrid() {
           {
             default: () =>
               h(DataGrid, {
+                ref: grid,
                 result: result.value,
+                resultColumnComments: resultColumnComments.value,
                 databaseType: "mysql",
-                context: "table-data",
+                context,
                 tableMeta: {
                   tableName: "scores",
                   columns: [
-                    { name: "zeta", data_type: "varchar", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
-                    { name: "alpha", data_type: "bigint", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+                    { name: "zeta", data_type: "varchar", comment: "Display name with a long comment", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+                    { name: "alpha", data_type: "bigint", comment: "Score", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
                   ],
                   primaryKeys: ["zeta"],
                 },
@@ -109,16 +121,32 @@ function mountGrid() {
   app.use(i18n);
   app.mount(host);
   mountedApps.push({ app, host });
-  return { host };
+  return { host, settingsStore, result, resultColumnComments, grid };
 }
 
-async function openTranspose(host: HTMLElement) {
+async function openTranspose(host: HTMLElement, selectedRows = 1) {
   const firstRowNumber = host.querySelector<HTMLElement>(".data-grid-row-number");
   if (!firstRowNumber) throw new Error("Row number not found");
   firstRowNumber.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
   window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
+  if (selectedRows > 1) {
+    host.querySelectorAll<HTMLElement>(".data-grid-row-number")[selectedRows - 1]!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0, shiftKey: true }));
+    window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
+  }
   firstRowNumber.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, button: 0 }));
   await settle();
+}
+
+async function exportSelectedMarkdown(host: HTMLElement) {
+  const trigger = [...host.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.getAttribute("aria-label") === i18n.global.t("grid.export"));
+  if (!trigger) throw new Error("Export menu trigger not found");
+  trigger.click();
+  await settle();
+  const selected = [...document.querySelectorAll<HTMLButtonElement>("[data-export-menu-grid] button")].find((button) => button.getAttribute("aria-label") === i18n.global.t("grid.exportSelectedRowsMarkdown"));
+  expect(selected, "The real export menu must offer selected-row Markdown").toBeDefined();
+  selected!.click();
+  await vi.waitFor(() => expect(exportMarkdown).toHaveBeenCalledOnce());
+  return exportMarkdown.mock.calls[0]!;
 }
 
 afterEach(() => {
@@ -126,9 +154,168 @@ afterEach(() => {
     app.unmount();
     host.remove();
   }
+  exportMarkdown.mockClear();
 });
 
 describe("DataGrid transpose sorting", () => {
+  it("exports a selected transposed record as Markdown field/value rows through the real menu", async () => {
+    const { host, settingsStore } = mountGrid("results");
+    settingsStore.updateEditorSettings({ dataGridMultiRowTranspose: false });
+    await settle();
+    await openTranspose(host);
+    expect(host.querySelector("[data-grid-transpose-header]")).not.toBeNull();
+
+    const [path, headers, rows, transposed] = await exportSelectedMarkdown(host);
+    expect(path).toMatch(/\.md$/);
+    expect(headers).toEqual(["zeta", "alpha"]);
+    expect(rows).toEqual([["b", "10"]]);
+    expect(transposed).toEqual({ field: i18n.global.t("common.column"), data: i18n.global.t("settings.dataTab") });
+  });
+
+  it("exports only selected transpose records into separate Markdown value columns", async () => {
+    const { host } = mountGrid("results");
+    await settle();
+    await openTranspose(host, 2);
+
+    const [, headers, rows, transposed] = await exportSelectedMarkdown(host);
+    expect(headers).toEqual(["zeta", "alpha"]);
+    expect(rows).toEqual([
+      ["b", "10"],
+      ["a", null],
+    ]);
+    expect(transposed).toEqual({ field: i18n.global.t("common.column"), data: i18n.global.t("settings.dataTab") });
+  });
+
+  it("keeps selected-row Markdown in the normal table orientation outside transpose mode", async () => {
+    const { host } = mountGrid("results");
+    await settle();
+    const rowNumber = host.querySelector<HTMLElement>(".data-grid-row-number")!;
+    rowNumber.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+    window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
+    await settle();
+
+    const [, headers, rows] = await exportSelectedMarkdown(host);
+    expect(headers).toEqual(["zeta", "alpha"]);
+    expect(rows).toEqual([["b", "10"]]);
+    expect(exportMarkdown.mock.calls[0]).toHaveLength(3);
+  });
+
+  it("follows the displayed field sort when exporting transposed Markdown", async () => {
+    const { host } = mountGrid("results");
+    await settle();
+    await openTranspose(host);
+    host.querySelector<HTMLButtonElement>("[data-grid-transpose-column-sort]")!.click();
+    await settle();
+    expect(transposeFieldNames(host)).toEqual(["alpha", "zeta"]);
+
+    const [, headers, rows] = await exportSelectedMarkdown(host);
+    expect(headers).toEqual(["alpha", "zeta"]);
+    expect(rows).toEqual([["10", "b"]]);
+  });
+
+  it("keeps repeated field names paired with their values after hiding, reordering and sorting", async () => {
+    const { host, result, grid } = mountGrid("results");
+    result.value = { ...result.value, columns: ["zeta", "alpha", "alpha", "hidden"], column_types: ["varchar", "varchar", "varchar", "varchar"], rows: [["b", "first", "second", "not exported"]] };
+    await settle();
+    grid.value!.moveDisplayableColumn(2, 0);
+    grid.value!.toggleColumnVisibility(3);
+    await settle();
+    await openTranspose(host);
+    host.querySelector<HTMLButtonElement>("[data-grid-transpose-column-sort]")!.click();
+    await settle();
+    expect(transposeFieldNames(host)).toEqual(["alpha", "alpha", "zeta"]);
+    expect([...host.querySelectorAll<HTMLElement>("[data-grid-transpose-column-index]")].map((field) => field.dataset.gridTransposeColumnIndex)).toEqual(["2", "1", "0"]);
+
+    const [, headers, rows] = await exportSelectedMarkdown(host);
+    expect(headers).toEqual(["alpha", "alpha", "zeta"]);
+    expect(rows).toEqual([["second", "first", "b"]]);
+  });
+
+  it.each(["table-data", "results"] as const)("moves all field metadata into an independent information column for %s", async (context) => {
+    const { host, settingsStore } = mountGrid(context);
+    settingsStore.updateEditorSettings({ dataGridShowTransposeFieldMetadata: true });
+    await settle();
+    await openTranspose(host);
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(2);
+    expect(host.querySelector("[data-grid-transpose-column-info]")).toBeNull();
+
+    settingsStore.updateEditorSettings({ dataGridTransposeMetadataInInfoColumn: true });
+    await settle();
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(0);
+    expect(host.querySelectorAll("[data-grid-transpose-type-line]")).toHaveLength(0);
+    const info = [...host.querySelectorAll<HTMLElement>("[data-grid-transpose-column-info]")];
+    expect(info).toHaveLength(2);
+    expect(info[0].textContent).toContain("Display name with a long comment");
+    expect(info[0].textContent).toContain("varchar");
+    expect(info[0].textContent).toContain("Nullable: No");
+    expect(info[0].textContent).not.toContain("zeta");
+    expect(info[0].title).toContain("Display name with a long comment");
+    expect(info[1].textContent).toContain("Score");
+    expect(info[1].textContent).toContain("Nullable: Yes");
+
+    settingsStore.updateEditorSettings({ dataGridTransposeMetadataInInfoColumn: false });
+    await settle();
+    expect(host.querySelectorAll("[data-grid-transpose-column-info]")).toHaveLength(0);
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(2);
+    expect(host.querySelectorAll("[data-grid-transpose-type-line]")).toHaveLength(2);
+  });
+
+  it("keeps normal and transposed comment placement independent", async () => {
+    const { host, settingsStore } = mountGrid("results");
+    settingsStore.updateEditorSettings({ dataGridColumnCommentsInInfoArea: true, dataGridShowTransposeFieldMetadata: true });
+    await settle();
+    // #13171: the info-area comment is additive; the header line stays visible.
+    expect(host.querySelectorAll("[data-grid-header-comment-line]")).toHaveLength(2);
+    await openTranspose(host);
+    expect(host.querySelectorAll("[data-grid-transpose-column-info]")).toHaveLength(0);
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(2);
+
+    settingsStore.updateEditorSettings({ dataGridColumnCommentsInInfoArea: false, dataGridTransposeMetadataInInfoColumn: true, dataGridShowTransposeFieldMetadata: false });
+    await settle();
+    expect(host.querySelectorAll("[data-grid-transpose-column-info]")).toHaveLength(2);
+    expect(host.querySelectorAll("[data-grid-transpose-type-line]")).toHaveLength(0);
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(0);
+  });
+
+  it("uses ordinal query comments for duplicate names and clears stale metadata for a new result", async () => {
+    const { host, settingsStore, result, resultColumnComments } = mountGrid();
+    settingsStore.updateEditorSettings({ dataGridColumnCommentsInInfoArea: true });
+    result.value = { ...result.value, columns: ["name", "name"] };
+    resultColumnComments.value = ["First source", "Second source"];
+    await settle();
+    host.querySelector<HTMLElement>('[data-grid-column-index="1"]')!.click();
+    await settle();
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).toContain("Second source");
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).not.toContain("First source");
+
+    resultColumnComments.value = [undefined, undefined];
+    await settle();
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).toContain("bigint");
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).not.toContain("Second source");
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).not.toContain("undefined");
+  });
+
+  it("shows selected column metadata in the status area while keeping header comments", async () => {
+    const { host, settingsStore } = mountGrid();
+    await settle();
+    expect(host.querySelectorAll("[data-grid-header-comment-line]")).toHaveLength(2);
+    settingsStore.updateEditorSettings({ dataGridColumnCommentsInInfoArea: true });
+    await settle();
+    // #13171: both surfaces show at once.
+    expect(host.querySelectorAll("[data-grid-header-comment-line]")).toHaveLength(2);
+    host.querySelector<HTMLElement>('[data-grid-column-index="0"]')!.click();
+    await settle();
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).toContain("Display name with a long comment");
+    host.querySelector<HTMLElement>('[data-grid-column-index="1"]')!.click();
+    await settle();
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).toContain("Score");
+    expect(host.querySelector("[data-grid-column-info]")?.textContent).toContain("bigint");
+    settingsStore.updateEditorSettings({ dataGridColumnCommentsInInfoArea: false });
+    await settle();
+    expect(host.querySelector("[data-grid-column-info]")).toBeNull();
+    expect(host.querySelectorAll("[data-grid-header-comment-line]")).toHaveLength(2);
+  });
+
   it("sorts transpose field rows from the column-name header", async () => {
     const { host } = mountGrid();
     await settle();
@@ -150,5 +337,112 @@ describe("DataGrid transpose sorting", () => {
     trigger.click();
     await settle();
     expect(transposeFieldNames(host)).toEqual(["zeta", "alpha"]);
+  });
+
+  it("allows resizing and auto-fitting the independent transpose info column", async () => {
+    const { host, settingsStore } = mountGrid();
+    settingsStore.updateEditorSettings({ dataGridTransposeMetadataInInfoColumn: true });
+    await settle();
+    await openTranspose(host);
+
+    const handle = host.querySelector<HTMLElement>("[data-grid-transpose-info-resize-handle]");
+    expect(handle).not.toBeNull();
+
+    const headerInfoCell = handle!.parentElement as HTMLElement;
+    expect(headerInfoCell.style.width).toBe("360px");
+    const rowInfoCell = host.querySelector<HTMLElement>("[data-grid-transpose-column-info]");
+    expect(rowInfoCell?.style.width).toBe("360px");
+
+    // Drag to widen (+150px)
+    handle!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 200 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, clientX: 350 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    await settle();
+
+    expect(headerInfoCell.style.width).toBe("510px");
+    expect(rowInfoCell?.style.width).toBe("510px");
+
+    // Drag to narrow below min width (should clamp to minTransposeInfoWidth = 120px)
+    handle!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 350 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, clientX: -100 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    await settle();
+
+    expect(headerInfoCell.style.width).toBe("120px");
+    expect(rowInfoCell?.style.width).toBe("120px");
+
+    // Double-click to auto-fit
+    handle!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+    await settle();
+
+    const autoFittedWidth = parseInt(headerInfoCell.style.width, 10);
+    expect(autoFittedWidth).toBeGreaterThan(120);
+    expect(rowInfoCell?.style.width).toBe(`${autoFittedWidth}px`);
+  });
+
+  it("keeps the transpose header fixed and resizes record columns from it", async () => {
+    const { host } = mountGrid();
+    await settle();
+    await openTranspose(host);
+
+    const transposeHeader = host.querySelector<HTMLElement>("[data-grid-transpose-header]");
+    expect(transposeHeader).not.toBeNull();
+    expect(transposeHeader!.closest(".transpose-grid-scroller")).toBeNull();
+    expect(host.querySelector('[data-grid-transpose-cell][data-grid-transpose-record-index="0"] [data-grid-transpose-record-resize-handle]')).toBeNull();
+
+    const initialHeader = host.querySelector<HTMLElement>('[data-grid-transpose-record-header][data-grid-transpose-record-index="0"]');
+    const resizeHandle = initialHeader?.querySelector<HTMLElement>("[data-grid-transpose-record-resize-handle]");
+    const initialWidth = parseInt(initialHeader?.style.width ?? "0", 10);
+    expect(initialWidth).toBeGreaterThan(0);
+    expect(resizeHandle).not.toBeNull();
+    expect(host.querySelectorAll('[data-grid-transpose-cell][data-grid-transpose-record-index="0"]')).toHaveLength(2);
+
+    resizeHandle!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 200 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, clientX: 280 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    await settle();
+
+    const resizedHeader = host.querySelector<HTMLElement>('[data-grid-transpose-record-header][data-grid-transpose-record-index="0"]');
+    const resizedWidth = parseInt(resizedHeader?.style.width ?? "0", 10);
+    const resizedCells = [...host.querySelectorAll<HTMLElement>('[data-grid-transpose-cell][data-grid-transpose-record-index="0"]')];
+    expect(resizedWidth).toBeGreaterThan(initialWidth);
+    expect(resizedCells.map((cell) => cell.style.width)).toEqual([`${resizedWidth}px`, `${resizedWidth}px`]);
+
+    host.querySelector<HTMLElement>('[data-grid-transpose-record-header][data-grid-transpose-record-index="0"] [data-grid-transpose-record-resize-handle]')!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+    await settle();
+
+    const autoFittedHeader = host.querySelector<HTMLElement>('[data-grid-transpose-record-header][data-grid-transpose-record-index="0"]');
+    const autoFittedWidth = autoFittedHeader?.style.width;
+    expect(autoFittedWidth).not.toBe(`${resizedWidth}px`);
+    expect([...host.querySelectorAll<HTMLElement>('[data-grid-transpose-cell][data-grid-transpose-record-index="0"]')].map((cell) => cell.style.width)).toEqual([autoFittedWidth, autoFittedWidth]);
+  });
+
+  it("displays column comments and types in transpose view by default and allows toolbar toggling", async () => {
+    const { host, settingsStore } = mountGrid();
+    await settle();
+    await openTranspose(host);
+
+    // Displayed by default without manual configuration
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(2);
+    expect(host.querySelectorAll("[data-grid-transpose-type-line]")).toHaveLength(2);
+    expect(host.querySelector("[data-grid-transpose-comment-line]")?.textContent).toContain("Display name with a long comment");
+    expect(host.querySelector("[data-grid-transpose-type-line]")?.textContent).toContain("varchar");
+
+    // Toggle via toolbar button
+    const toggleBtn = host.querySelector<HTMLButtonElement>("[data-grid-transpose-toggle-metadata]");
+    expect(toggleBtn).not.toBeNull();
+    toggleBtn!.click();
+    await settle();
+
+    expect(settingsStore.editorSettings.dataGridShowTransposeFieldMetadata).toBe(false);
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(0);
+    expect(host.querySelectorAll("[data-grid-transpose-type-line]")).toHaveLength(0);
+
+    // Toggle back on via toolbar button
+    toggleBtn!.click();
+    await settle();
+    expect(settingsStore.editorSettings.dataGridShowTransposeFieldMetadata).toBe(true);
+    expect(host.querySelectorAll("[data-grid-transpose-comment-line]")).toHaveLength(2);
+    expect(host.querySelectorAll("[data-grid-transpose-type-line]")).toHaveLength(2);
   });
 });

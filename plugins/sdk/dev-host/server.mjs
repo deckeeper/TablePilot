@@ -314,9 +314,38 @@ export async function createMockHost(options) {
         requirePermission(manifest, "host.workbench");
         return { mockHostOpenFrame: await serialize(() => openFrame(session, p.context?.connectionId || frame.connectionId, p.contributionId, p.context)) };
       }
+      case "host.setTitle": {
+        requirePermission(manifest, "host.workbench");
+        const title = p.title === null || p.title === undefined ? null : typeof p.title === "string" ? p.title.trim() || null : null;
+        frame.title = title;
+        return { ok: true, title };
+      }
+      case "host.getTitle": {
+        requirePermission(manifest, "host.workbench");
+        return frame.title ?? "";
+      }
       case "host.reopenConnection": {
         if (typeof p.connectionId !== "string" || !p.connectionId) throw new Error("connectionId is invalid");
         return { ok: true, mockReopenConnection: p.connectionId };
+      }
+      case "host.getConnections":
+      case "host.listConnections": {
+        const hasConnectionsRead = manifest.permissions?.includes("host.connections:read") || manifest.permissions?.includes("host.connections::read");
+        if (!hasConnectionsRead) {
+          requirePermission(manifest, "host.workbench");
+        }
+        return [
+          {
+            id: frame.connectionId || "mock-conn-1",
+            name: "Mock Connection",
+            dbType: "sqlite",
+            dialect: "sqlite",
+            databaseType: "sqlite",
+            connected: true,
+            isConnected: true,
+            readOnly: false,
+          },
+        ];
       }
       case "host.storageGet":
       case "host.storageSet":
@@ -420,6 +449,53 @@ export async function createMockHost(options) {
         }
         case "/api/backend/restart":
           return restartBackend();
+        case "/api/observations/publish": {
+          // Simulation helper: DBX desktop is the real source of observation
+          // events; the dev host lets plugin authors feed fixtures through the
+          // same kind → permission gate the real bridge applies.
+          const event = p.event;
+          if (!event || typeof event !== "object" || typeof event.kind !== "string" || !event.kind) {
+            throw new Error("Invalid observation event");
+          }
+          // Mirrors `OBSERVATION_KINDS` in dbx-types (exact kinds, not
+          // prefixes): a kind that is not registered here is not delivered by
+          // the real host either, so the dev host must not leak it.
+          const permissionByKind = {
+            "query.started": "host.observe:queries",
+            "query.finished": "host.observe:queries",
+            "query.message": "host.observe:queries",
+            "connection.opened": "host.observe:connections",
+            "connection.open_failed": "host.observe:connections",
+            "connection.closed": "host.observe:connections",
+            "connection.liveness_lost": "host.observe:connections",
+            "connection.idle_closed": "host.observe:connections",
+            "ai.turn_started": "host.observe:ai",
+            "ai.turn_ended": "host.observe:ai",
+            "ai.text_delta": "host.observe:ai",
+            "ai.reasoning_delta": "host.observe:ai",
+            "ai.tool_call_started": "host.observe:ai",
+            "ai.tool_call_finished": "host.observe:ai",
+            "ai.approval_required": "host.observe:ai",
+            "ai.approval_resolved": "host.observe:ai",
+            "ai.write_sql_confirmation_required": "host.observe:ai",
+            "ai.production_write_blocked": "host.observe:ai",
+            "ai.response_complete": "host.observe:ai",
+            "ai.output_truncated": "host.observe:ai",
+            "ai.agent_finished": "host.observe:ai",
+            "ai.context_compacted": "host.observe:ai",
+            "ai.error": "host.observe:ai",
+            "transfer.progress": "host.observe:transfers",
+            "plugin.activated": "host.observe:plugins",
+            "plugin.activate_failed": "host.observe:plugins",
+            "plugin.status_changed": "host.observe:plugins",
+            "plugin.stopped": "host.observe:plugins",
+          };
+          const permission = Object.prototype.hasOwnProperty.call(permissionByKind, event.kind) ? permissionByKind[event.kind] : undefined;
+          const delivered = Boolean(permission && manifest.permissions?.includes(permission));
+          if (delivered) broadcast("hostevent", event);
+          diagnostics.record("debug", "event", delivered ? "宿主观测事件已模拟" : "缺少对应 host.observe 权限，事件被丢弃", { kind: event.kind });
+          return { delivered };
+        }
         default:
           throw new Error("Unknown mock host endpoint");
       }
@@ -486,6 +562,7 @@ export async function createMockHost(options) {
         "/api/connections/import",
         "/api/frames/close",
         "/api/backend/restart",
+        "/api/observations/publish",
       ];
       route = known.includes(path) ? path.replace("/api/", "") || "/" : "unknown";
       if (path === "/api/diagnostics") {

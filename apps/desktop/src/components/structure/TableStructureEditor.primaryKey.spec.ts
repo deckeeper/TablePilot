@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   executeQuery: vi.fn(),
   listDataTypes: vi.fn(),
   buildTableStructureChangeSql: vi.fn(),
+  buildCreateTableSql: vi.fn(),
   previewSqliteTableStructureChange: vi.fn(),
   buildMysqlAutoIncrementSql: vi.fn(),
   updateEditorSettings: vi.fn(),
@@ -34,7 +35,7 @@ const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
 }));
 
-vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
+vi.mock("vue-i18n", async (original) => ({ ...(await original<typeof import("vue-i18n")>()), useI18n: () => ({ t: (key: string) => key }) }));
 
 vi.mock("@lucide/vue", async () => {
   const { defineComponent, h } = await import("vue");
@@ -243,6 +244,7 @@ vi.mock("@/lib/backend/api", () => ({
   executeQuery: mocks.executeQuery,
   listDataTypes: mocks.listDataTypes,
   buildTableStructureChangeSql: mocks.buildTableStructureChangeSql,
+  buildCreateTableSql: mocks.buildCreateTableSql,
   previewSqliteTableStructureChange: mocks.previewSqliteTableStructureChange,
   buildMysqlAutoIncrementSql: mocks.buildMysqlAutoIncrementSql,
   buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
@@ -341,9 +343,19 @@ function draftWithColumns(count: number) {
 }
 
 async function mountEditor(
-  databaseType: "mysql" | "sqlserver" | "postgres" | "sqlite" | "oracle" | "oceanbase-oracle" | "iris" | "dameng" | "duckdb" | "informix" | "clickhouse",
+  databaseType: "mysql" | "sqlserver" | "postgres" | "sqlite" | "oracle" | "oceanbase-oracle" | "iris" | "dameng" | "duckdb" | "informix" | "clickhouse" | "saphana",
   isPrimaryKey = false,
-  options: { database?: string; dynamicTypes?: string[]; identity?: { seed: number; increment: number }; tableName?: string; columnName?: string; foreignKeyRefTable?: string; draftOverride?: ReturnType<typeof draft>; onDraftUpdate?: (value: unknown) => void } = {},
+  options: {
+    database?: string;
+    dynamicTypes?: string[];
+    identity?: { seed: number; increment: number };
+    tableName?: string;
+    tableType?: "table" | "view" | "materialized_view";
+    columnName?: string;
+    foreignKeyRefTable?: string;
+    draftOverride?: ReturnType<typeof draft>;
+    onDraftUpdate?: (value: unknown) => void;
+  } = {},
 ) {
   mocks.connection.db_type = databaseType;
   mocks.connection.name = databaseType;
@@ -359,6 +371,7 @@ async function mountEditor(
     database: options.database ?? "test",
     schema: "SYSDBA",
     tableName: options.tableName ?? "users",
+    tableType: options.tableType,
     draft: options.draftOverride ?? draft(isPrimaryKey, options.identity, options.columnName, options.foreignKeyRefTable),
     "onUpdate:draft": options.onDraftUpdate,
   });
@@ -449,6 +462,71 @@ afterEach(() => {
 });
 
 describe("TableStructureEditor primary key editing", () => {
+  it.each(["view", "materialized_view"] as const)("passes the PostgreSQL %s kind when generating comment SQL", async (tableType) => {
+    const root = await mountEditor("postgres", false, { tableName: "orders_view", tableType });
+    const input = root.querySelector<HTMLInputElement>("[data-table-comment-input]")!;
+    expect(input.disabled).toBe(false);
+    input.value = "new comment";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    await vi.waitFor(() => expect(mocks.buildTableStructureChangeSql).toHaveBeenLastCalledWith(expect.objectContaining({ databaseType: "postgres", tableName: "orders_view", tableType, tableComment: "new comment" })));
+  });
+
+  it.each(["table", "view"] as const)("passes the HANA %s kind when generating comment SQL", async (tableType) => {
+    const root = await mountEditor("saphana", false, { database: "", tableName: "V_6200_YGMBBK", tableType });
+    const input = root.querySelector<HTMLInputElement>("[data-table-comment-input]")!;
+    expect(input.disabled).toBe(false);
+    input.value = "员工目标";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(mocks.buildTableStructureChangeSql).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          databaseType: "saphana",
+          schema: "SYSDBA",
+          tableName: "V_6200_YGMBBK",
+          tableType,
+          tableComment: "员工目标",
+          originalTableComment: "",
+        }),
+      ),
+    );
+  });
+
+  it("adds a column in HANA create mode", async () => {
+    mocks.buildCreateTableSql.mockResolvedValue({ statements: [], warnings: [] });
+    const root = await mountEditor("saphana", false, { tableName: "", draftOverride: { ...draft(), newTableName: "new_table", columns: [] } });
+    const addColumn = buttonWithText(root, "structureEditor.addColumn");
+    expect(addColumn.disabled).toBe(false);
+
+    addColumn.click();
+    await nextTick();
+    const nameInput = root.querySelector<HTMLInputElement>('[data-column-row-index="0"] [data-column-name-input]')!;
+    nameInput.value = "new_col";
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+
+    await vi.waitFor(() => expect(mocks.buildCreateTableSql).toHaveBeenLastCalledWith(expect.objectContaining({ databaseType: "saphana", schema: "SYSDBA", tableName: "new_table", columns: [expect.objectContaining({ name: "new_col" })] }), undefined, undefined));
+  });
+
+  it("submits a primary key for an existing HANA table without one", async () => {
+    const root = await mountEditor("saphana");
+    const primaryKey = columnCheckbox(root, "structureEditor.primaryKey");
+    expect(primaryKey.disabled).toBe(false);
+
+    primaryKey.checked = true;
+    primaryKey.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(mocks.buildTableStructureChangeSql).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          databaseType: "saphana",
+          columns: [expect.objectContaining({ isPrimaryKey: true, isNullable: false })],
+        }),
+      ),
+    );
+    expect(root.querySelector("[data-primary-key-name-input]")).toBeNull();
+  });
+
   it("allows enabling identity on an existing Dameng integer column", async () => {
     const root = await mountEditor("dameng");
     const identity = columnPropertyCheckbox(root, "structureEditor.identity");

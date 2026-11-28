@@ -25,12 +25,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function createHarness(overrides: Partial<QueryEditorProps> = {}, semanticCompletionEnabled = false) {
+async function createHarness(overrides: Partial<QueryEditorProps> = {}, semanticCompletionEnabled = false, tableHoverLookupMode: "current" | "fallback" | "always" = "current") {
   const props = reactive<QueryEditorProps>({ modelValue: "SELECT * FROM users", databaseType: "postgres", dialect: "postgres", connectionId: "connection", database: "demo", schema: "public", ...overrides });
   const host = document.createElement("div");
   document.body.append(host);
   const currentView = new EditorView({ parent: host, state: EditorState.create({ doc: props.modelValue }) });
-  const position = vi.spyOn(currentView, "posAtCoords").mockReturnValue(props.modelValue.lastIndexOf("users") + 2);
+  const defaultToken = props.modelValue.includes("users") ? "users" : (props.modelValue.match(/[A-Za-z_][\w$]*/g)?.at(-1) ?? "users");
+  const position = vi.spyOn(currentView, "posAtCoords").mockReturnValue(Math.max(0, props.modelValue.lastIndexOf(defaultToken)) + Math.min(2, defaultToken.length));
   vi.spyOn(currentView, "focus").mockImplementation(() => {});
   const view = shallowRef<EditorView | null>(currentView);
   const store = {
@@ -47,7 +48,7 @@ async function createHarness(overrides: Partial<QueryEditorProps> = {}, semantic
   const runtime = createQueryEditorCodeMirrorRuntime();
   await runtime.load();
   runtime.setResultSourceRangeEffect = StateEffect.define<{ from: number; to: number } | null>();
-  const settings = { editorSettings: { tableHoverLookupMode: "current" } } as Options["settingsStore"];
+  const settings = { editorSettings: { tableHoverLookupMode } } as Options["settingsStore"];
   const emit = vi.fn();
   const dismissHoverTooltip = vi.fn();
   const startEditorSelectionDrag = vi.fn(() => false);
@@ -69,6 +70,19 @@ async function createHarness(overrides: Partial<QueryEditorProps> = {}, semantic
 }
 
 describe("QueryEditor object navigation ownership", () => {
+  it.each([false, true])("opens a complete MySQL fullwidth table name (semantic=%s)", async (semantic) => {
+    const name = "医疗服务项目限年龄（省级）_事后_tab_1";
+    const database = "归档库（省级）";
+    const modelValue = `SELECT * FROM ${database}.${name} gt1;`;
+    const { store, position, emit, click } = await createHarness({ modelValue, databaseType: "mysql", dialect: "mysql", database: "demo", schema: undefined }, semantic);
+    position.mockReturnValue(modelValue.lastIndexOf("省级"));
+    store.lookupLocalCompletionTables.mockReturnValue([{ name, database, type: "table" }]);
+    expect((await click()).handled).toBe(true);
+    expect(emit).toHaveBeenCalledWith("clickTable", expect.objectContaining({ name, database }));
+    expect(store.lookupLocalCompletionObjects).not.toHaveBeenCalled();
+    expect(store.listCompletionObjects).not.toHaveBeenCalled();
+  });
+
   it("gives existing selection dragging priority over object navigation", async () => {
     const harness = await createHarness();
     harness.startEditorSelectionDrag.mockReturnValue(true);
@@ -128,6 +142,60 @@ describe("QueryEditor object navigation ownership", () => {
     expect(store.listCompletionTables).not.toHaveBeenCalled();
   });
 
+  it("falls back across schemas for unqualified routines in fallback mode", async () => {
+    const sql = "CALL cleanup()";
+    const { store, position, emit, click } = await createHarness({ modelValue: sql, schema: "public" }, false, "fallback");
+    position.mockReturnValue(sql.indexOf("cleanup") + 2);
+    store.listCompletionObjects.mockImplementation(async (_connectionId, _database, _filter, _limit, schema, _parent, globalSearch) => {
+      if (globalSearch) return [{ name: "cleanup", schema: "reporting", type: "procedure" }];
+      if (schema === "public") return [];
+      return [];
+    });
+    await click();
+    expect(store.listCompletionObjects).toHaveBeenCalledWith("connection", "demo", "cleanup", 20, "public", undefined, false, "public", ["routine"]);
+    expect(store.listCompletionObjects).toHaveBeenCalledWith("connection", "demo", "cleanup", 20, undefined, undefined, true, "public", ["routine"]);
+    expect(emit).toHaveBeenCalledWith("openObjectSource", expect.objectContaining({ name: "cleanup", schema: "reporting", type: "procedure" }), false);
+  });
+
+  it("does not cross schemas for unqualified routines in current mode", async () => {
+    const sql = "CALL cleanup()";
+    const { store, position, emit, click } = await createHarness({ modelValue: sql, schema: "public" }, false, "current");
+    position.mockReturnValue(sql.indexOf("cleanup") + 2);
+    store.listCompletionObjects.mockResolvedValue([]);
+    await click();
+    expect(store.listCompletionObjects).toHaveBeenCalledWith("connection", "demo", "cleanup", 20, "public", undefined, false, "public", ["routine"]);
+    expect(store.listCompletionObjects.mock.calls.some((call) => call[6] === true)).toBe(false);
+    expect(emit).toHaveBeenCalledWith("openObjectSource", expect.objectContaining({ name: "cleanup", schema: "public", type: "procedure" }), false);
+  });
+
+  it("searches all schemas first for unqualified routines in always mode", async () => {
+    const sql = "CALL cleanup()";
+    const { store, position, emit, click } = await createHarness({ modelValue: sql, schema: "public" }, false, "always");
+    position.mockReturnValue(sql.indexOf("cleanup") + 2);
+    store.listCompletionObjects.mockResolvedValue([
+      { name: "cleanup", schema: "reporting", type: "procedure" },
+      { name: "cleanup", schema: "public", type: "procedure" },
+    ]);
+    await click();
+    expect(store.listCompletionObjects).toHaveBeenCalledWith("connection", "demo", "cleanup", 20, undefined, undefined, true, "public", ["routine"]);
+    expect(store.listCompletionObjects.mock.calls.some((call) => call[4] === "public" && call[6] === false)).toBe(false);
+    expect(emit).toHaveBeenCalledWith("openObjectSource", expect.objectContaining({ name: "cleanup", schema: "public", type: "procedure" }), false);
+  });
+
+  it("keeps qualified routine lookups scoped without global fallback", async () => {
+    const sql = "CALL reporting.cleanup()";
+    const { store, position, emit, click } = await createHarness({ modelValue: sql, schema: "public" }, false, "fallback");
+    position.mockReturnValue(sql.indexOf("cleanup") + 2);
+    store.listCompletionObjects.mockImplementation(async (_connectionId, _database, _filter, _limit, schema, parent) => {
+      if (schema === "public" && parent === "reporting") return [];
+      if (schema === "reporting") return [{ name: "cleanup", schema: "reporting", type: "procedure" }];
+      return [];
+    });
+    await click();
+    expect(store.listCompletionObjects.mock.calls.some((call) => call[6] === true)).toBe(false);
+    expect(emit).toHaveBeenCalledWith("openObjectSource", expect.objectContaining({ name: "cleanup", schema: "reporting", type: "procedure" }), false);
+  });
+
   it("jumps to CTE definitions without querying physical table metadata", async () => {
     const sql = "WITH picked AS (SELECT id FROM users) SELECT id FROM picked";
     const { position, currentView, runtime, emit, click, store } = await createHarness({ modelValue: sql }, true);
@@ -175,5 +243,55 @@ describe("QueryEditor object navigation ownership", () => {
     navigation.updateTableNavigationHover(currentView, event());
     window.dispatchEvent(new Event("blur"));
     expect(host.classList.contains("query-editor--table-navigation-hover")).toBe(true);
+  });
+});
+
+describe("Oracle package source navigation", () => {
+  const PACKAGE_SPEC = `CREATE OR REPLACE PACKAGE LLMES.BZ_EM_PRO AS
+  PROCEDURE BZ_EM_CLEAN_REC_E(V0 STR_ARY_TYPE, IRET OUT VARCHAR2, SRET OUT VARCHAR2);
+END BZ_EM_PRO;`;
+  const PACKAGE_BODY = `CREATE OR REPLACE PACKAGE BODY LLMES.BZ_EM_PRO AS
+  PROCEDURE BZ_EM_CLEAN_REC_S(V0 STR_ARY_TYPE) IS
+  BEGIN
+    BZ_EM_CLEAN_REC_E(V0);
+  END BZ_EM_CLEAN_REC_S;
+
+  PROCEDURE BZ_EM_CLEAN_REC_E(V0 STR_ARY_TYPE) IS
+  BEGIN
+    NULL;
+  END BZ_EM_CLEAN_REC_E;
+END BZ_EM_PRO;`;
+  const oracleProps = (modelValue: string, objectType: "PACKAGE" | "PACKAGE_BODY") => ({
+    modelValue,
+    databaseType: "oracle" as const,
+    dialect: undefined,
+    schema: "LLMES",
+    packageSource: { name: "BZ_EM_PRO", schema: "LLMES", objectType },
+  });
+
+  it("opens the package body for a spec declaration instead of a missing standalone procedure", async () => {
+    const { position, store, emit, click } = await createHarness(oracleProps(PACKAGE_SPEC, "PACKAGE"));
+    position.mockReturnValue(PACKAGE_SPEC.indexOf("BZ_EM_CLEAN_REC_E") + 2);
+    expect((await click()).handled).toBe(true);
+    expect(emit).toHaveBeenCalledWith("openObjectSource", expect.objectContaining({ name: "BZ_EM_CLEAN_REC_E", type: "procedure", parentName: "BZ_EM_PRO", parentSchema: "LLMES" }), false);
+    expect(store.listCompletionObjects).not.toHaveBeenCalled();
+    expect(store.listCompletionTables).not.toHaveBeenCalled();
+  });
+
+  it("jumps to the implementation inside the body without opening another tab", async () => {
+    const { position, currentView, emit, click } = await createHarness(oracleProps(PACKAGE_BODY, "PACKAGE_BODY"));
+    const call = PACKAGE_BODY.indexOf("BZ_EM_CLEAN_REC_E(V0);");
+    position.mockReturnValue(call + 2);
+    expect((await click()).handled).toBe(true);
+    expect(emit).not.toHaveBeenCalled();
+    expect(currentView.state.selection.main.from).toBe(PACKAGE_BODY.indexOf("BZ_EM_CLEAN_REC_E(V0 STR_ARY_TYPE) IS"));
+  });
+
+  it("still resolves unrelated identifiers through metadata", async () => {
+    const { position, store, emit, click } = await createHarness(oracleProps(PACKAGE_BODY, "PACKAGE_BODY"));
+    position.mockReturnValue(PACKAGE_BODY.indexOf("STR_ARY_TYPE") + 2);
+    store.lookupLocalCompletionTables.mockReturnValue([{ name: "STR_ARY_TYPE", schema: "LLMES", type: "table" }]);
+    await click();
+    expect(emit).toHaveBeenCalledWith("clickTable", expect.objectContaining({ name: "STR_ARY_TYPE" }));
   });
 });

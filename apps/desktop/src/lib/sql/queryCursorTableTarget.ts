@@ -1,4 +1,5 @@
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
+import { connectionUsesConnectionRootSchemaMode, type JdbcDialectConnection } from "@/lib/database/jdbcDialect";
 import { extractIdentifierPartsAt, isSqlKeyword, sqlObjectNavigationTarget, type SqlObjectNavigationTarget, type SqlObjectNavigationType } from "@/lib/sql/sqlNavigation";
 import type { ActiveTabSidebarTarget } from "@/lib/sidebar/sidebarActiveTabTarget";
 import type { SqlCompletionTable } from "@/lib/sql/sqlCompletion";
@@ -100,9 +101,18 @@ export function resolveQueryContextCandidateDatabase(candidate: QueryCursorTable
   return database && database !== candidate.database ? { ...candidate, database } : candidate;
 }
 
-export function resolveQueryContextObjectTarget(candidate: QueryCursorTableCandidate, tables: readonly SqlCompletionTable[]): SqlObjectNavigationTarget {
+export function resolveQueryContextObjectTarget(candidate: QueryCursorTableCandidate, tables: readonly SqlCompletionTable[], preferredSchema?: string): SqlObjectNavigationTarget {
   const nameMatches = tables.filter((table) => sameIdentifier(table.name, candidate.tableName));
-  const match = candidate.schema ? (nameMatches.find((table) => sameIdentifier(table.schema, candidate.schema)) ?? nameMatches.find((table) => !table.schema)) : nameMatches[0];
+  // An unqualified name is ambiguous across schemas. When the SQL did not name a
+  // schema, prefer the query tab's schema (or the connection default) instead of
+  // the first cache entry: otherwise a view in the current schema can be resolved
+  // as a same-named table in another schema (#12865). An explicit schema in the
+  // SQL still wins.
+  const match = candidate.schema
+    ? (nameMatches.find((table) => sameIdentifier(table.schema, candidate.schema)) ?? nameMatches.find((table) => !table.schema))
+    : preferredSchema
+      ? (nameMatches.find((table) => sameIdentifier(table.schema, preferredSchema)) ?? nameMatches.find((table) => !table.schema) ?? nameMatches[0])
+      : nameMatches[0];
   return sqlObjectNavigationTarget({
     name: match?.name ?? candidate.tableName,
     database: candidate.database,
@@ -157,18 +167,18 @@ function sameIdentifier(left: string | undefined, right: string | undefined): bo
   return (left || "").toLowerCase() === (right || "").toLowerCase();
 }
 
-function nodeMatchesCandidate(node: TreeNode, candidate: QueryCursorTableCandidate): boolean {
+function nodeMatchesCandidate(node: TreeNode, candidate: QueryCursorTableCandidate, matchAnyDatabase = false): boolean {
   if (node.type !== "table" && node.type !== "view" && node.type !== "materialized_view") return false;
   if (node.connectionId !== candidate.connectionId) return false;
   if ((node.catalog || undefined) !== (candidate.catalog || undefined)) return false;
-  if (!sameIdentifier(node.database, candidate.database)) return false;
+  if (!matchAnyDatabase && !sameIdentifier(node.database, candidate.database)) return false;
   if (candidate.schema && !sameIdentifier(node.schema || node.database, candidate.schema)) return false;
   return sameIdentifier(node.label, candidate.tableName);
 }
 
-export function findLoadedTableTargetForCandidate(nodes: readonly TreeNode[], candidate: QueryCursorTableCandidate): ActiveTabSidebarTarget | null {
+export function findLoadedTableTargetForCandidate(nodes: readonly TreeNode[], candidate: QueryCursorTableCandidate, options?: { matchAnyDatabase?: boolean }): ActiveTabSidebarTarget | null {
   for (const node of nodes) {
-    if (nodeMatchesCandidate(node, candidate)) {
+    if (nodeMatchesCandidate(node, candidate, options?.matchAnyDatabase)) {
       return {
         type: "table",
         connectionId: candidate.connectionId,
@@ -180,10 +190,68 @@ export function findLoadedTableTargetForCandidate(nodes: readonly TreeNode[], ca
     }
 
     if (node.children) {
-      const found = findLoadedTableTargetForCandidate(node.children, candidate);
+      const found = findLoadedTableTargetForCandidate(node.children, candidate, options);
       if (found) return found;
     }
   }
 
   return null;
+}
+
+function findLoadedSchemaNode(nodes: readonly TreeNode[], connectionId: string, schema: string): TreeNode | null {
+  for (const node of nodes) {
+    if (node.type === "schema" && node.connectionId === connectionId && sameIdentifier(node.database, schema) && sameIdentifier(node.schema || node.label, schema)) {
+      return node;
+    }
+    if (node.children) {
+      const found = findLoadedSchemaNode(node.children, connectionId, schema);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolves the effective schema name for locating in connection-root-schema trees
+ * (Oracle, Dameng, OceanBase Oracle), falling back from service/DB name to login user.
+ */
+export function resolveConnectionRootLocateSchema(nodes: readonly TreeNode[], connectionId: string | undefined, candidateSchema: string | undefined, connection?: JdbcDialectConnection & { username?: string }): string {
+  if (!connectionId) return candidateSchema || "";
+  if (candidateSchema) {
+    const schemaNode = findLoadedSchemaNode(nodes, connectionId, candidateSchema);
+    if (schemaNode) return schemaNode.schema || schemaNode.label;
+  }
+  const loginSchema = connection?.username?.trim();
+  if (loginSchema) {
+    const loginNode = findLoadedSchemaNode(nodes, connectionId, loginSchema);
+    if (loginNode) return loginNode.schema || loginNode.label;
+    return loginSchema;
+  }
+  return candidateSchema || "";
+}
+
+/**
+ * Aligns a locate candidate's `database` and `schema` fields with how the sidebar tree
+ * indexes connection-root-schema engines so loaded lookups and lazy expansion hit the schema node.
+ */
+export function normalizeLocateCandidate(candidate: QueryCursorTableCandidate, nodes: readonly TreeNode[], connection?: JdbcDialectConnection & { username?: string }): QueryCursorTableCandidate {
+  if (!connectionUsesConnectionRootSchemaMode(connection)) return candidate;
+  if (candidate.schema) {
+    return { ...candidate, database: candidate.schema };
+  }
+  const loadedMatch = findLoadedTableTargetForCandidate(nodes, candidate, { matchAnyDatabase: true });
+  if (loadedMatch && loadedMatch.type === "table") {
+    return {
+      ...candidate,
+      database: loadedMatch.database,
+      schema: loadedMatch.schema || loadedMatch.database,
+    };
+  }
+  const resolvedSchema = resolveConnectionRootLocateSchema(nodes, candidate.connectionId, candidate.database, connection);
+  return resolvedSchema ? { ...candidate, database: resolvedSchema, schema: resolvedSchema } : candidate;
+}
+
+export function resolveLoadedLocateTarget(nodes: readonly TreeNode[], target: ActiveTabSidebarTarget, candidate: QueryCursorTableCandidate | null, connection?: JdbcDialectConnection): ActiveTabSidebarTarget | null {
+  if (!candidate) return target;
+  return findLoadedTableTargetForCandidate(nodes, candidate) ?? (!candidate.schema && connectionUsesConnectionRootSchemaMode(connection) ? findLoadedTableTargetForCandidate(nodes, candidate, { matchAnyDatabase: true }) : null);
 }

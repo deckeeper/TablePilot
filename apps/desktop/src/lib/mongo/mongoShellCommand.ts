@@ -1,5 +1,5 @@
 import type { QueryResult } from "@/types/database";
-import { isMongoExtendedJsonId, mongoDocumentGridValue, mongoDocumentIdForGrid } from "@/lib/mongo/mongoDocumentValues";
+import { isMongoExtendedJsonId, mongoDocumentGridColumnTypes, mongoDocumentGridValue, mongoDocumentIdForGrid } from "@/lib/mongo/mongoDocumentValues";
 import {
   chainedMethodCallPattern,
   describeMongoCommandParseFailure as describeMongoCommandParseFailureBasic,
@@ -118,7 +118,7 @@ const DATABASE_METHOD_SHAPES: Record<string, MongoMethodShape> = {
 
 const SUPPORTED_DATABASE_METHODS = ["version", "stats", "serverStatus", "createCollection", "createView", "dropDatabase", "createUser", "getUsers", "getUser", "getRoles", "getRole", "runCommand", "getCollection", "getSiblingDB"];
 
-const SUPPORTED_VALUE_CONSTRUCTORS = ["ObjectId", "ISODate", "new Date", "NumberLong", "NumberInt", "NumberDecimal", "UUID", "BinData", "Timestamp", "MinKey", "MaxKey"];
+const SUPPORTED_VALUE_CONSTRUCTORS = ["ObjectId", "ISODate", "new Date", "NumberLong", "NumberInt", "NumberDecimal", "Int32", "Long", "Double", "Decimal128", "UUID", "BinData", "Timestamp", "MinKey", "MaxKey"];
 
 const COMMAND_SHAPE = /^db\s*(?:\.\s*(?<collection>[A-Za-z_$][\w$]*)|\[\s*(["'])(?<bracket>.*?)\2\s*\]|\.\s*getCollection\s*\(\s*(["'])(?<named>.*?)\4\s*\))?\s*\.\s*(?<method>[A-Za-z_$][\w$]*)\s*\(/;
 
@@ -210,7 +210,7 @@ function diagnoseMongoCommand(source: string): string | null {
 
 /** First `Name(` outside a string that is not a constructor the parser understands. */
 function findUnsupportedValueConstructor(argument: string): string | null {
-  const known = new Set(["ObjectId", "ISODate", "Date", "NumberLong", "NumberInt", "NumberDecimal", "UUID", "BinData", "Timestamp", "MinKey", "MaxKey", "deserialize"]);
+  const known = new Set(["ObjectId", "ISODate", "Date", "NumberLong", "NumberInt", "NumberDecimal", "Int32", "Long", "Double", "Decimal128", "UUID", "BinData", "Timestamp", "MinKey", "MaxKey", "deserialize"]);
   let quote: string | null = null;
   let escaped = false;
   for (let index = 0; index < argument.length; index += 1) {
@@ -221,7 +221,7 @@ function findUnsupportedValueConstructor(argument: string): string | null {
       else if (char === quote) quote = null;
       continue;
     }
-    if (char === '"' || char === "'") {
+    if (char === '"' || char === "'" || char === "`") {
       quote = char;
       continue;
     }
@@ -1229,28 +1229,32 @@ export interface MongoDocumentsToQueryResultOptions {
 
 export function mongoDocumentsToQueryResult(documents: unknown[], executionTimeMs: number, total: number, copyDocuments?: unknown[], totalIsExact = true, options: MongoDocumentsToQueryResultOptions = {}): QueryResult {
   const documentGridValues = options.documentGridValues !== false;
-  const columns: string[] = [];
-
+  const columnNames = new Set<string>();
   for (const doc of documents) {
     if (isRecord(doc)) {
-      for (const key of Object.keys(doc)) {
-        if (!columns.includes(key)) columns.push(key);
-      }
-    } else if (!columns.includes("value")) {
-      columns.push("value");
+      for (const key of Object.keys(doc)) columnNames.add(key);
+    } else {
+      columnNames.add("value");
     }
   }
+  const columns = Array.from(columnNames);
 
   const rows = documents.map((doc) => {
     if (isRecord(doc)) return columns.map((column) => toCellValue(doc[column], documentGridValues));
     return columns.map((column) => (column === "value" ? toCellValue(doc, documentGridValues) : null));
   });
 
+  const canonicalDocuments = copyDocuments?.length === documents.length ? copyDocuments : undefined;
+  // Query cells keep their existing text for editing and export. Only canonical
+  // BSON dates provide evidence that the column should use date display settings.
+  const dateColumnTypes = documentGridValues && canonicalDocuments ? mongoDocumentGridColumnTypes(canonicalDocuments.filter(isRecord), columns, "datesOnly") : [];
+
   return {
     columns,
     rows,
+    ...(dateColumnTypes.includes("datetime") ? { column_types: dateColumnTypes } : {}),
     mongo_documents: documents,
-    ...(copyDocuments?.length === documents.length ? { mongo_copy_documents: copyDocuments } : {}),
+    ...(canonicalDocuments ? { mongo_copy_documents: canonicalDocuments } : {}),
     ...(totalIsExact ? {} : { total_is_exact: false }),
     affected_rows: total,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
@@ -1690,7 +1694,7 @@ function mongoCommentAwareBodyEnd(source: string, start: number, end: number): n
       bodyEnd = i;
       continue;
     }
-    if (char === '"' || char === "'") {
+    if (char === '"' || char === "'" || char === "`") {
       quote = char;
       i += 1;
       bodyEnd = i;

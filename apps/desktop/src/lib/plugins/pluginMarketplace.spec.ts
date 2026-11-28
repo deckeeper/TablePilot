@@ -1,12 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildInstalledUpdateIndex,
   buildMarketplacePluginListings,
   compareVersions,
+  extractRepositoryBaseUrl,
+  fetchPluginInstallCounts,
   filterMarketplacePluginListings,
   formatMarketplaceReleasedDate,
+  markPluginRequiresNewerDbx,
   marketplaceHomepageUrl,
+  parsePluginIncompatibility,
   pluginSourceChange,
+  requirementSatisfiedByNewerVersion,
+  resetPluginRequiresNewerDbxMarks,
+  resolveMarketplaceReleaseUrl,
   selectMarketplaceArtifact,
   sortMarketplacePluginListings,
   type MarketplacePluginListing,
@@ -136,6 +143,130 @@ describe("plugin marketplace listings", () => {
     expect(marketplaceHomepageUrl("https://github.com/dbxio/example/", "https://github.com/dbxio/example#readme")).toBeUndefined();
     expect(marketplaceHomepageUrl("https://github.com/dbxio/example", "https://dbxio.com/plugins/example")).toBe("https://dbxio.com/plugins/example");
   });
+
+  it("greys out an update the catalog marks incompatible with this host", () => {
+    const incompatible = structuredClone(result);
+    incompatible.catalog!.plugins[0].versions[0].compatibility = { compatible: false, dbx: ">=0.7.0", blockedBy: "dbx" };
+    const listings = buildMarketplacePluginListings([incompatible], [installed("1.0.0")], "en");
+
+    expect(listings[0]).toMatchObject({ status: "requires-newer-dbx", requiredEngine: ">=0.7.0" });
+    // The update badge, batch selection, and the automatic pass all key off status === "update".
+    expect(listings.filter((listing) => listing.status === "update")).toHaveLength(0);
+  });
+
+  it("keeps an installed version installed even when the catalog marks that version incompatible", () => {
+    const incompatible = structuredClone(result);
+    incompatible.catalog!.plugins[0].versions[0].compatibility = { compatible: false, dbx: ">=0.7.0", blockedBy: "dbx" };
+
+    expect(buildMarketplacePluginListings([incompatible], [installed("1.1.0")], "en")[0].status).toBe("installed");
+  });
+
+  it("marks an unfixable catalog requirement incompatible instead of offering an upgrade", () => {
+    const upperBound = structuredClone(result);
+    upperBound.catalog!.plugins[0].versions[0].compatibility = { compatible: false, dbx: "<0.7.0", blockedBy: "dbx", upgradeRequired: false };
+    const listings = buildMarketplacePluginListings([upperBound], [installed("1.0.0")], "en");
+
+    // A newer DBX is satisfied by *older* hosts, so upgrading cannot help and the UI must not
+    // advertise the upgrade entry.
+    expect(listings[0]).toMatchObject({ status: "incompatible", requiredEngine: "<0.7.0" });
+    expect(listings.filter((listing) => listing.status === "update")).toHaveLength(0);
+  });
+
+  it("names the host API requirement when that is what blocked the version", () => {
+    const incompatible = structuredClone(result);
+    incompatible.catalog!.plugins[0].versions[0].compatibility = { compatible: false, hostApi: "^2.0", blockedBy: "hostApi" };
+
+    expect(buildMarketplacePluginListings([incompatible], [], "en")[0].requiredEngine).toBe("Host API ^2.0");
+  });
+
+  it("blocks only the rejected version after a failed install and offers the next release", () => {
+    resetPluginRequiresNewerDbxMarks();
+    markPluginRequiresNewerDbx("dbx-official", "example.hello", "1.1.0", { requirement: ">=0.7.0", hostApi: false, upgradeRequired: true });
+
+    expect(buildMarketplacePluginListings([result], [installed("1.0.0")], "en")[0]).toMatchObject({ status: "requires-newer-dbx", requiredEngine: ">=0.7.0" });
+    // A catalog release that moves past the rejected version must be offered again.
+    const nextRelease = repositoryResult("dbx-official", "DBX Marketplace", "1.2.0");
+    expect(buildMarketplacePluginListings([nextRelease], [installed("1.0.0")], "en")[0].status).toBe("update");
+    resetPluginRequiresNewerDbxMarks();
+  });
+
+  it("scopes the failed-install mark to the offering repository", () => {
+    resetPluginRequiresNewerDbxMarks();
+    markPluginRequiresNewerDbx("dbx-official", "example.hello", "1.1.0", { requirement: ">=0.7.0", hostApi: false, upgradeRequired: true });
+
+    expect(buildMarketplacePluginListings([result], [installed("1.0.0")], "en")[0].status).toBe("requires-newer-dbx");
+
+    // Same plugin id and version, different repository: a different package, so it stays offered.
+    const teamRepo = repositoryResult("team-repo", "Team", "1.1.0", false);
+    expect(buildMarketplacePluginListings([teamRepo], [installed("1.0.0")], "en")[0].status).toBe("update");
+    resetPluginRequiresNewerDbxMarks();
+  });
+
+  describe("resolveMarketplaceReleaseUrl", () => {
+    it("resolves GitHub branch and tag tree URLs to root repository release tag", () => {
+      // Regression for #12516: source with /tree/<ref> should not result in /tree/<ref>/releases/tag/...
+      expect(resolveMarketplaceReleaseUrl("https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console/tree/v0.3.3", "0.3.3")).toBe("https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console/releases/tag/v0.3.3");
+
+      expect(resolveMarketplaceReleaseUrl("https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console/tree/v0.3.3/", "0.3.3")).toBe("https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console/releases/tag/v0.3.3");
+
+      expect(resolveMarketplaceReleaseUrl("https://github.com/t8y2/dbx/tree/main/plugins/examples/hello-workbench", "0.1.0")).toBe("https://github.com/t8y2/dbx/releases/tag/v0.1.0");
+    });
+
+    it("resolves standard repository URLs with and without trailing slash or .git", () => {
+      expect(resolveMarketplaceReleaseUrl("https://github.com/jinpy/dbx-ssh-plugin", "3.0.0")).toBe("https://github.com/jinpy/dbx-ssh-plugin/releases/tag/v3.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/jinpy/dbx-ssh-plugin/", "3.0.0")).toBe("https://github.com/jinpy/dbx-ssh-plugin/releases/tag/v3.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/jinpy/dbx-ssh-plugin.git", "3.0.0")).toBe("https://github.com/jinpy/dbx-ssh-plugin/releases/tag/v3.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/jinpy/dbx-ssh-plugin", "v3.0.0")).toBe("https://github.com/jinpy/dbx-ssh-plugin/releases/tag/v3.0.0");
+    });
+
+    it("resolves blob, releases, and ssh URLs", () => {
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo/blob/main/README.md", "1.0.0")).toBe("https://github.com/owner/repo/releases/tag/v1.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo/releases", "1.0.0")).toBe("https://github.com/owner/repo/releases/tag/v1.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo/releases/tag/v0.1.0", "1.0.0")).toBe("https://github.com/owner/repo/releases/tag/v1.0.0");
+      expect(resolveMarketplaceReleaseUrl("git@github.com:Ezreal-byte/dbx-plugin-xxl-job-console.git", "0.3.3")).toBe("https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console/releases/tag/v0.3.3");
+    });
+
+    it("supports Gitee, GitLab, and CNB repository formats", () => {
+      expect(resolveMarketplaceReleaseUrl("https://gitee.com/someone/my-plugin/tree/master", "1.0.0")).toBe("https://gitee.com/someone/my-plugin/releases/tag/v1.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://gitlab.com/group/subgroup/my-plugin/-/tree/main", "1.0.0")).toBe("https://gitlab.com/group/subgroup/my-plugin/-/releases/v1.0.0");
+      expect(resolveMarketplaceReleaseUrl("https://cnb.cool/dbxio.com/my-plugin/-/tree/main", "1.0.0")).toBe("https://cnb.cool/dbxio.com/my-plugin/-/releases/tag/v1.0.0");
+    });
+
+    it("accepts PluginMarketplaceVersion objects and handles empty inputs gracefully", () => {
+      expect(
+        resolveMarketplaceReleaseUrl("https://github.com/owner/repo", {
+          version: "2.1.0",
+          artifacts: [],
+        }),
+      ).toBe("https://github.com/owner/repo/releases/tag/v2.1.0");
+
+      expect(resolveMarketplaceReleaseUrl("", "1.0.0")).toBe("");
+      expect(resolveMarketplaceReleaseUrl("   ", "1.0.0")).toBe("");
+      expect(resolveMarketplaceReleaseUrl(undefined, "1.0.0")).toBe("");
+      expect(resolveMarketplaceReleaseUrl(null, "1.0.0")).toBe("");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo", "")).toBe("");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo", "   ")).toBe("");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo", undefined)).toBe("");
+      expect(resolveMarketplaceReleaseUrl("https://github.com/owner/repo", { version: "", artifacts: [] })).toBe("");
+    });
+
+    it("extracts base repository URL from various git URL formats", () => {
+      expect(extractRepositoryBaseUrl("https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console/tree/v0.3.3")).toEqual({
+        baseUrl: "https://github.com/Ezreal-byte/dbx-plugin-xxl-job-console",
+        host: "github.com",
+      });
+      expect(extractRepositoryBaseUrl("https://github.com/owner/repo.git")).toEqual({
+        baseUrl: "https://github.com/owner/repo",
+        host: "github.com",
+      });
+      expect(extractRepositoryBaseUrl("git@github.com:owner/repo.git")).toEqual({
+        baseUrl: "https://github.com/owner/repo",
+        host: "github.com",
+      });
+      expect(extractRepositoryBaseUrl("")).toBeNull();
+      expect(extractRepositoryBaseUrl("   ")).toBeNull();
+    });
+  });
 });
 
 describe("buildInstalledUpdateIndex", () => {
@@ -187,6 +318,66 @@ describe("pluginSourceChange", () => {
     const rekeyed = installed("1.0.0");
     rekeyed.provenance = { repositoryId: "dbx-official", publisher: "DBX", signingKeyId: "dbx.release-2023", source: "marketplace" };
     expect(pluginSourceChange(buildMarketplacePluginListings([result], [rekeyed], "en")[0])).toEqual({ repositoryChanged: false, publisherChanged: false, signingKeyChanged: true });
+  });
+});
+
+describe("parsePluginIncompatibility", () => {
+  it("extracts the engine requirement from the installer rejection", () => {
+    expect(parsePluginIncompatibility("Plugin 'example.hello' is incompatible: Plugin requires DBX >=0.7.0, but 0.6.60 is installed")).toEqual({
+      requirement: ">=0.7.0",
+      current: "0.6.60",
+      hostApi: false,
+      upgradeRequired: true,
+    });
+  });
+
+  it("marks an upper-bound DBX requirement as unfixable by upgrading", () => {
+    // `<0.7.0` is satisfied by *older* hosts, so the "Upgrade DBX" entry would be a dead end.
+    expect(parsePluginIncompatibility("Plugin 'example.hello' is incompatible: Plugin requires DBX <0.7.0, but 0.7.0 is installed")).toMatchObject({
+      requirement: "<0.7.0",
+      hostApi: false,
+      upgradeRequired: false,
+    });
+  });
+
+  it("recognizes the host API variant", () => {
+    expect(parsePluginIncompatibility("Plugin 'example.hello' is incompatible: Plugin requires DBX Host API ^2.0, but 1.4.0 is installed")).toMatchObject({
+      requirement: "^2.0",
+      hostApi: true,
+      upgradeRequired: true,
+    });
+  });
+
+  it("marks a host API upper bound as unfixable by upgrading", () => {
+    // Host API failures are not automatically forward-fixable: `<1.0.0` excludes this host and
+    // every newer one, so the generic "incompatible" state is the honest answer.
+    expect(parsePluginIncompatibility("Plugin 'example.hello' is incompatible: Plugin requires DBX Host API <1.0.0, but 1.4.0 is installed")).toMatchObject({
+      requirement: "<1.0.0",
+      hostApi: true,
+      upgradeRequired: false,
+    });
+  });
+
+  it("ignores unrelated install failures", () => {
+    expect(parsePluginIncompatibility("Plugin update blocked by active connections: Main")).toBeNull();
+  });
+
+  // Which direction a rejection points in is only decidable from a single lower bound; everything
+  // ambiguous must fall back to "incompatible" rather than advise an upgrade that cannot help.
+  it.each([
+    [">=0.7.0", "0.6.60", true],
+    [">0.7.0", "0.7.0", true],
+    ["=0.6.0", "0.7.0", false],
+    ["=0.7.1", "0.7.0", true],
+    ["<0.7.0", "0.7.0", false],
+    ["<=0.7.0", "0.7.0", false],
+    [">=0.5.0, <0.6.0", "0.7.0", false],
+    ["^0.6.0", "0.7.0", false],
+    ["^0.6.0", "0.5.0", true],
+    ["1.2.3", "1.0.0", true],
+    ["*", "0.7.0", false],
+  ])("requirement %s against host %s reports upgradeRequired %s", (requirement, current, expected) => {
+    expect(requirementSatisfiedByNewerVersion(requirement, current)).toBe(expected);
   });
 });
 
@@ -353,5 +544,45 @@ describe("sortMarketplacePluginListings", () => {
     // The update-bearing listing leads even though its displayed date is the older one.
     expect(displayedTimes(updatesFirst)).toEqual([Date.parse("2025-01-01T00:00:00Z"), Date.parse("2026-06-01T00:00:00Z")]);
     expect(ids(sortMarketplacePluginListings(listings, "name"))).toEqual(["a.alpha", "b.zulu"]);
+  });
+
+  it("sorts by install count descending and sinks plugins with no positive count", () => {
+    const catalog = datedCatalog([
+      { id: "c.none", name: "Gamma", latestVersion: "1.0.0", versions: [{ version: "1.0.0" }] },
+      { id: "a.few", name: "Alpha", latestVersion: "1.0.0", versions: [{ version: "1.0.0" }] },
+      { id: "b.many", name: "Beta", latestVersion: "1.0.0", versions: [{ version: "1.0.0" }] },
+      { id: "d.tie", name: "Delta", latestVersion: "1.0.0", versions: [{ version: "1.0.0" }] },
+    ]);
+    const listings = buildMarketplacePluginListings([catalog], [], "en");
+
+    expect(ids(sortMarketplacePluginListings(listings, "installs", { "b.many": 40, "a.few": 3, "d.tie": 3, "c.none": 0 }))).toEqual(["b.many", "a.few", "d.tie", "c.none"]);
+    expect(ids(sortMarketplacePluginListings(listings, "installs"))).toEqual(["a.few", "b.many", "d.tie", "c.none"]);
+  });
+});
+
+describe("fetchPluginInstallCounts", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps positive finite counts for valid plugin ids", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ installs: { "io.dbx.ssh": 12, "not an id": 4, "io.dbx.zero": 0, "io.dbx.nan": Number.NaN, "io.dbx.text": "9" } }),
+      }),
+    );
+
+    await expect(fetchPluginInstallCounts()).resolves.toEqual({ "io.dbx.ssh": 12 });
+  });
+
+  it("returns null when the endpoint fails or the payload is malformed", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }));
+    await expect(fetchPluginInstallCounts()).resolves.toBeNull();
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    await expect(fetchPluginInstallCounts()).resolves.toBeNull();
+
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
+    await expect(fetchPluginInstallCounts()).resolves.toBeNull();
   });
 });

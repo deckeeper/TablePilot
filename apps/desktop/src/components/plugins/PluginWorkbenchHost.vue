@@ -1,9 +1,12 @@
 <script setup lang="ts">
+import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
+import PluginOpenUrlDialog from "./PluginOpenUrlDialog.vue";
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { AlertTriangle, Loader2 } from "@lucide/vue";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard, readImageFromClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
+import { canWritePluginClipboardImage, writePluginClipboardImage } from "@/lib/plugins/pluginClipboardImage";
 import {
   PluginHostBridge,
   pluginSandboxDocument,
@@ -18,7 +21,8 @@ import {
   type PluginWorkbenchContext,
   type PluginAiRecommendationHostUpdate,
 } from "@/lib/plugins/pluginHostBridge";
-import { getCachedPluginUiHtml, getOrLoadPluginUiHtml, pluginUiAssetBaseUrl } from "@/lib/plugins/pluginUiHtmlCache";
+import { getCachedPluginUiHtml, getOrLoadPluginUiHtml, getSandboxDocument, invalidatePluginUiHtml, pluginUiAssetBaseUrl, type PluginUiHtml } from "@/lib/plugins/pluginUiHtmlCache";
+import { declaresAnyObservationPermission } from "@/lib/plugins/pluginObservation";
 import { isPluginGraphicsEngineEnabled } from "@/lib/plugins/pluginGraphicsEngine";
 import { beginFloatingWindowDrag, closeFloatingWindows, endFloatingWindowDrag, openFloatingWindow, setFloatingWindowSize } from "@/lib/plugins/pluginFloatingWindow";
 import { isFloatingPluginWindow } from "@/lib/app/windowContext";
@@ -34,12 +38,15 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { createPluginAiCompletion, type PluginAiConfirmDecision, type PluginAiPromptPreview } from "@/lib/plugins/pluginAiCompletion";
 import { useQueryStore } from "@/stores/queryStore";
 import { OPEN_PLUGIN_AI_CONVERSATION } from "@/lib/ai/aiPluginConversation";
+import { PLUGIN_CONNECTION_EDITOR } from "@/lib/connection/pluginConnectionEdit";
 
 const props = withDefaults(
   defineProps<{
     plugin: InstalledPlugin;
     contribution: PluginUiContribution;
     context?: PluginWorkbenchContext;
+    setTitle?: (title: string | null) => Promise<void> | void;
+    getTitle?: () => Promise<string> | string;
   }>(),
   { context: () => ({}) },
 );
@@ -56,7 +63,9 @@ const emit = defineEmits<{
 const { t, locale: appLocale } = useI18n();
 const { isDark, themeRevision } = useTheme();
 const settingsStore = useSettingsStore();
+const urlDialog = ref<InstanceType<typeof PluginOpenUrlDialog>>();
 const openAiConversation = inject(OPEN_PLUGIN_AI_CONVERSATION, undefined);
+const connectionEditor = inject(PLUGIN_CONNECTION_EDITOR, undefined);
 // Per-plugin grant for `script-src 'unsafe-eval'`; flipping it rebuilds the
 // sandbox document (and must not reuse a doc cached under the other setting).
 const graphicsEngineEnabled = computed(() => isPluginGraphicsEngineEnabled(settingsStore.editorSettings.pluginGraphicsEngineIds, props.plugin.manifest.id));
@@ -154,6 +163,13 @@ const frameReady = ref(false);
 const error = ref("");
 let bridge: PluginHostBridge | undefined;
 let unsubscribeEvents: (() => void) | undefined;
+let unsubscribeObservationEvents: (() => void) | undefined;
+// Host observation interest is registered per workbench mount, because the
+// shell's Tauri bridges stay subscribed for the whole process and therefore
+// cannot tell the Rust bus whether anyone is watching. Two tabs of one plugin
+// hold two owners and are refcounted independently.
+const observationOwnerId = `plugin-workbench:${props.plugin.manifest.id}:${Math.random().toString(36).slice(2)}`;
+let observationInterestRegistered = false;
 let disposed = false;
 let loadGeneration = 0;
 // Boot timing (§8.3 loading lifecycle): one console.debug line per iframe load
@@ -410,10 +426,12 @@ interface TauriFileDropPayload {
 }
 
 let dropDragActive = false;
+let lastDragPoint: { x: number; y: number } | null = null;
 
-function forwardDragState(active: boolean): void {
+function forwardDragState(active: boolean, position?: { x: number; y: number }): void {
   dropDragActive = active;
-  bridge?.forwardDragState(active);
+  lastDragPoint = active && position ? { x: position.x, y: position.y } : null;
+  bridge?.forwardDragState(active, position);
 }
 
 function onHostFileDrop(event: Event): void {
@@ -430,20 +448,35 @@ function onHostFileDrop(event: Event): void {
   }
   // Overlay titlebar: the webview starts at the window origin, so physical
   // window coordinates divide straight into CSS pixels via devicePixelRatio.
-  const scale = window.devicePixelRatio || 1;
-  if (document.elementFromPoint(position.x / scale, position.y / scale) !== frame) {
+  // A non-finite ratio (e.g. a NaN reading) must behave like 1 so a bad
+  // reading cannot turn every forwarded coordinate into NaN.
+  const dpr = window.devicePixelRatio;
+  const scale = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  const cssX = position.x / scale;
+  const cssY = position.y / scale;
+  if (document.elementFromPoint(cssX, cssY) !== frame) {
     if (dropDragActive) forwardDragState(false);
     return;
   }
   // Claim the drop so the host fallback (open as SQL/database) does not run.
   event.preventDefault();
+  const rect = frame.getBoundingClientRect();
+  const point = {
+    x: cssX - rect.left,
+    y: cssY - rect.top,
+  };
   if (payload.type !== "drop") {
-    if (!dropDragActive) forwardDragState(true);
+    if (dropDragActive && lastDragPoint && Math.abs(lastDragPoint.x - point.x) < 1 && Math.abs(lastDragPoint.y - point.y) < 1) {
+      return;
+    }
+    forwardDragState(true, point);
     return;
   }
-  forwardDragState(false);
   const paths = (payload.paths || []).filter((path) => typeof path === "string" && path);
-  if (!paths.length || !bridge) return;
+  if (!paths.length || !bridge) {
+    forwardDragState(false);
+    return;
+  }
   // Pin the owner and generation before the await: the expansion runs on a
   // Rust blocking thread and can land after a teardown or identity rebuild.
   const pluginId = props.plugin.manifest.id;
@@ -465,10 +498,17 @@ function onHostFileDrop(event: Event): void {
         });
         return;
       }
-      if (files.length) bridge?.forwardFileDrop(files, { dropId, truncated });
-      else console.error("[DBX][plugin-workbench:drop] no dropped files could be opened", paths);
+      if (files.length) {
+        bridge?.forwardFileDrop(files, { dropId, truncated, position: point });
+      } else {
+        console.error("[DBX][plugin-workbench:drop] no dropped files could be opened", paths);
+      }
     } catch (error) {
       console.error("[DBX][plugin-workbench:drop]", error);
+    } finally {
+      if (!disposed && generation === loadGeneration) {
+        forwardDragState(false);
+      }
     }
   })();
 }
@@ -519,11 +559,37 @@ function createBridge() {
       invoke: api.invokePlugin,
       notify: api.notifyPlugin,
       sendBinary: api.sendPluginBinary,
+      // Desktop-only for now (web SSE delivery is a follow-up), so the bridge
+      // advertises `observations` only when this entry exists.
+      ...(isTauriRuntime() ? { subscribeHostObservations: api.subscribeHostObservations } : {}),
       readAsset: api.readPluginUiAsset,
       openAiConversation,
+      connectionEditor,
       ...(isTauriRuntime() ? aiCompletion : {}),
       setAiRecommendations: (update) => emit("recommendations", update),
       openWorkbench: async (pluginId, contributionId, context, options) => emit("openWorkbench", pluginId, contributionId, context, options),
+      // Only expose the title APIs on surfaces that implement them (workbench
+      // tab and dock hosts pass the props); the bridge derives the
+      // `workbenchTitle` capability from their presence, so floating windows
+      // and sidebar hosts must not advertise a silent no-op.
+      ...(() => {
+        const setTitleProp = props.setTitle;
+        const getTitleProp = props.getTitle;
+        return {
+          ...(setTitleProp
+            ? {
+                setTitle: async (newTitle: string | null) => {
+                  await setTitleProp(newTitle);
+                },
+              }
+            : {}),
+          ...(getTitleProp
+            ? {
+                getTitle: async () => await getTitleProp(),
+              }
+            : {}),
+        };
+      })(),
       // §4/§5 bridge command execution, scoped to this plugin's own manifest:
       // the single-plugin registry is equivalent here because findCommand /
       // findWorkbench / enablement never cross plugins. Panel commands dock,
@@ -537,18 +603,77 @@ function createBridge() {
       openFilesystem: async (pluginId, providerId, context) => emit("openFilesystem", pluginId, providerId, context),
       reopenConnection: (pluginId, connectionId) => useConnectionStore().reopenPluginConnection(connectionId, pluginId),
       // PR-A4 generic extension point: a read-only, secret-free, plugin-scoped connection list (for in-panel connection switching).
-      listConnections: (ownerPluginId) => {
+      // Extended for #12603 with `host.connections:read` / options.all to return all connections.
+      listConnections: (ownerPluginId, options?: { all?: boolean }) => {
+        const connectionStore = useConnectionStore();
+        const queryStore = useQueryStore();
+        const connectedIds = connectionStore.connectedIds;
+        if (options?.all) {
+          return connectionStore.connections.map((connection) => {
+            const connected = connectedIds.has(connection.id);
+            return {
+              id: connection.id,
+              name: connection.name,
+              dbType: connection.db_type,
+              dialect: connection.db_type,
+              databaseType: connection.db_type,
+              connected,
+              isConnected: connected,
+              readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+              database: connection.database,
+              schema: connection.default_schema,
+              providerId: connection.plugin_connection_provider ?? "",
+              connectionType: connection.plugin_connection_type,
+              workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
+            };
+          });
+        }
         const providerIds = new Set((props.plugin.manifest.contributions || []).filter((candidate) => candidate.type === "connection-provider").map((candidate) => candidate.id));
         if (ownerPluginId !== props.plugin.manifest.id) return [];
-        return useConnectionStore()
-          .connections.filter((connection) => providerIds.has(connection.plugin_connection_provider ?? ""))
-          .map((connection) => ({
+        return connectionStore.connections
+          .filter((connection) => providerIds.has(connection.plugin_connection_provider ?? ""))
+          .map((connection) => {
+            const connected = connectedIds.has(connection.id);
+            return {
+              id: connection.id,
+              name: connection.name,
+              dbType: connection.db_type,
+              dialect: connection.db_type,
+              databaseType: connection.db_type,
+              connected,
+              isConnected: connected,
+              providerId: connection.plugin_connection_provider ?? "",
+              connectionType: connection.plugin_connection_type,
+              readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+              database: connection.database,
+              schema: connection.default_schema,
+              // #193b — dock/tab titles bound to the connection (dock first), so plugins can label session rows after renamed terminals.
+              workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
+            };
+          });
+      },
+      listAllConnections: () => {
+        const connectionStore = useConnectionStore();
+        const queryStore = useQueryStore();
+        const connectedIds = connectionStore.connectedIds;
+        return connectionStore.connections.map((connection) => {
+          const connected = connectedIds.has(connection.id);
+          return {
             id: connection.id,
             name: connection.name,
+            dbType: connection.db_type,
+            dialect: connection.db_type,
+            databaseType: connection.db_type,
+            connected,
+            isConnected: connected,
+            readOnly: mysqlDataCharsetEnabled(connection) || connection.read_only === true,
+            database: connection.database,
+            schema: connection.default_schema,
             providerId: connection.plugin_connection_provider ?? "",
             connectionType: connection.plugin_connection_type,
-            readOnly: connection.read_only === true,
-          }));
+            workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
+          };
+        });
       },
       // Both plan calls carry the plugin's declared `host.plans:read` gate in the
       // bridge; the backend owns EXPLAIN generation, the timeout, and the plan cap.
@@ -577,7 +702,9 @@ function createBridge() {
       saveFile: (_pluginId, request, data) => savePluginFile(request, data),
       downloadFile: isTauriRuntime() ? downloadPluginFile : undefined,
       cancelDownload: isTauriRuntime() ? cancelPluginDownload : undefined,
+      openUrl: (url) => (urlDialog.value ? urlDialog.value.request(url) : Promise.reject(new Error("Host URL consent is unavailable"))),
       copyText: (_pluginId, text) => copyToClipboard(text),
+      copyImage: canWritePluginClipboardImage() ? (_pluginId, data) => writePluginClipboardImage(data) : undefined,
       // Permission-gated in the bridge (host.clipboard:read); the helper
       // prefers the Tauri clipboard plugin and falls back to the Web Clipboard.
       clipboardRead: (_pluginId) => readTextFromClipboard(),
@@ -678,6 +805,7 @@ async function loadWorkbench() {
   // An identity rebuild swaps the plugin this component serves; retire the
   // previous plugin's handles first or they would outlive their owner.
   disposeLocalFileHandles();
+  urlDialog.value?.cancel();
   bridge?.dispose();
   bridge = undefined;
   loading.value = true;
@@ -688,7 +816,7 @@ async function loadWorkbench() {
   try {
     if (!props.plugin.compatibility.compatible) throw new Error((props.plugin.compatibility.errors || []).join("; ") || t("pluginPlatform.pluginIncompatible"));
     // The read/decode/inline pipeline over a multi-megabyte ui build dominates
-    // workbench open time; cache the inlined html per plugin id+version so
+    // workbench open time; cache the processed ui per plugin id+version so
     // reopening panels (new dock entries, workbench reloads) skips it. Theme
     // is applied per load via the sandbox document, so the cache never pins a
     // stale appearance. getOrLoadPluginUiHtml coalesces with an in-flight
@@ -700,20 +828,30 @@ async function loadWorkbench() {
       cachedHtml = await getOrLoadPluginUiHtml(htmlCacheKey, props.plugin.manifest.id);
       if (disposed || generation !== loadGeneration) return;
     }
-    const { html, entryDirectory } = cachedHtml;
-    // The final sandbox document is cached alongside the html: generating it
-    // re-runs megabyte-scale string surgery on every boot.
+    // The final sandbox document is cached in place of the inlined html:
+    // generating it re-runs megabyte-scale string surgery on every boot, and
+    // keeping both would hold two copies of a tens-of-MB string per plugin.
     const allowUnsafeEval = graphicsEngineEnabled.value;
-    if (!cachedHtml.sandboxDoc || cachedHtml.sandboxDoc.allowUnsafeEval !== allowUnsafeEval) {
-      cachedHtml.sandboxDoc = {
-        allowUnsafeEval,
-        doc: pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme(), {
-          baseUrl: pluginUiAssetBaseUrl(props.plugin.manifest.id, entryDirectory),
+    const sandboxDocumentOf = (entry: PluginUiHtml) =>
+      getSandboxDocument(entry, allowUnsafeEval, (html) =>
+        pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme(), {
+          baseUrl: pluginUiAssetBaseUrl(props.plugin.manifest.id, entry.entryDirectory),
           allowUnsafeEval,
         }),
-      };
+      );
+    let sandboxDoc = sandboxDocumentOf(cachedHtml);
+    if (sandboxDoc === undefined) {
+      // The unsafe-eval grant flipped after the html was released, so the cached
+      // document carries the wrong CSP. Re-read the build instead of keeping the
+      // html resident for a setting that rarely changes.
+      invalidatePluginUiHtml(htmlCacheKey);
+      bootCacheHit = false;
+      cachedHtml = await getOrLoadPluginUiHtml(htmlCacheKey, props.plugin.manifest.id);
+      if (disposed || generation !== loadGeneration) return;
+      sandboxDoc = sandboxDocumentOf(cachedHtml);
+      if (sandboxDoc === undefined) throw new Error(`Plugin ui document for ${htmlCacheKey} is unavailable`);
     }
-    source.value = cachedHtml.sandboxDoc.doc;
+    source.value = sandboxDoc;
     await nextTick();
     if (disposed || generation !== loadGeneration) return;
     createBridge();
@@ -759,11 +897,37 @@ onMounted(async () => {
     (event) => bridge?.forwardEvent(event),
     (event) => bridge?.forwardBinary(event),
   );
+  // Only a plugin that declared `host.observe:*` can receive observations, so
+  // anything else skips both the interest registration and the event
+  // subscription: an unobserved workbench must not keep the host building
+  // payloads.
+  const observesHostEvents = isTauriRuntime() && declaresAnyObservationPermission(props.plugin.manifest.permissions);
+  let unsubscribeObservations: (() => void) | undefined;
+  if (observesHostEvents) {
+    try {
+      await api.setPluginObservationInterest(observationOwnerId, props.plugin.manifest.id);
+      observationInterestRegistered = true;
+    } catch (interestError) {
+      // Observation is additive: a registration failure must not break the
+      // workbench, it only silences the observation stream for this tab.
+      console.error("[DBX][plugin-workbench:observation-interest]", interestError);
+    }
+    unsubscribeObservations = await api.subscribeHostObservations(
+      (event) => bridge?.forwardObservation(event),
+      (gap) => bridge?.forwardObservationGap(gap),
+    );
+  }
   if (disposed) {
     unsubscribe();
+    unsubscribeObservations?.();
+    if (observationInterestRegistered) {
+      observationInterestRegistered = false;
+      void api.clearPluginObservationInterest(observationOwnerId).catch(() => undefined);
+    }
     return;
   }
   unsubscribeEvents = unsubscribe;
+  unsubscribeObservationEvents = unsubscribeObservations;
   await loadWorkbench();
 });
 
@@ -802,6 +966,8 @@ defineExpose({ requestClose });
 
 onBeforeUnmount(() => {
   disposed = true;
+  dropDragActive = false;
+  lastDragPoint = null;
   loadGeneration += 1;
   // An unanswered consent dialog must not leave the plugin's generation
   // request (and its busy lock) hanging on a dead workbench.
@@ -816,11 +982,17 @@ onBeforeUnmount(() => {
   document.removeEventListener("dbx:tauri-file-drop", onHostFileDrop);
   disposeLocalFileHandles();
   unsubscribeEvents?.();
+  unsubscribeObservationEvents?.();
+  if (observationInterestRegistered) {
+    observationInterestRegistered = false;
+    void api.clearPluginObservationInterest(observationOwnerId).catch(() => undefined);
+  }
 });
 </script>
 
 <template>
   <div class="relative flex size-full overflow-hidden" :class="hostSurfaceClass">
+    <PluginOpenUrlDialog ref="urlDialog" :plugin-id="plugin.manifest.id" :plugin-name="plugin.manifest.name" :permissions="plugin.manifest.permissions" />
     <div v-if="loading" class="absolute inset-0 z-10 flex items-center justify-center text-sm text-muted-foreground" :class="overlayClass">
       <Loader2 class="mr-2 size-4 animate-spin" />
       {{ t("pluginPlatform.loadingTitle", { title }) }}

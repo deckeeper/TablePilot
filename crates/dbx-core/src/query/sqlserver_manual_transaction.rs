@@ -46,7 +46,8 @@ pub mod live_test_hooks {
 }
 const PREFIX: &str = "sqlserver-txn-";
 const ERROR_PREFIX: &str = "DBX_MANUAL_TRANSACTION_ERROR:";
-const IDLE: Duration = Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
+/// How long an ended session's outcome stays queryable for late callers.
+const ENDED_SESSION_RETENTION: Duration = Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
 const MAX_ENDED_SESSIONS: usize = 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,7 +79,7 @@ pub struct EndedSessions {
 }
 impl EndedSessions {
     fn prune(&mut self) {
-        self.entries.retain(|_, (time, _)| time.elapsed() < IDLE);
+        self.entries.retain(|_, (time, _)| time.elapsed() < ENDED_SESSION_RETENTION);
     }
     fn record(&mut self, id: &str, failure: Failure) {
         self.prune();
@@ -285,10 +286,12 @@ pub async fn begin(
     let id = format!("{PREFIX}{}", uuid::Uuid::new_v4());
     let metadata = SessionMetadata { lifecycle, driver, ends: state.sqlserver_transaction_ends.clone() };
     let session = TransactionSession {
+        mysql_data_charset: None,
         sqlserver: Some(metadata.clone()),
         connection: Arc::new(tokio::sync::Mutex::new(conn)),
         pool_key,
         last_activity: Instant::now(),
+        idle_timeout: super::manual_transaction_idle_timeout(state, connection_id).await,
         busy: false,
         snapshot_rotation_safe: false,
         connection_id: connection_id.to_owned(),
@@ -422,7 +425,7 @@ pub async fn execute(
             return Err(failure(Kind::Busy, Outcome::Unknown, "The transaction is currently executing"));
         }
         let context_changed = session.database != database || session.schema.as_deref() != schema;
-        let expired = session.last_activity.elapsed() >= IDLE;
+        let expired = session.last_activity.elapsed() >= session.idle_timeout;
         session.busy = true;
         (
             session.connection.clone(),
@@ -473,7 +476,12 @@ pub async fn execute(
         Arc::new(registered)
     });
     let token = registered.as_ref().map(|query| query.token()).unwrap_or_default();
-    let timeout = resolve_query_timeout(options.timeout_secs);
+    let timeout =
+        if batches.iter().all(|batch| statement_scope(batch, Some(DatabaseType::SqlServer)) == StatementScope::Read) {
+            resolve_query_timeout(options.timeout_secs)
+        } else {
+            None
+        };
     let agent_transport = matches!(&*conn, TxnConnection::Agent { .. });
     let run = async {
         let mut results = Vec::new();
@@ -669,7 +677,7 @@ pub async fn finish(state: &AppState, id: &str, commit: bool) -> Result<db::Quer
     };
     let metadata = session.sqlserver.as_ref().expect("SQL Server session metadata");
     let mut conn = session.connection.lock().await;
-    if metadata.lifecycle.cancellation().is_cancelled() || session.last_activity.elapsed() >= IDLE {
+    if metadata.lifecycle.cancellation().is_cancelled() || session.last_activity.elapsed() >= session.idle_timeout {
         let error = cleanup_failure(
             state,
             id,
@@ -793,14 +801,16 @@ fn spawn_idle_watcher(sessions: Arc<tokio::sync::RwLock<HashMap<String, Transact
                 if session.busy {
                     Duration::from_secs(1)
                 } else {
-                    IDLE.saturating_sub(session.last_activity.elapsed())
+                    session.idle_timeout.saturating_sub(session.last_activity.elapsed())
                 }
             };
             tokio::time::sleep(delay).await;
             let removed = {
                 let mut map = sessions.write().await;
                 match map.get(&id) {
-                    Some(session) if !session.busy && session.last_activity.elapsed() >= IDLE => map.remove(&id),
+                    Some(session) if !session.busy && session.last_activity.elapsed() >= session.idle_timeout => {
+                        map.remove(&id)
+                    }
                     None => return,
                     _ => None,
                 }
@@ -817,7 +827,7 @@ fn spawn_idle_watcher(sessions: Arc<tokio::sync::RwLock<HashMap<String, Transact
                         Ok(Ok(())) => Failure::new(
                             Kind::IdleTimeout,
                             Outcome::RolledBack,
-                            "Transaction rolled back after five minutes of inactivity",
+                            "Transaction rolled back after its idle timeout",
                         ),
                         Ok(Err(error)) => Failure::new(
                             Kind::RollbackFailed,
@@ -862,7 +872,7 @@ mod tests {
         assert_eq!(ended.entries.len(), MAX_ENDED_SESSIONS);
         ended.entries.insert(
             "old".into(),
-            (Instant::now() - IDLE, Failure::new(Kind::IdleTimeout, Outcome::RolledBack, "Idle")),
+            (Instant::now() - ENDED_SESSION_RETENTION, Failure::new(Kind::IdleTimeout, Outcome::RolledBack, "Idle")),
         );
         assert!(ended.missing("old").contains("connection_lost"));
         assert!(!ended.entries.contains_key("old"));
@@ -946,6 +956,7 @@ for line in sys.stdin:
         state.transaction_sessions.write().await.insert(
             id.clone(),
             TransactionSession {
+                mysql_data_charset: None,
                 sqlserver: Some(SessionMetadata {
                     lifecycle: state.connection_lifecycle_snapshot("mock-sqlserver"),
                     driver: DriverInfo::default(),
@@ -959,6 +970,7 @@ for line in sys.stdin:
                 })),
                 pool_key: "mock-sqlserver".to_owned(),
                 last_activity: Instant::now(),
+                idle_timeout: ENDED_SESSION_RETENTION,
                 busy: false,
                 snapshot_rotation_safe: false,
                 connection_id: "mock-sqlserver".to_owned(),
@@ -1101,12 +1113,34 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn slow_agent_write_ignores_read_deadline_and_can_commit() {
+        let (state, id, dir) = mock_session(false, false).await;
+        let start = Instant::now();
+        execute(
+            &state,
+            &id,
+            "UPDATE t SET value = 1 /* SLOW */",
+            "db",
+            None,
+            ManualTransactionExecutionOptions { timeout_secs: Some(1), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        finish(&state, &id, true).await.unwrap();
+        let events = events(&dir);
+        assert_eq!(events[0]["params"]["timeoutSecs"], 0);
+        assert_eq!(events[1]["method"], "commit_manual_transaction");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
     async fn agent_deadline_covers_all_go_batches() {
         let (state, id, dir) = mock_session(false, false).await;
         let error = execute(
             &state,
             &id,
-            "SHORT_SLOW\nGO\nSHORT_SLOW",
+            "SELECT 1 /* SHORT_SLOW */\nGO\nSELECT 2 /* SHORT_SLOW */",
             "db",
             None,
             ManualTransactionExecutionOptions { timeout_secs: Some(1), ..Default::default() },
